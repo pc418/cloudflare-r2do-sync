@@ -44,15 +44,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function manager(app: App): HotkeyManagerish | null {
   const found = (app as unknown as { hotkeyManager?: unknown }).hotkeyManager;
-  return isRecord(found) ? (found as HotkeyManagerish) : null;
+  return isRecord(found) ? found : null;
 }
 
 /** Both binding tables, or null when neither is readable. */
 function tables(app: App): { custom: Bindings | null; fallback: Bindings | null } | null {
   const found = manager(app);
   if (found === null) return null;
-  const custom = isRecord(found.customKeys) ? (found.customKeys as Bindings) : null;
-  const fallback = isRecord(found.defaultKeys) ? (found.defaultKeys as Bindings) : null;
+  const custom = isRecord(found.customKeys) ? found.customKeys : null;
+  const fallback = isRecord(found.defaultKeys) ? found.defaultKeys : null;
   return custom === null && fallback === null ? null : { custom, fallback };
 }
 

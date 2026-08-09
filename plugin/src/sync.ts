@@ -19,7 +19,7 @@ import {
   netLines,
   type LineCounts,
 } from "./lines";
-import { alwaysSkip, isConfigPath, makeExcluder, pathError } from "./paths";
+import { alwaysSkip, DEFAULT_CONFIG_DIR, isConfigPath, makeExcluder, pathError } from "./paths";
 import { DEFAULT_LANES, clampLanes, mapPool } from "./pool";
 import { createUlidFactory } from "./ulid";
 import { isSyncMode, type SyncMode } from "./sync-policy";
@@ -158,8 +158,14 @@ export interface SyncEngineOptions {
   onlyPaths?: string[];
   /** Direction policy. Unknown runtime values fail instead of silently becoming two-way. */
   mode?: SyncMode;
-  /** Allows ordinary `.obsidian/**` files; hard credential/workspace skips still win. */
+  /** Allows ordinary configuration-directory files; hard credential/workspace skips still win. */
   syncConfigDir?: boolean;
+  /**
+   * This vault's configuration directory (`Vault.configDir`). Defaults to `.obsidian`, which is
+   * only Obsidian's default — a vault that renamed it keeps its credentials somewhere else, and
+   * assuming the literal would upload them.
+   */
+  configDir?: string;
   maxBlobBytes?: number;
   now?: () => number;
   ulid?: () => string;
@@ -318,6 +324,7 @@ export class SyncEngine {
   readonly #hasOnlyPaths: boolean;
   readonly #mode: SyncMode;
   readonly #syncConfigDir: boolean;
+  readonly #configDir: string;
   readonly #maxBlobBytes: number;
   readonly #now: () => number;
   readonly #ulid: () => string;
@@ -348,6 +355,17 @@ export class SyncEngine {
       throw new Error("syncConfigDir must be a boolean");
     }
     this.#syncConfigDir = opts.syncConfigDir ?? false;
+    // A blank or nested value would silently stop matching the directory it names, and the
+    // paths it protects hold this device's credentials. Refuse it instead of guessing.
+    if (opts.configDir !== undefined) {
+      if (typeof opts.configDir !== "string" || opts.configDir.trim() === "") {
+        throw new Error("configDir must be a non-empty string");
+      }
+      if (opts.configDir.includes("/")) {
+        throw new Error(`configDir must be a single folder name, got ${opts.configDir}`);
+      }
+    }
+    this.#configDir = opts.configDir ?? DEFAULT_CONFIG_DIR;
     this.#maxBlobBytes = opts.maxBlobBytes ?? DEFAULT_MAX_BLOB_BYTES;
     this.#now = opts.now ?? Date.now;
     this.#ulid = opts.ulid ?? createUlidFactory(opts.now ?? Date.now);
@@ -1279,9 +1297,9 @@ export class SyncEngine {
   /** True for paths this device does not put in its own snapshots. */
   #notScanned(path: string): boolean {
     return (
-      alwaysSkip(path) ||
+      alwaysSkip(path, this.#configDir) ||
       pathError(path) !== null ||
-      (!this.#syncConfigDir && isConfigPath(path)) ||
+      (!this.#syncConfigDir && isConfigPath(path, this.#configDir)) ||
       this.#isExcluded(path) ||
       (this.#hasOnlyPaths && !this.#isIncluded(path))
     );
@@ -1746,14 +1764,14 @@ export class SyncEngine {
     for (const file of [...listed].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
       // Silent skips: excludes are the user's choice and junk/self-excludes are not
       // actionable, so neither belongs in the reported `skipped` list.
-      if (alwaysSkip(file.path)) continue;
+      if (alwaysSkip(file.path, this.#configDir)) continue;
       const invalid = pathError(file.path);
       if (invalid !== null) {
         skipped.push({ path: file.path, reason: invalid });
         continue;
       }
       if (
-        (!this.#syncConfigDir && isConfigPath(file.path)) ||
+        (!this.#syncConfigDir && isConfigPath(file.path, this.#configDir)) ||
         this.#isExcluded(file.path) ||
         (this.#hasOnlyPaths && !this.#isIncluded(file.path))
       ) {

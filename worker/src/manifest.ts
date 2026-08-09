@@ -16,7 +16,7 @@ export function pathError(path: string): string | null {
   if (new TextEncoder().encode(path).length > MAX_PATH_BYTES) return "path exceeds 1024 bytes";
   if (path.startsWith("/")) return "absolute path";
   if (path.includes("\\")) return "backslash in path";
-  // eslint-disable-next-line no-control-regex
+  // eslint-disable-next-line no-control-regex -- rejecting control characters is the point
   if (/[\u0000-\u001f\u007f]/.test(path)) return "control character in path";
   if (path !== path.normalize("NFC")) return "path not NFC-normalized";
   for (const seg of path.split("/")) {

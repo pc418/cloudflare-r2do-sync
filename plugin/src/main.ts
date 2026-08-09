@@ -66,7 +66,7 @@ import {
   passChangedSomething,
   type SyncLogEntry,
 } from "./log";
-import { countInScope, parseGlobs } from "./paths";
+import { countInScope, parseGlobs, DEFAULT_CONFIG_DIR } from "./paths";
 import { DEFAULT_LANES, MAX_LANES, clampLanes } from "./pool";
 import { SyncScheduler } from "./queue";
 import {
@@ -241,6 +241,20 @@ export function firstSyncConsentBody(mode: EncryptionMode): readonly string[] {
  */
 export function isUnconfigured(s: Pick<Settings, "serverUrl" | "accessToken">): boolean {
   return s.serverUrl.trim() === "" || s.accessToken.trim() === "";
+}
+
+/**
+ * This vault's configuration directory, which the user can rename ("Override config folder").
+ * Every rule guarding this plugin's own `data.json` — access token and master key, in plaintext
+ * — is keyed on it, so the literal `.obsidian` must never be assumed.
+ *
+ * `Vault.configDir` is documented and always present in Obsidian; the guard is for test doubles.
+ * Falling back to the default cannot un-protect a default vault, because `alwaysSkip` skips the
+ * default directory unconditionally whatever the active name is.
+ */
+function configDirOf(app: App): string {
+  const dir = (app.vault as Partial<Vault> | undefined)?.configDir;
+  return typeof dir === "string" && dir.trim() !== "" ? dir : DEFAULT_CONFIG_DIR;
 }
 
 /** Backoff between automatic retries. `retryAttempts` takes the first N. */
@@ -808,6 +822,9 @@ export default class LogSyncPlugin extends Plugin {
       onlyPaths: parseGlobs(this.settings.onlyPaths),
       mode: this.settings.syncMode,
       syncConfigDir: this.settings.syncConfigDir,
+      // Not the literal `.obsidian`: a vault that renamed its config folder keeps this
+      // plugin's `data.json` — access token and master key — somewhere else entirely.
+      configDir: configDirOf(this.app),
       maxBlobBytes: Math.round(this.settings.maxBlobMB * 1024 * 1024),
       crypto,
       protectPercent: this.settings.protectPercent,
@@ -2117,7 +2134,7 @@ export class ConflictReportModal extends Modal {
       const pre = holder.createEl("pre", { cls: "r2do-diff-body" });
       for (const row of diff.rows) {
         const mark = row.kind === "ours" ? "-" : row.kind === "theirs" ? "+" : " ";
-        pre.createEl("div", {
+        pre.createDiv({
           text: `${mark} ${row.text}`,
           cls: `r2do-diff-${row.kind}`,
         });
@@ -3275,6 +3292,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
     // itself is only written on blur — a half-finished glob must never be the live rule.
     let onlyDraft = this.plugin.settings.onlyPaths;
     let excludeDraft = this.plugin.settings.excludes;
+    const configDir = configDirOf(this.app);
     const indexed = this.#indexedPaths();
     let onlyHint: HTMLElement | null = null;
     let excludeHint: HTMLElement | null = null;
@@ -3284,6 +3302,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
         excludes: parseGlobs(excludeDraft),
         onlyPaths: parseGlobs(onlyDraft),
         syncConfigDir: this.plugin.settings.syncConfigDir,
+        configDir,
       };
       const kept = countInScope(indexed, rules);
       const unexcluded = countInScope(indexed, { ...rules, excludes: [] });
@@ -3343,7 +3362,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Sync Obsidian configuration directory")
-      .setDesc("Includes .obsidian/** except this plugin's live/legacy credential directories and workspace files. Bad config merges can break plugins.")
+      .setDesc(`Includes ${configDir}/** except this plugin's live/legacy credential directories and workspace files. Bad config merges can break plugins.`)
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.syncConfigDir).onChange((enabled) => {
           if (!enabled) {

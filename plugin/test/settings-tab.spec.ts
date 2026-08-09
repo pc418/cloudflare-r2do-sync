@@ -743,6 +743,22 @@ describe("settings tab rendering", () => {
       expect(hints[1]).toContain("Excludes drop 1 file of the 5");
     });
 
+    it("counts and names the vault's own configuration directory, not `.obsidian`", () => {
+      const CUSTOM = ".config-obsidian";
+      const files = ["note.md", `${CUSTOM}/app.json`, `${CUSTOM}/plugins/cloudflare-rdo-sync/data.json`];
+      const app = { vault: { configDir: CUSTOM, getFiles: () => files.map((path) => ({ path })) } };
+      const tab = newTab(fakePlugin({ syncConfigDir: true, excludes: "" }), app);
+      tab.display();
+      const container = tab.containerEl as unknown as FakeElement;
+      // Config files are in scope once the toggle is on; our own credential file never is.
+      expect(container.byClass("r2do-hint")[0].text).toContain("2 of 3 files");
+      const desc = logOf(tab).settings.find(
+        (s) => s.name === "Sync Obsidian configuration directory"
+      )?.desc;
+      expect(desc).toContain(`${CUSTOM}/**`);
+      expect(desc).not.toContain(".obsidian/**");
+    });
+
     it("counts an allow-list", () => {
       const { hints } = scope({ onlyPaths: "log/**" });
       expect(hints[0]).toContain("Allow-list matches 2 of 5");

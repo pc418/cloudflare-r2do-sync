@@ -155,7 +155,7 @@ export class SyncApi {
   }
 
   /** The shared settings document, or null when none has ever been written. */
-  async getSettingsDoc(): Promise<unknown | null> {
+  async getSettingsDoc(): Promise<unknown> {
     try {
       const res = await this.#request("/api/settings");
       return await res.json();

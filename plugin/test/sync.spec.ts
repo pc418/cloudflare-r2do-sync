@@ -238,6 +238,30 @@ describe("SyncEngine.sync — filtering and limits", () => {
     ]);
   });
 
+  it("hard-skips credentials in a renamed configuration directory", async () => {
+    // A vault that overrode its config folder keeps `data.json` — access token and master key
+    // in plaintext — outside `.obsidian`. Without the real name the engine would upload it.
+    vault.set("note.md", "ordinary content still syncs");
+    vault.set(".config-obsidian/app.json", "{}");
+    vault.set(".config-obsidian/workspace.json", "secret layout");
+    vault.set(".config-obsidian/plugins/cloudflare-rdo-sync/data.json", "credentials");
+    vault.set(".config-obsidian/plugins/obsidian-log-sync/data.json", "legacy credentials");
+
+    await makeEngine({ excludes: [], syncConfigDir: true, configDir: ".config-obsidian" }).sync();
+
+    expect(Object.keys(plainFiles(server.manifests.get(server.head!)!))).toEqual([
+      ".config-obsidian/app.json",
+      "note.md",
+    ]);
+  });
+
+  it("refuses a configDir that cannot name a directory", async () => {
+    // Silently falling back would leave the credential paths above unprotected.
+    for (const bad of ["", "   ", "a/b"]) {
+      expect(() => makeEngine({ configDir: bad })).toThrow(/configDir/);
+    }
+  });
+
   it("lets explicit excludes override config-directory opt-in", async () => {
     vault.set(".obsidian/app.json", "{}");
     vault.set(".obsidian/hotkeys.json", "{}");

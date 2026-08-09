@@ -40,7 +40,7 @@ export class ObsidianVault implements VaultAdapter {
     const existing = await this.app.vault.adapter.stat(path);
     if (existing?.type === "folder") throw new Error(`not a file: ${path}`);
     await this.#ensureFolder(path);
-    await this.app.vault.adapter.writeBinary(path, bytes.slice().buffer as ArrayBuffer);
+    await this.app.vault.adapter.writeBinary(path, bytes.slice().buffer);
   }
 
   /** Pulled files may land in folders this vault has never had. */

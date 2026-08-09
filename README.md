@@ -152,10 +152,13 @@ can be two different accounts, so the script never silently switches between the
   than silently deriving a different key.
 - Blob names are `sha256(ciphertext)`, so the server can still verify integrity without
   being able to read anything.
-- Plugin settings (`.obsidian/plugins/cloudflare-rdo-sync/**`) and `workspace*.json` are
+- Plugin settings (`<config folder>/plugins/cloudflare-rdo-sync/**`) and `workspace*.json` are
   never synced: `data.json` holds this device's access token and master key in plaintext.
-  The old `.obsidian/plugins/obsidian-log-sync/**` credential directory is also
-  permanently skipped so a leftover legacy `data.json` can never enter a snapshot.
+  The old `plugins/obsidian-log-sync/**` credential directory is also
+  permanently skipped so a leftover legacy `data.json` can never enter a snapshot. The config
+  folder is whatever your vault uses — if you renamed it under *Settings → About → Override
+  config folder*, both that folder and `.obsidian` are skipped, since a rename leaves the
+  old copy on disk.
 - **Your data stays your responsibility.** Nothing here is a service: there is no operator
   and no support channel that can read your notes back to you or restore them on your
   behalf. Your own backups and your own master key are part of running this, and the plugin
@@ -255,7 +258,8 @@ commands then ask for it with hidden input.)
   of globs. **Pull-only** applies remote changes but never commits; **Push-only (backup)**
   never writes local files, and preserves a racing remote edit as a conflict entry in the
   new snapshot. Paths outside the allow-list remain carried remotely rather than deleted.
-- `.obsidian/**` is local by default. **Sync Obsidian configuration directory** requires a
+- Your config folder (`.obsidian/**` unless you renamed it) is local by default. **Sync
+  Obsidian configuration directory** requires a
   typed `SYNC CONFIG` confirmation; even then R2DO Sync's current and legacy credential
   folders plus every `workspace*.json` remain hard-skipped. Explicit excludes still win.
 - Changing the encryption mode or key is a separate `REKEY` operation. It authenticates

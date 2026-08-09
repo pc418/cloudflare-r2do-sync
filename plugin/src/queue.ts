@@ -113,16 +113,16 @@ export class SyncScheduler {
 
   async #waitForRetry(delayMs: number): Promise<void> {
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(finish, delayMs);
-      const scheduler = this;
-      function finish(): void {
-        clearTimeout(timer);
-        if (scheduler.#cancelBackoff === cancel) scheduler.#cancelBackoff = null;
+      // `let`, rather than a `const` declared below `cancel`: nothing can reach `cancel` before
+      // the timer exists, but a TDZ ReferenceError is not worth having to prove that again.
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const cancel = (): void => {
+        if (timer !== null) clearTimeout(timer);
+        // Only retire the backoff this call installed; a newer one must survive.
+        if (this.#cancelBackoff === cancel) this.#cancelBackoff = null;
         resolve();
-      }
-      function cancel(): void {
-        finish();
-      }
+      };
+      timer = setTimeout(cancel, delayMs);
       this.#cancelBackoff = cancel;
     });
   }

@@ -2,7 +2,7 @@
   "name": "cloudflare-r2do-sync-plugin",
   "private": true,
   "type": "module",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",

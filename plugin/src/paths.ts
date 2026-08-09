@@ -1,13 +1,37 @@
 const MAX_PATH_BYTES = 1024;
 
-/** This plugin's own folder inside the vault. Must never be synced — see `alwaysSkip`. */
-export const PLUGIN_DIR = ".obsidian/plugins/cloudflare-rdo-sync";
+/**
+ * Obsidian's *default* configuration directory. A vault can rename it (Settings → About →
+ * "Override config folder"), so no rule here may assume the literal: `Vault.configDir` holds
+ * the live value and every predicate below takes it as an argument.
+ */
+export const DEFAULT_CONFIG_DIR = ".obsidian";
+
+/** This plugin's folder, relative to whichever configuration directory the vault uses. */
+const SELF_FOLDER = "plugins/cloudflare-rdo-sync";
 
 /**
  * The unpublished pre-rename install can still contain `data.json` with live credentials.
  * Treat it as a self-directory forever: a renamed install must never upload the old copy.
  */
-export const LEGACY_PLUGIN_DIR = ".obsidian/plugins/obsidian-log-sync";
+const LEGACY_SELF_FOLDER = "plugins/obsidian-log-sync";
+
+/** This plugin's own folder in a default vault. Must never be synced — see `alwaysSkip`. */
+export const PLUGIN_DIR = `${DEFAULT_CONFIG_DIR}/${SELF_FOLDER}`;
+export const LEGACY_PLUGIN_DIR = `${DEFAULT_CONFIG_DIR}/${LEGACY_SELF_FOLDER}`;
+
+/**
+ * Every directory that can hold this plugin's own credentials, for a vault using `configDir`.
+ *
+ * Deliberately covers the **default** directory as well as the active one. Skipping too much
+ * costs nothing — these are our own plugin ids — while skipping too little uploads `data.json`,
+ * and with it the access token and the vault master key in plaintext. A vault whose config
+ * folder was renamed after this plugin had run still has the old copy on disk.
+ */
+export function selfDirs(configDir: string = DEFAULT_CONFIG_DIR): string[] {
+  const bases = configDir === DEFAULT_CONFIG_DIR ? [configDir] : [configDir, DEFAULT_CONFIG_DIR];
+  return bases.flatMap((base) => [`${base}/${SELF_FOLDER}`, `${base}/${LEGACY_SELF_FOLDER}`]);
+}
 
 /** Files that are noise on every platform, matched by exact segment name. */
 const JUNK_NAMES = new Set([
@@ -43,13 +67,17 @@ function isIconMarker(segment: string): boolean {
  * fix. Paths already on the remote are still carried into our snapshots, so a device
  * running an older version that uploaded junk does not get it deleted underneath it.
  */
-export function alwaysSkip(path: string): boolean {
-  for (const selfDir of [PLUGIN_DIR, LEGACY_PLUGIN_DIR]) {
+export function alwaysSkip(path: string, configDir: string = DEFAULT_CONFIG_DIR): boolean {
+  for (const selfDir of selfDirs(configDir)) {
     if (path === selfDir || path.startsWith(`${selfDir}/`)) return true;
   }
 
   const segments = path.split("/");
-  if (segments.length === 2 && segments[0] === ".obsidian" && isWorkspaceFile(segments[1])) {
+  if (
+    segments.length === 2 &&
+    (segments[0] === configDir || segments[0] === DEFAULT_CONFIG_DIR) &&
+    isWorkspaceFile(segments[1])
+  ) {
     return true;
   }
   return segments.some(
@@ -67,6 +95,7 @@ export function pathError(path: string): string | null {
   if (new TextEncoder().encode(path).length > MAX_PATH_BYTES) return "path exceeds 1024 bytes";
   if (path.startsWith("/")) return "absolute path";
   if (path.includes("\\")) return "backslash in path";
+  // eslint-disable-next-line no-control-regex -- rejecting control characters is the point
   if (/[\u0000-\u001f\u007f]/.test(path)) return "control character in path";
   if (path !== path.normalize("NFC")) return "path not NFC-normalized";
   for (const seg of path.split("/")) {
@@ -105,9 +134,15 @@ export function makeExcluder(globs: string[]): (path: string) => boolean {
   return (path: string) => patterns.some((re) => re.test(path));
 }
 
-/** Obsidian's configuration directory: opt-in, and never this plugin's own folder inside it. */
-export function isConfigPath(path: string): boolean {
-  return path === ".obsidian" || path.startsWith(".obsidian/");
+/**
+ * Obsidian's configuration directory: opt-in, and never this plugin's own folder inside it.
+ *
+ * The **active** directory only, unlike `alwaysSkip`. This predicate gates the `syncConfigDir`
+ * consent, and a directory left behind by a previous config-folder name is ordinary vault
+ * content — not the config the user just agreed to publish.
+ */
+export function isConfigPath(path: string, configDir: string = DEFAULT_CONFIG_DIR): boolean {
+  return path === configDir || path.startsWith(`${configDir}/`);
 }
 
 /** One glob per line, blank lines dropped. The stored form of every glob setting. */
@@ -123,8 +158,10 @@ export interface ScopeRules {
   excludes: string[];
   /** Allow-list; empty means the whole vault. */
   onlyPaths: string[];
-  /** Whether ordinary `.obsidian/**` files are in scope. */
+  /** Whether ordinary configuration-directory files are in scope. */
   syncConfigDir: boolean;
+  /** This vault's configuration directory. Defaults to `.obsidian` when the caller has none. */
+  configDir?: string;
 }
 
 /**
@@ -139,10 +176,11 @@ export function makeScopeFilter(rules: ScopeRules): (path: string) => boolean {
   const excluded = makeExcluder(rules.excludes);
   const only = rules.onlyPaths.filter((glob) => glob.trim().length > 0);
   const included = makeExcluder(only);
+  const configDir = rules.configDir ?? DEFAULT_CONFIG_DIR;
   return (path: string) =>
-    !alwaysSkip(path) &&
+    !alwaysSkip(path, configDir) &&
     pathError(path) === null &&
-    (rules.syncConfigDir || !isConfigPath(path)) &&
+    (rules.syncConfigDir || !isConfigPath(path, configDir)) &&
     !excluded(path) &&
     (only.length === 0 || included(path));
 }
