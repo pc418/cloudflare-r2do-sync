@@ -101,12 +101,12 @@ export class SyncScheduler {
         return result;
       } catch (e) {
         const error = e instanceof Error ? e : new Error(String(e));
-        if (this.#stopped) throw new Error("sync scheduler stopped");
+        if (this.#stopped) throw new Error("sync scheduler stopped", { cause: e });
         this.lastError = error;
         this.#onError?.(error);
         if (attempt >= this.#retryDelaysMs.length || this.#stopped) throw error;
         await this.#waitForRetry(this.#retryDelaysMs[attempt++]);
-        if (this.#stopped) throw new Error("sync scheduler stopped");
+        if (this.#stopped) throw new Error("sync scheduler stopped", { cause: e });
       }
     }
   }

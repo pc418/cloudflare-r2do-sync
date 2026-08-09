@@ -231,7 +231,9 @@ export class VaultCrypto {
 
   private async decryptJsonWith<T>(key: CryptoKey, payload: EncPayload, what: string): Promise<T> {
     if (payload.alg !== "AES-GCM") {
-      throw new Error(`unsupported ${what} cipher "${payload.alg}"`);
+      // `payload.alg` narrows to `never` — the declared type says this cannot happen. It is
+      // remote data, so it can: stringify whatever actually arrived instead of trusting it.
+      throw new Error(`unsupported ${what} cipher "${String(payload.alg)}"`);
     }
     let pt: ArrayBuffer;
     try {

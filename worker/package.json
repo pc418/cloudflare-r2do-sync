@@ -6,6 +6,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
     "deploy": "node ../scripts/deploy.mjs"
   },
   "dependencies": {
@@ -15,9 +16,12 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.20.1",
     "@cloudflare/workers-types": "^5.20260801.0",
+    "@eslint/js": "^10.0.1",
     "esbuild": "^0.28.1",
+    "eslint": "^10.8.1",
     "jsonc-parser": "^3.3.1",
     "typescript": "^5.6.0",
+    "typescript-eslint": "^8.66.0",
     "vitest": "^4.1.10",
     "wrangler": "^4.0.0"
   },

@@ -317,7 +317,10 @@ const obsidianHttp: HttpClient = async (url, req) => {
   return {
     status: res.status,
     text: async () => res.text,
-    json: async () => res.json,
+    // Obsidian types `res.json` as `any`. `HttpResponse.json()` promises `unknown`, and
+    // returning `any` through it silently re-opens every validated call site in `api.ts`.
+    // The access stays inside the arrow so evaluation timing is unchanged.
+    json: async (): Promise<unknown> => res.json,
     arrayBuffer: async () => res.arrayBuffer,
   };
 };
@@ -3383,7 +3386,9 @@ export class LogSyncSettingTab extends PluginSettingTab {
               await this.plugin.saveSettings();
               this.display();
             },
-            onCancel: () => toggle.setValue(false),
+            onCancel: () => {
+              toggle.setValue(false);
+            },
           }).open();
         })
       );
@@ -3516,7 +3521,9 @@ export class LogSyncSettingTab extends PluginSettingTab {
                 this.plugin.settings.conflictMode = mode;
                 await this.plugin.saveSettings();
               },
-              onCancel: () => d.setValue(previous),
+              onCancel: () => {
+                d.setValue(previous);
+              },
             }).open();
           });
       });

@@ -680,7 +680,8 @@ export class SyncEngine {
           if (rescans >= MAX_RESCAN_ATTEMPTS) {
             throw new Error(
               `"${e.path}" kept changing while sync was reading it (${rescans + 1} attempts). ` +
-                "Nothing was published. Try again once the file settles."
+                "Nothing was published. Try again once the file settles.",
+              { cause: e }
             );
           }
           rescans++;
@@ -829,7 +830,10 @@ export class SyncEngine {
       }
     } catch (error) {
       if (error instanceof StaleHeadError) {
-        throw new Error("remote head changed during encryption migration; sync under the old mode and retry");
+        throw new Error(
+          "remote head changed during encryption migration; sync under the old mode and retry",
+          { cause: error }
+        );
       }
       throw error;
     }

@@ -171,6 +171,10 @@ export function mergeText(base: string, ours: string, theirs: string): TextMerge
     const stable = regionStart - bi;
     oi += stable;
     ti += stable;
+    // Dead today: every path below either returns or reassigns `bi` at `bi = regionEnd`.
+    // Kept so `bi` still means "base consumed up to here" for anything added in between —
+    // a stale index in this loop merges the wrong lines.
+    // eslint-disable-next-line no-useless-assignment -- see above
     bi = regionStart;
 
     let deltaOurs = 0;

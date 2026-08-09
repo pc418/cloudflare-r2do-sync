@@ -96,7 +96,7 @@ export class SyncApi {
   }
 
   async #toError(res: HttpResponse): Promise<ApiError> {
-    let body: ErrorBody | null = null;
+    let body: ErrorBody | null;
     let raw = "";
     try {
       raw = await res.text();

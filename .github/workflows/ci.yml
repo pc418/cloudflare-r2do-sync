@@ -26,14 +26,19 @@ jobs:
           npm ci --prefix worker
       - name: Test scripts
         run: node --test scripts/*.test.mjs
-      - name: Test and typecheck plugin
+      # Lint runs here but deliberately NOT in release.yml: its baseline is zero, so a nonzero
+      # exit means something new, but it is also the most churn-prone check in the repo and
+      # must never be what stops a tagged release from publishing.
+      - name: Test, typecheck and lint plugin
         run: |
           npm test --prefix plugin
           npm run typecheck --prefix plugin
-      - name: Test and typecheck Worker
+          npm run lint --prefix plugin
+      - name: Test, typecheck and lint Worker
         run: |
           npm test --prefix worker
           npm run typecheck --prefix worker
+          npm run lint --prefix worker
       - name: Build and validate release layout
         run: |
           npm run build --prefix plugin

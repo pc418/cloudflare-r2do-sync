@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { SyncApi, ApiError, AuthError, StaleHeadError, MissingBlobError } from "../src/api";
 import type { HttpClient, HttpRequest } from "../src/api";
 

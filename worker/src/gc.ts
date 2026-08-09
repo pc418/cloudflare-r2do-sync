@@ -45,7 +45,7 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
     console.log("gc: no head.json, skipping (empty vault or mirror missing)");
     return report;
   }
-  const { head } = (await headObj.json()) as { head: string | null };
+  const { head }: { head: string | null } = await headObj.json();
   if (head === null) return report;
 
   // Walk the head chain; retain while within keepCount OR younger than keepDays.
@@ -54,7 +54,7 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
   let cursor: string | null = head;
   let depth = 0;
   while (cursor !== null) {
-    const obj = await env.VAULT.get(`manifests/${cursor}.json`);
+    const obj: R2ObjectBody | null = await env.VAULT.get(`manifests/${cursor}.json`);
     if (obj === null) {
       // A missing ancestor after retained snapshots is expected once an earlier GC trimmed
       // history. A missing *head* is different: there is no trustworthy live set, so any
@@ -63,7 +63,7 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
       console.log(`gc: chain broken at ${cursor}, stopping walk`);
       break;
     }
-    const m = (await obj.json()) as Manifest;
+    const m: Manifest = await obj.json();
     const young = Date.parse(m.createdAt) >= ageCutoff;
     if (depth >= keepCount && !young) break; // older links are older still
     retainedIds.add(m.id);

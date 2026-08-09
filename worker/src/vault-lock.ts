@@ -22,7 +22,9 @@ export class VaultLock extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    ctx.blockConcurrencyWhile(async () => {
+    // Not awaitable in a constructor. A rejection here aborts the Durable Object, which is
+    // the intended failure mode, so the drop is explicit rather than accidental.
+    void ctx.blockConcurrencyWhile(async () => {
       this.ctx.storage.sql.exec(`
         CREATE TABLE IF NOT EXISTS meta (
           key TEXT PRIMARY KEY,
@@ -129,7 +131,7 @@ export class VaultLock extends DurableObject<Env> {
       if (obj === null) {
         return { ok: false, code: "invalid_manifest", message: `parent manifest ${manifest.parent} not found` };
       }
-      const parent = (await obj.json()) as Manifest;
+      const parent: Manifest = await obj.json();
       parentHashes = new Set(manifestHashes(parent));
     }
     const newHashes = [...new Set(manifestHashes(manifest))].filter((h) => !parentHashes.has(h));

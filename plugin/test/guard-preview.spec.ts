@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { SyncEngine, type MassChangeDecision, type MassChangeSummary } from "../src/sync";
+import { SyncEngine, type MassChangeSummary } from "../src/sync";
 import { FakeServer, FakeStore, FakeVault } from "./fakes";
 import type { Manifest, ManifestV1 } from "../src/types";
 import { VaultCrypto } from "../src/crypto";
