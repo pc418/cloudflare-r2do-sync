@@ -70,6 +70,7 @@ import { SyncScheduler } from "./queue";
 import {
   SETUP_ACTION,
   decodeSetupPayload,
+  encodeSetupPayload,
   encodeSetupUri,
   normalizeServerUrl,
   parseSetupText,
@@ -186,6 +187,58 @@ export function needsFirstSyncConsent(opts: {
   hasSyncedSnapshot: boolean;
 }): boolean {
   return !opts.acknowledged && !opts.hasSyncedSnapshot;
+}
+
+/**
+ * The thing a self-hosted sync plugin owes the user in plain words. Shown twice on purpose:
+ * as prose on the first-run panel, where it can still change someone's mind about installing
+ * this at all, and inside the first-sync gate, where it is answered rather than merely read.
+ *
+ * It takes the mode because the confidentiality half is only true in one of them. A fixed
+ * string promising the server cannot read anything is not a harmless simplification on a
+ * plaintext vault — it is a false assurance, made mandatory, moments before the notes are
+ * uploaded in the clear. Plaintext devices reach this dialog: `encryptionEnabled` is nothing
+ * but the mode, the gate has no mode guard, and `applySetup` copies the mode from the link.
+ */
+export function dataResponsibility(mode: EncryptionMode): string {
+  const shared =
+    "Keeping your own backups is yours to do, and nobody else can do it for you: there is " +
+    "no operator and no support channel behind this plugin. It is provided as-is, without " +
+    "warranty of any kind.";
+  return mode === "encrypted"
+    ? "R2DO Sync is self-hosted. Your notes live in storage you own and pay for, encrypted " +
+        "on this device under a master key that only you hold, so nobody else can read them " +
+        `or recover them for you. ${shared} Lose the key and every encrypted snapshot is ` +
+        "permanently unreadable."
+    : "R2DO Sync is self-hosted, and encryption is turned OFF for this vault. Your notes " +
+        "and their file paths are uploaded exactly as they are, so anyone who can read the " +
+        "storage bucket — your provider, and anyone holding its credentials — can read " +
+        `them. ${shared}`;
+}
+
+/**
+ * The one-time first-sync gate, one paragraph per entry. Exported as data so a test can prove
+ * the disclaimer is actually in the dialog the user has to answer, rather than only in the
+ * panel they may never look at.
+ */
+export function firstSyncConsentBody(mode: EncryptionMode): readonly string[] {
+  return [
+    "This device has not synced with the vault yet, so the first pass reconciles two " +
+      "collections of real files: everything the remote holds is merged into this vault, and " +
+      "everything here is published. Notes that cannot be merged are kept on both sides, but " +
+      "a copy of this vault is the only thing that makes a bad first pass fully undoable. " +
+      "Make one now if you have not.",
+    dataResponsibility(mode),
+  ];
+}
+
+/**
+ * No server URL or no access token means no engine can be built. The settings tab and
+ * `#finishRebuild` share this so the page and the engine can never disagree about whether
+ * this device is set up — a page claiming otherwise would send the user looking for a bug.
+ */
+export function isUnconfigured(s: Pick<Settings, "serverUrl" | "accessToken">): boolean {
+  return s.serverUrl.trim() === "" || s.accessToken.trim() === "";
 }
 
 /** Backoff between automatic retries. `retryAttempts` takes the first N. */
@@ -307,12 +360,16 @@ export default class LogSyncPlugin extends Plugin {
     const persistedStateServerUrl = endpointIdentity(
       data?.stateServerUrl ?? data?.settings?.serverUrl ?? this.settings.serverUrl
     );
-    this.#state = persistedStateServerUrl === this.#stateServerUrl ? (data?.state ?? null) : null;
+    const sameEndpoint = persistedStateServerUrl === this.#stateServerUrl;
+    this.#state = sameEndpoint ? (data?.state ?? null) : null;
+    // A hand-edited `data.json` can point this device at a different vault between loads.
+    // Dropping the cached head without dropping the consent leaves the flag alone to
+    // suppress the gate, so the first pass against a stranger's files happens unwarned.
+    if (!sameEndpoint) this.settings.firstSyncAcknowledged = false;
     this.#log = data?.log ?? [];
     this.#lastSuccessAt = data?.lastSuccessAt;
     this.#lastFailureAt = data?.lastFailureAt;
-    this.#sharedSettings =
-      persistedStateServerUrl === this.#stateServerUrl ? (data?.sharedSettings ?? null) : null;
+    this.#sharedSettings = sameEndpoint ? (data?.sharedSettings ?? null) : null;
     this.#lastConflicts = data?.lastConflicts ?? [];
     this.#pendingEncryptionTransition = data?.pendingEncryptionTransition ?? null;
 
@@ -369,8 +426,10 @@ export default class LogSyncPlugin extends Plugin {
       },
     });
     this.addCommand({
+      // The id outlives the label on purpose: renaming it would silently drop any hotkey a
+      // user has already bound to this command.
       id: "sync-setup-qr",
-      name: "Show device setup QR",
+      name: "Set up another device",
       callback: () => new DeviceSetupModal(this.app, this).open(),
     });
     this.addCommand({
@@ -539,8 +598,8 @@ export default class LogSyncPlugin extends Plugin {
         throw new WrongVaultKeyError(
           "shared settings were written with a different master key — this device was " +
             'configured by hand instead of from the vault. On a working device use "Set up ' +
-            'another device → Show QR" (or copy its setup link) and apply it here; a typed ' +
-            "server URL and access token do not carry the key."
+            'another device", then scan its QR or copy its setup link and apply that here; ' +
+            "a typed server URL and access token do not carry the key."
         );
       }
       // Positive proof this device holds the vault's key, so any earlier verdict is stale.
@@ -639,7 +698,7 @@ export default class LogSyncPlugin extends Plugin {
     await this.#schedulerDrain;
     if (generation !== this.#generation) return;
 
-    if (!this.settings.serverUrl || !this.settings.accessToken) {
+    if (isUnconfigured(this.settings)) {
       this.#phase = "unconfigured";
       this.#renderStatus();
       return;
@@ -803,12 +862,7 @@ export default class LogSyncPlugin extends Plugin {
     const accepted = await new Promise<boolean>((resolve) => {
       new ConfirmModal(this.app, {
         title: "Back up this vault before the first sync",
-        body:
-          "This device has not synced with the vault yet, so the first pass reconciles two " +
-          "collections of real files: everything the remote holds is merged into this vault, " +
-          "and everything here is published. Notes that cannot be merged are kept on both " +
-          "sides, but a copy of this vault is the only thing that makes a bad first pass " +
-          "fully undoable. Make one now if you have not.",
+        body: firstSyncConsentBody(this.settings.encryptionMode),
         confirmText: "I have a backup — sync",
         cancelText: "Not yet",
         onConfirm: () => resolve(true),
@@ -932,6 +986,19 @@ export default class LogSyncPlugin extends Plugin {
       new Notice("R2DO Sync: set the server URL and access token in settings first");
       return;
     }
+    // Publishing is publishing, however it is spelled. `syncNow` owns this gate and
+    // `forcePull` inherits it by calling `syncNow`, but this path talks to the scheduler
+    // directly — so without asking here a device that has never consented can overwrite the
+    // remote with its whole vault. Asked before the preview, so the two dialogs do not stack.
+    this.#interactive++;
+    let consented: boolean;
+    try {
+      consented = await this.#confirmFirstSync();
+    } finally {
+      this.#interactive--;
+    }
+    if (!consented) return;
+
     const summary = await this.#summarise(() => engine.forcePushSummary(), "push this device over the remote");
     if (summary === null) return;
 
@@ -1483,6 +1550,10 @@ export default class LogSyncPlugin extends Plugin {
       this.#state = null;
       // A different server's settings document has nothing to do with this one.
       this.#sharedSettings = null;
+      // Nor does the consent. It was given for the files of one vault, and the pass ahead
+      // reconciles against a different set — which is precisely why `applySetup` already
+      // re-arms it. Typing a new URL into the field has to mean the same thing.
+      this.settings.firstSyncAcknowledged = false;
     }
     this.#stateServerUrl = nextStateServerUrl;
     await this.#persist();
@@ -2034,7 +2105,8 @@ class ConfirmModal extends Modal {
     app: App,
     private readonly opts: {
       title: string;
-      body: string;
+      /** One paragraph, or several — a wall of text is a dialog nobody reads. */
+      body: string | readonly string[];
       /** When set, the phrase must be typed. Absent: a plain second-confirm button. */
       phrase?: string;
       confirmText?: string;
@@ -2050,7 +2122,9 @@ class ConfirmModal extends Modal {
     const { contentEl, opts } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: opts.title });
-    contentEl.createEl("p", { text: opts.body });
+    for (const paragraph of typeof opts.body === "string" ? [opts.body] : opts.body) {
+      contentEl.createEl("p", { text: paragraph });
+    }
 
     const phrase = opts.phrase;
     let typed = "";
@@ -2240,8 +2314,16 @@ class PassphraseKeyModal extends Modal {
   }
 }
 
-/** Desktop side of QR setup: turns a freshly minted token into a scannable code. */
-class DeviceSetupModal extends Modal {
+/**
+ * Hands this device's credentials to a new one, as a scannable code or as a copyable link.
+ *
+ * The link is not a convenience duplicate of the QR. Scanning is what delivers the payload,
+ * so a QR-only export can only reach devices that can point a camera at this screen: desktop
+ * to desktop had no route at all, and the "copy the setup link" the docs told people to use
+ * only existed when a phone scanner mis-routed `obsidian://` into a browser — a failure path
+ * dressed up as a feature.
+ */
+export class DeviceSetupModal extends Modal {
   #name = "phone";
   #token: string;
 
@@ -2262,8 +2344,10 @@ class DeviceSetupModal extends Modal {
     contentEl.createEl("h2", { text: "Set up another device" });
     contentEl.createEl("p", {
       text:
-        "The QR carries the server URL, the vault access token and the master key. Give " +
-        "the new device its own name — that is how conflict copies say where they came from.",
+        "Both the code and the link carry the server URL, the vault access token and the " +
+        "master key. Scan the code from a phone; copy the link for a device that cannot " +
+        "scan one, such as a second computer. Give the new device its own name — that is " +
+        "how conflict copies say where they came from.",
     });
 
     new Setting(contentEl)
@@ -2283,23 +2367,42 @@ class DeviceSetupModal extends Modal {
       });
 
     const out = contentEl.createDiv();
-    new Setting(contentEl).addButton((b) =>
-      b
-        .setButtonText("Show QR")
-        .setCta()
-        .onClick(() => this.#render(out))
-    );
+    new Setting(contentEl)
+      .addButton((b) =>
+        b
+          .setButtonText("Show QR")
+          .setCta()
+          .onClick(() => this.#render(out))
+      )
+      // Returns the promise rather than discarding it: Obsidian ignores it, but a test that
+      // cannot await the copy can only assert on whatever happened to have settled by then.
+      .addButton((b) => b.setButtonText("Copy setup link").onClick(() => this.#copy(out)));
   }
 
-  #render(out: HTMLElement): void {
-    out.empty();
+  /**
+   * The payload both exports share, or null with the reason said out loud. Building it in one
+   * place is what keeps the link and the code from ever describing different vaults.
+   */
+  #payload(): SetupPayload | null {
     if (!this.plugin.settings.serverUrl) {
       new Notice("Set the server URL in settings first");
-      return;
+      return null;
     }
     if (!this.#token) {
       new Notice("No token to share — set the access token in settings first");
-      return;
+      return null;
+    }
+    // Handing the key to a second device is not a backup, and it must not be able to pass
+    // for one. Without this the acknowledgement is laundered away by transit: this device
+    // exports a key it never saved, `applySetup` records it as backed up on the recipient,
+    // and the invariant the gate exists for — one durable copy exists somewhere — is gone.
+    if (this.plugin.encryptionEnabled && !this.plugin.settings.masterKeyBackedUp) {
+      new Notice(
+        "Back up the vault master key before sharing it. Sending it to another device is " +
+          "not a backup — both could be lost. Finish the key backup in settings first.",
+        10_000
+      );
+      return null;
     }
 
     const common = {
@@ -2317,15 +2420,70 @@ class DeviceSetupModal extends Modal {
         }
       : { ...common, mode: "plaintext" };
 
+    // Prove the receiving side will accept this before promising the user it is usable.
+    // Running the real parser rather than re-checking the fields here is what stops export
+    // and import from ever drifting apart, and it names the offending field for free — the
+    // alternative is a failure that surfaces on the *other* device, minutes later.
+    try {
+      decodeSetupPayload(encodeSetupPayload(payload));
+    } catch (error) {
+      new Notice(
+        `This device cannot produce a usable setup link yet: ${message(error)}. Finish ` +
+          "setting it up — or fix its settings — and try again.",
+        0
+      );
+      return null;
+    }
+    return payload;
+  }
+
+  #warn(out: HTMLElement, medium: string): void {
     out.createEl("p", {
       text: this.plugin.encryptionEnabled
-        ? "This QR contains the access token AND the vault master key. Anyone who photographs it gains full access — show it only to your own device."
-        : "This QR contains the access token. Anyone who photographs it can write to your vault.",
+        ? `This ${medium} contains the access token AND the vault master key. Anyone who gets it gains full access — give it only to your own device.`
+        : `This ${medium} contains the access token. Anyone who gets it can write to your vault.`,
     });
+  }
+
+  #render(out: HTMLElement): void {
+    out.empty();
+    const payload = this.#payload();
+    if (payload === null) return;
+
+    this.#warn(out, "QR");
     renderQr(out, encodeSetupUri(payload));
     out.createEl("p", {
       text: "On the other device: open the camera app, scan, and confirm when Obsidian opens.",
     });
+  }
+
+  async #copy(out: HTMLElement): Promise<void> {
+    out.empty();
+    const payload = this.#payload();
+    if (payload === null) return;
+
+    const uri = encodeSetupUri(payload);
+    this.#warn(out, "link");
+    try {
+      await navigator.clipboard.writeText(uri);
+      new Notice("Setup link copied. Paste it into the new device with \"Apply a setup link\".");
+      out.createEl("p", {
+        text:
+          "Copied. On the other device: Settings → R2DO Sync → Apply a setup link → Paste " +
+          "link. Clear your clipboard afterwards.",
+      });
+    } catch (error) {
+      // A clipboard the platform refuses must not leave the user with no route at all — the
+      // whole point of the link is reaching a device that cannot scan the code.
+      new Notice(`Could not copy the link: ${message(error)}. Select and copy it manually.`, 10_000);
+      const field = out.createEl("textarea");
+      field.value = uri;
+      field.readOnly = true;
+      field.rows = 3;
+      field.setAttr("aria-label", "Setup link");
+      field.focus();
+      field.select();
+    }
   }
 
   onClose(): void {
@@ -2367,7 +2525,14 @@ class ApplySetupModal extends Modal {
           .setCta()
           .onClick(async () => {
             this.close();
-            await this.plugin.applySetup(this.payload);
+            try {
+              await this.plugin.applySetup(this.payload);
+            } catch (error) {
+              // The window is already gone, so an unhandled rejection here is silence: the
+              // device looks configured and is not. `applySetup` catches its own connection
+              // test, which is the tell that failures were meant to be visible.
+              new Notice(`R2DO Sync could not apply the setup link: ${message(error)}`, 0);
+            }
           })
       )
       .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
@@ -2400,9 +2565,9 @@ class PasteSetupModal extends Modal {
     contentEl.createEl("h2", { text: "Apply a setup link" });
     contentEl.createEl("p", {
       text:
-        "On the configured device use \"Set up another device\", then copy the link the QR " +
-        "encodes and paste it here. It carries the server URL, the access token and the " +
-        "master key, so treat it like a password and clear your clipboard afterwards.",
+        "On the configured device use \"Set up another device\" → \"Copy setup link\", then " +
+        "paste it here. It carries the server URL, the access token and the master key, so " +
+        "treat it like a password and clear your clipboard afterwards.",
     });
 
     let text = "";
@@ -2539,6 +2704,54 @@ export class LogSyncSettingTab extends PluginSettingTab {
     );
   }
 
+  /**
+   * What a fresh install sees instead of two unexplained credential fields.
+   *
+   * The two ways in are not interchangeable and the difference is invisible from the fields
+   * alone: only a setup link or QR carries the vault's master key, so a second device that is
+   * configured by hand mints a key of its own and is refused at the first pass. That used to
+   * be discoverable only by hitting it, since the cure lived in a banner that appears *after*
+   * the failure. Leading with both routes puts the choice before the mistake.
+   */
+  #renderFirstRun(containerEl: HTMLElement): void {
+    containerEl.createEl("h3", { text: "Set up sync" });
+    containerEl.createEl("p", {
+      text:
+        "This device is not connected to a vault yet. There are two ways in, and they are " +
+        "not interchangeable.",
+    });
+
+    new Setting(containerEl)
+      .setName("Join a vault that already syncs")
+      .setDesc(
+        "On a device that already syncs, open Settings → R2DO Sync → \"Set up another " +
+          "device\". Scan the QR with this device's camera, or press \"Copy setup link\" " +
+          "there and paste it with the button here — that is the route for a second " +
+          "computer, which has nothing to scan with. A server URL and access token typed in " +
+          "by hand cannot join an encrypted vault: they do not carry the master key, so this " +
+          "device would mint a key of its own and be refused at the first pass."
+      )
+      .addButton((b) =>
+        b
+          .setButtonText("Paste setup link")
+          .setCta()
+          .onClick(() => new PasteSetupModal(this.app, this.plugin).open())
+      );
+
+    containerEl.createEl("p", {
+      text:
+        "Setting up the first device instead? Run scripts/setup.mjs from the repository on a " +
+        "computer and paste the server URL and access token it prints into the two fields " +
+        "below. This device then generates the vault's master key and asks you to save it " +
+        "before anything is uploaded.",
+    });
+
+    containerEl.createEl("p", {
+      text: dataResponsibility(this.plugin.settings.encryptionMode),
+      cls: "r2do-disclaimer",
+    });
+  }
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
@@ -2560,6 +2773,10 @@ export class LogSyncSettingTab extends PluginSettingTab {
             .setCta()
             .onClick(() => new PasteSetupModal(this.app, this.plugin).open())
         );
+    } else if (isUnconfigured(this.plugin.settings)) {
+      // Never both: the mismatch banner's cure is also "paste a setup link", and two primary
+      // buttons doing the same thing on one page is a page that has stopped giving advice.
+      this.#renderFirstRun(containerEl);
     }
 
     new Setting(containerEl)
@@ -2693,7 +2910,11 @@ export class LogSyncSettingTab extends PluginSettingTab {
         )
       );
 
-    if (this.plugin.encryptionEnabled && !this.plugin.settings.masterKeyBackedUp) {
+    // `masterKey` is empty until the engine generates one, and the CTA below feeds it
+    // straight to parseMasterKey — so on a brand-new device this row rendered a primary
+    // button whose only possible outcome was an error notice.
+    const hasKey = this.plugin.settings.masterKey.trim() !== "";
+    if (this.plugin.encryptionEnabled && hasKey && !this.plugin.settings.masterKeyBackedUp) {
       new Setting(containerEl)
         .setName("Key backup required")
         .setDesc("Sync is disabled until the generated or derived key is saved.")
@@ -2706,7 +2927,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
         ));
     }
 
-    if (this.plugin.encryptionEnabled) {
+    if (this.plugin.encryptionEnabled && hasKey) {
       new Setting(containerEl)
         .setName("Reveal master key")
         .setDesc("Shows the key so you can back it up or copy it to another device.")
@@ -2733,11 +2954,27 @@ export class LogSyncSettingTab extends PluginSettingTab {
         );
     }
 
+    const blockedReason = isUnconfigured(this.plugin.settings)
+      ? "Set the server URL and access token first — there is nothing to hand over yet."
+      : this.plugin.encryptionEnabled && !hasKey
+        ? "Waiting for this device's master key to be generated."
+        : this.plugin.encryptionEnabled && !this.plugin.settings.masterKeyBackedUp
+          ? "Back up the vault master key first. Sending it to another device is not a backup."
+          : null;
     new Setting(containerEl)
       .setName("Set up another device")
-      .setDesc("Shows a QR code carrying the server URL, an access token and the master key.")
+      .setDesc(
+        blockedReason ??
+          "Hands the server URL, an access token and the master key to a new device — as a " +
+            "QR code to scan from a phone, or as a link to paste into one that cannot scan."
+      )
       .addButton((b) =>
-        b.setButtonText("Show QR").onClick(() => new DeviceSetupModal(this.app, this.plugin).open())
+        b
+          .setButtonText("Set up device")
+          // Offering a window whose every button can only refuse is a dead end dressed as
+          // an action. The reason belongs in the description, not in a notice after a click.
+          .setDisabled(blockedReason !== null)
+          .onClick(() => new DeviceSetupModal(this.app, this.plugin).open())
       );
 
     new Setting(containerEl)

@@ -1,15 +1,20 @@
 import { fromBase64, parseMasterKey, parseVaultSalt, toBase64 } from "./crypto";
 
 /**
- * Device setup by QR code.
+ * Device setup by QR code or copied link.
  *
  * Typing a server URL, an access token and a 44-character master key on a phone is exactly
- * the kind of manual step that produces silent misconfiguration, so the desktop renders the
- * whole payload as a QR code encoding an `obsidian://` URI. The phone's own camera app opens
- * Obsidian directly, which means no camera or QR-scanning code has to ship in this plugin.
+ * the kind of manual step that produces silent misconfiguration, so the configured device
+ * exports the whole payload as one `obsidian://` URI. A phone gets it as a QR code its own
+ * camera app opens directly, which means no camera or QR-scanning code has to ship here; a
+ * device that cannot scan — a second computer — gets the same URI copied to the clipboard.
  *
- * The payload carries secrets. It is only ever rendered on screen at the user's request and
- * never persisted or transmitted.
+ * The payload carries secrets — the access token and, on an encrypted vault, the master key.
+ * It is built only at the user's explicit request and never sent to the server. It does leave
+ * the app when copied: the system clipboard is storage outside Obsidian's control, and macOS
+ * Universal Clipboard forwards it to the user's other Apple devices over iCloud. That is a
+ * real off-device transmission of the master key, so the UI says what the link carries and
+ * tells the user to clear their clipboard afterwards.
  */
 export const SETUP_ACTION = "r2do-sync-setup";
 

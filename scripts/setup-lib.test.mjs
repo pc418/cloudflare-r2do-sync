@@ -367,7 +367,8 @@ test("the summary carries everything that must reach the plugin, and no admin se
   assert.match(text, /access-token-value/);
   assert.match(text, /install-plugin\.mjs/);
   // The wording must match the actual plugin controls, not an idealised UI.
-  assert.match(text, /press "Generate" for the vault master key/);
+  assert.match(text, /a window asks you to save it/);
+  assert.match(text, /cd plugin && node build\.mjs && cd \.\./);
   assert.match(text, /enable "R2DO Sync"/);
   assert.match(text, /--rotate/);
   // The master-key warning is the one thing no support call can undo.
@@ -378,7 +379,13 @@ test("the summary carries everything that must reach the plugin, and no admin se
   assert.match(text, /GOOD TO KNOW \(nothing to do here\)/);
   assert.match(text, /ADMIN_TOKEN\) was saved to \.\/\.env/);
   assert.match(text, /re-running setup fixes it/);
-  assert.doesNotMatch(text, /ADMIN_TOKEN=|password manager|store it/i);
+  assert.doesNotMatch(text, /ADMIN_TOKEN=/);
+  // Scoped to the admin section rather than the whole summary. The steps above it now tell
+  // the user to put the *master key* in a password manager, which is correct and is the one
+  // secret they must handle by hand; a blanket ban on the phrase forbade that too.
+  const adminSection = text.slice(text.indexOf("GOOD TO KNOW"));
+  assert.doesNotMatch(adminSection, /password manager|store it/i);
+  assert.match(text, /Copy it into a password manager/);
 });
 
 test("a summary without an access token is a bug, not a message to explain", () => {

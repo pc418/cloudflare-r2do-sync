@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_SETTINGS, LogSyncSettingTab, type Settings } from "../src/main";
+import {
+  DEFAULT_SETTINGS,
+  LogSyncSettingTab,
+  dataResponsibility,
+  type Settings,
+} from "../src/main";
 import { App, type FakeElement, type RenderLog } from "./obsidian-fake";
 
 // Vitest aliases "obsidian" to the fake at runtime, but tsc still resolves the real types
@@ -17,8 +22,17 @@ function newTab(plugin: unknown, app: unknown = new App()): LogSyncSettingTab {
 // the const is initialised, so display() threw a TDZ ReferenceError and abandoned every
 // control below it. Nothing caught that, because no test had ever rendered this tab.
 
+// The default fixture is a device that is already connected, because that is the state this
+// page spends its life in. A device with no credentials renders an extra first-run panel
+// ahead of everything else, so tests about the ordinary page must not start from that state;
+// the "first run" block below opts back into it explicitly.
+const CONFIGURED: Partial<Settings> = {
+  serverUrl: "https://vault.example.workers.dev",
+  accessToken: "access-token",
+};
+
 function fakePlugin(over: Partial<Settings> = {}, keyMismatch: string | null = null) {
-  const settings: Settings = { ...DEFAULT_SETTINGS, ...over };
+  const settings: Settings = { ...DEFAULT_SETTINGS, ...CONFIGURED, ...over };
   return {
     app: new App(),
     settings,
@@ -326,6 +340,129 @@ describe("settings tab rendering", () => {
 
   it("says nothing about setup links when the key is fine", () => {
     expect(render().names).not.toContain("This device is not set up for this vault");
+  });
+
+  // The row opens a window that exports two ways now, so a button still labelled "Show QR"
+  // would hide the only route to a device that has no camera to scan with.
+  it("opens device setup without promising only a QR", () => {
+    const { log, names } = render({ masterKey: "a".repeat(44), masterKeyBackedUp: true });
+    const index = names.indexOf("Set up another device");
+    expect(log.rows[index].buttons.map((b) => b.text)).toEqual(["Set up device"]);
+    expect(log.rows[index].buttons[0].disabled).toBe(false);
+    expect(log.settings[index].desc).toContain("cannot scan");
+  });
+
+  // Every one of these rows used to render an enabled control whose only outcome was an
+  // error notice. A button offered for something that cannot be done is a dead end, and the
+  // reason belongs on the page rather than in a notice after the click.
+  describe("actions with unmet prerequisites", () => {
+    function setupRow(over: Partial<Settings>) {
+      const { log, names } = render(over);
+      const index = names.indexOf("Set up another device");
+      return { setting: log.settings[index], button: log.rows[index].buttons[0] };
+    }
+
+    it("will not offer device setup before there is anything to hand over", () => {
+      const { setting, button } = setupRow({ serverUrl: "", accessToken: "" });
+      expect(button.disabled).toBe(true);
+      expect(setting.desc).toContain("nothing to hand over");
+    });
+
+    it("will not offer device setup before the key exists", () => {
+      const { setting, button } = setupRow({ masterKey: "" });
+      expect(button.disabled).toBe(true);
+      expect(setting.desc).toContain("master key to be generated");
+    });
+
+    it("will not share a key whose backup is unfinished", () => {
+      const { setting, button } = setupRow({ masterKey: "a".repeat(44), masterKeyBackedUp: false });
+      expect(button.disabled).toBe(true);
+      expect(setting.desc).toContain("not a backup");
+    });
+
+    it.each(["Key backup required", "Reveal master key"])(
+      "hides %s until a key has been generated",
+      (row) => {
+        expect(render({ masterKey: "" }).names).not.toContain(row);
+      }
+    );
+  });
+
+  // A fresh install used to land on two bare credential fields. Joining an existing vault was
+  // reachable only from the command palette, or from the key-mismatch banner that appears
+  // *after* a hand-configuration has already failed — the failure taught the user what the
+  // page should have said first.
+  describe("first run", () => {
+    const FRESH: Partial<Settings> = { serverUrl: "", accessToken: "" };
+
+    it("leads with the setup panel, ahead of every other section", () => {
+      expect(render(FRESH).log.headings).toEqual([
+        "Set up sync",
+        "Encryption",
+        "Safety",
+        "Advanced",
+      ]);
+    });
+
+    it("offers the setup-link route first, as the default action", () => {
+      const { log, names } = render(FRESH);
+      expect(names.indexOf("Join a vault that already syncs")).toBe(0);
+      const button = log.rows[0].buttons[0];
+      expect(button.text).toBe("Paste setup link");
+      expect(button.cta).toBe(true);
+      // Rendering a button proves nothing about it opening anything.
+      expect(() => button.click()).not.toThrow();
+    });
+
+    it("warns that hand-typed credentials cannot join an encrypted vault", () => {
+      // The single most expensive misunderstanding this plugin has: a URL and a token look
+      // like enough, so the user types them and the device silently mints a key of its own.
+      expect(render(FRESH).log.settings[0].desc).toContain("mint a key of its own");
+    });
+
+    it("points a first device at the setup script and the fields below", () => {
+      expect(render(FRESH).log.paragraphs.join(" ")).toContain("scripts/setup.mjs");
+    });
+
+    it("states that the user is responsible for their own data", () => {
+      expect(render(FRESH).log.paragraphs).toContain(dataResponsibility("encrypted"));
+    });
+
+    it("does not promise encryption to a device set to plaintext", () => {
+      const { log } = render({ ...FRESH, encryptionMode: "plaintext", masterKeyBackedUp: true });
+      expect(log.paragraphs).toContain(dataResponsibility("plaintext"));
+      expect(log.paragraphs).not.toContain(dataResponsibility("encrypted"));
+    });
+
+    it("still gives every row of the fresh page a name and a control", () => {
+      for (const setting of render(FRESH).log.settings) {
+        expect(setting.name, JSON.stringify(setting)).not.toBe("");
+        expect(setting.controls.length, setting.name).toBeGreaterThan(0);
+      }
+    });
+
+    it("drops the panel entirely once the device is connected", () => {
+      const { log, names } = render();
+      expect(names).not.toContain("Join a vault that already syncs");
+      expect(log.paragraphs).not.toContain(dataResponsibility("encrypted"));
+    });
+
+    it.each([
+      ["no token", { serverUrl: "https://vault.example.workers.dev", accessToken: "" }],
+      ["no URL", { serverUrl: "", accessToken: "access-token" }],
+      ["blank-looking values", { serverUrl: "   ", accessToken: "  " }],
+    ])("still counts as unconfigured with %s", (_label, over) => {
+      expect(render(over).names).toContain("Join a vault that already syncs");
+    });
+
+    it("yields to the key-mismatch banner instead of offering two paste routes", () => {
+      // Both cures are "paste a setup link". Rendering them together would put two primary
+      // buttons that do the same thing on one page.
+      const { log, names } = render(FRESH, "written with a different master key");
+      expect(names[0]).toBe("This device is not set up for this vault");
+      expect(log.headings).not.toContain("Set up sync");
+      expect(names).not.toContain("Join a vault that already syncs");
+    });
   });
 
   it("renders identically on a second display() call", () => {

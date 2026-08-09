@@ -49,3 +49,14 @@
 .r2do-diff-same {
   color: var(--text-muted);
 }
+
+/*
+ * The self-hosting disclaimer on the first-run panel. Muted and set apart, because it has to
+ * be readable without competing with the two setup routes it sits under.
+ */
+.r2do-disclaimer {
+  color: var(--text-muted);
+  font-size: var(--font-smaller);
+  border-left: 2px solid var(--background-modifier-border);
+  padding-left: 0.75em;
+}

@@ -59,8 +59,10 @@ node scripts/install-plugin.mjs "/path/to/Your Vault"
 ```
 
 1. Obsidian → Settings → Community plugins → enable **R2DO Sync**.
-2. Fill in **Server URL** and **Access token** from the printed block, and set a
-   **Device name** (any label you like — it is what conflict copies are named after).
+2. A device with no credentials opens on a **Set up sync** panel naming the two ways in and
+   what self-hosting puts on you. This is the first device, so use the fields under it: the
+   **Server URL** and **Access token** from the printed block, plus a **Device name** (any
+   label you like — it is what conflict copies are named after).
 3. R2DO Sync generates a random vault master key before the first upload and opens the
    required backup window. Copy the key into your password manager and press **I saved
    it**; sync stays disabled until you do. Then press **Sync now**.
@@ -72,22 +74,28 @@ passphrase is discarded.
 
 ### Adding another device
 
-On the configured device, use **Set up another device → Show QR** and scan it with the new
-device's camera. The QR carries the server URL, the token and the master key, and opens
-Obsidian directly, so nothing is typed by hand.
+On the configured device, open **Set up another device**. It exports the same payload — the
+server URL, the token and the master key — two ways, and nothing is ever typed by hand:
 
-**Scan before the new device's first sync.** Without the master key it cannot read the
+- **Show QR**, for a phone. Scan it with the phone's own camera app; the code encodes an
+  `obsidian://` link, so Obsidian opens directly.
+- **Copy setup link**, for anything that cannot scan a code — a second computer, most
+  obviously. Paste it into the new device with **Apply a setup link**.
+
+**Set the new device up before its first sync.** Without the master key it cannot read the
 vault, and it will stop rather than guess — that halt is the safety net working.
 
 Typing the server URL and access token into a new device by hand **cannot** work on an
 encrypted vault: neither of them carries the master key, so the device generates one of its
-own and is rejected. When that happens the top of its settings page says so and offers
-**Paste setup link** right there — that is the whole fix.
+own and is rejected. The **Set up sync** panel says this before you try and offers **Paste
+setup link** beside the warning; if you type them in anyway, the same offer reappears at the
+top of the settings page once the device is refused — that is the whole fix.
 
-If the scan opens a browser instead of Obsidian — common on phones — copy the link and use
 **Apply a setup link → Paste link** on the new device (or the "Apply a setup link (paste)"
-command). It takes the whole `obsidian://…` link or just its payload, and refuses anything
-it cannot use instead of half-configuring the device.
+command) takes the whole `obsidian://…` link or just its payload, and refuses anything it
+cannot use instead of half-configuring the device. Use it with a copied link, and also when
+a phone's scanner opens the link in a browser instead of Obsidian — copy it from the address
+bar and paste it here.
 
 A new device that already holds a copy of the vault (or part of one) is fine: identical
 files are recognised by content hash and do nothing, notes that both sides created merge,
@@ -105,7 +113,7 @@ why creating the folders by hand only works on Android. The copy carries the plu
 server settings and the keys, so there is nothing to scan or type; just change **Device
 name** in settings afterwards so conflict copies name the right device. (On Android you can
 instead copy the three files from `plugin/dist/` into
-`YourVault/.obsidian/plugins/cloudflare-rdo-sync/` and set up by QR as usual.)
+`YourVault/.obsidian/plugins/cloudflare-rdo-sync/` and set it up by QR or link as usual.)
 
 Once it runs: there is no status bar on mobile, so the **ribbon icon** is the sync button —
 tap it to sync, and its tooltip carries the same state the desktop status bar shows. Every
@@ -146,6 +154,11 @@ can be two different accounts, so the script never silently switches between the
   never synced: `data.json` holds this device's access token and master key in plaintext.
   The old `.obsidian/plugins/obsidian-log-sync/**` credential directory is also
   permanently skipped so a leftover legacy `data.json` can never enter a snapshot.
+- **Your data stays your responsibility.** Nothing here is a service: there is no operator
+  and no support channel that can read your notes back to you or restore them on your
+  behalf. Your own backups and your own master key are part of running this, and the plugin
+  is provided as-is under the MIT license, without warranty. The first-run panel and the
+  first-sync prompt both say so, and the prompt has to be answered before anything uploads.
 
 ## Tokens
 
@@ -305,14 +318,15 @@ two byte-compatible — so a bug in the plugin cannot make your backups unreadab
 ## Development
 
 ```bash
+# All commands are run from the repository root.
 npm --prefix worker install && npm --prefix plugin install
 
-cd worker && npx vitest run          # 84 tests, real workerd via vitest-pool-workers
-cd plugin && npx vitest run          # 561 tests, incl. rendered settings-tab/modal coverage
+npm --prefix worker test             # 84 tests, real workerd via vitest-pool-workers
+npm --prefix plugin test             # 585 tests, incl. rendered settings-tab/modal coverage
 node --test scripts/*.test.mjs       # 42 tests: deploy/setup/release/token helpers
 
-cd plugin && node build.mjs          # -> plugin/dist/{main.js,manifest.json,styles.css}
-npm run validate -- 0.1.6            # release layout check; works from plugin/ or the root
+npm --prefix plugin run build        # -> plugin/dist/{main.js,manifest.json,styles.css}
+node scripts/release-validate.mjs 0.1.8   # release layout check; must run from the root
 ```
 
 `worker/wrangler.jsonc` is the single source of deployment metadata for both deploy paths.

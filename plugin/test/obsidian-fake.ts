@@ -41,12 +41,24 @@ class FakeInput {
 
 export class FakeElement {
   readonly children: FakeElement[] = [];
+  // Enough of a textarea to model the secret-bearing ones the UI falls back to when the
+  // clipboard is unavailable: the value must be readable, and "was it offered for manual
+  // selection" is the difference between a dead end and a working escape hatch.
+  value = "";
+  readOnly = false;
+  rows = 0;
+  selected = false;
   constructor(
     readonly tag: string,
     readonly text: string,
     readonly log: RenderLog,
     readonly cls: string = ""
   ) {}
+  focus(): void {}
+  select(): void {
+    this.selected = true;
+  }
+  setAttr(): void {}
   empty(): void {
     this.children.length = 0;
     this.log.headings.length = 0;
