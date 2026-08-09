@@ -1,0 +1,51 @@
+/*
+ * R2DO Sync uses Obsidian's native components almost everywhere. The exception is the conflict
+ * view, which has to show a diff: that needs a monospace, scrollable body and a colour per side.
+ * Every colour is an Obsidian theme variable, so light, dark and custom themes all stay legible.
+ */
+
+.r2do-conflict {
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 0.75em;
+  margin-top: 0.75em;
+}
+
+.r2do-diff {
+  margin: 0.5em 0;
+}
+
+.r2do-diff-body {
+  max-height: 40vh;
+  overflow: auto;
+  padding: 0.5em;
+  margin: 0;
+  background: var(--background-secondary);
+  border-radius: var(--radius-s);
+  font-family: var(--font-monospace);
+  font-size: var(--font-smaller);
+  line-height: 1.4;
+  /* Long lines scroll horizontally rather than wrapping: a wrapped diff line is unreadable. */
+  white-space: pre;
+  tab-size: 4;
+}
+
+.r2do-diff-ours,
+.r2do-diff-theirs,
+.r2do-diff-same {
+  padding: 0 0.25em;
+}
+
+/* "Ours" is what is being replaced if the other side wins, so it reads as the removal. */
+.r2do-diff-ours {
+  background: var(--background-modifier-error);
+  color: var(--text-normal);
+}
+
+.r2do-diff-theirs {
+  background: var(--background-modifier-success);
+  color: var(--text-normal);
+}
+
+.r2do-diff-same {
+  color: var(--text-muted);
+}

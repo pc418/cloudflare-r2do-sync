@@ -1,0 +1,121 @@
+import { describe, expect, it } from "vitest";
+import { ObsidianVault } from "../src/obsidian-vault";
+
+type Entry =
+  | { type: "file"; bytes: Uint8Array; mtime: number }
+  | { type: "folder" };
+
+class FakeDataAdapter {
+  readonly entries = new Map<string, Entry>([["", { type: "folder" }]]);
+  readonly systemTrash: string[] = [];
+  readonly localTrash: string[] = [];
+  systemTrashAvailable = true;
+
+  addFile(path: string, text: string, mtime = 1): void {
+    this.entries.set(path, { type: "file", bytes: new TextEncoder().encode(text), mtime });
+    const parts = path.split("/").slice(0, -1);
+    for (let i = 1; i <= parts.length; i++) {
+      this.entries.set(parts.slice(0, i).join("/"), { type: "folder" });
+    }
+  }
+
+  async list(path: string): Promise<{ files: string[]; folders: string[] }> {
+    const prefix = path === "" ? "" : `${path}/`;
+    const files: string[] = [];
+    const folders = new Set<string>();
+    for (const [candidate, entry] of this.entries) {
+      if (candidate === path || !candidate.startsWith(prefix)) continue;
+      const rest = candidate.slice(prefix.length);
+      if (rest.includes("/")) {
+        folders.add(`${prefix}${rest.split("/")[0]}`);
+      } else if (entry.type === "file") {
+        files.push(candidate);
+      } else {
+        folders.add(candidate);
+      }
+    }
+    return { files: files.sort(), folders: [...folders].sort() };
+  }
+
+  async stat(path: string): Promise<{ type: "file" | "folder"; ctime: number; mtime: number; size: number } | null> {
+    const entry = this.entries.get(path);
+    if (entry === undefined) return null;
+    if (entry.type === "folder") return { type: "folder", ctime: 0, mtime: 0, size: 0 };
+    return { type: "file", ctime: 0, mtime: entry.mtime, size: entry.bytes.byteLength };
+  }
+
+  async readBinary(path: string): Promise<ArrayBuffer> {
+    const entry = this.entries.get(path);
+    if (entry?.type !== "file") throw new Error(`not a file: ${path}`);
+    return entry.bytes.slice().buffer;
+  }
+
+  async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
+    const existing = this.entries.get(path);
+    if (existing?.type === "folder") throw new Error(`not a file: ${path}`);
+    this.entries.set(path, { type: "file", bytes: new Uint8Array(data.slice(0)), mtime: 2 });
+  }
+
+  async mkdir(path: string): Promise<void> {
+    if (this.entries.has(path)) throw new Error(`already exists: ${path}`);
+    this.entries.set(path, { type: "folder" });
+  }
+
+  async trashSystem(path: string): Promise<boolean> {
+    if (!this.systemTrashAvailable) return false;
+    this.systemTrash.push(path);
+    this.entries.delete(path);
+    return true;
+  }
+
+  async trashLocal(path: string): Promise<void> {
+    this.localTrash.push(path);
+    this.entries.delete(path);
+  }
+}
+
+function vault(adapter: FakeDataAdapter): ObsidianVault {
+  return new ObsidianVault({ vault: { adapter } } as never);
+}
+
+describe("ObsidianVault DataAdapter bridge", () => {
+  it("recursively lists ordinary and hidden config files", async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.addFile("note.md", "note", 10);
+    adapter.addFile(".obsidian/app.json", "{}", 20);
+    adapter.addFile(".obsidian/plugins/other/data.json", "secret", 30);
+
+    await expect(vault(adapter).list()).resolves.toEqual([
+      { path: ".obsidian/app.json", size: 2, mtime: 20 },
+      { path: ".obsidian/plugins/other/data.json", size: 6, mtime: 30 },
+      { path: "note.md", size: 4, mtime: 10 },
+    ]);
+  });
+
+  it("creates parents, writes, reads, and trashes through the adapter", async () => {
+    const adapter = new FakeDataAdapter();
+    const bridge = vault(adapter);
+    await bridge.write(".obsidian/plugins/theme/data.json", new TextEncoder().encode("ok"));
+    await expect(bridge.read(".obsidian/plugins/theme/data.json")).resolves.toEqual(
+      new TextEncoder().encode("ok")
+    );
+    expect(adapter.entries.get(".obsidian/plugins/theme")).toEqual({ type: "folder" });
+    await bridge.remove(".obsidian/plugins/theme/data.json");
+    expect(adapter.systemTrash).toEqual([".obsidian/plugins/theme/data.json"]);
+  });
+
+  it("falls back to local trash only when system trash reports unavailable", async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.systemTrashAvailable = false;
+    adapter.addFile("note.md", "note");
+    await vault(adapter).remove("note.md");
+    expect(adapter.localTrash).toEqual(["note.md"]);
+  });
+
+  it("fails loudly when a parent segment is a file", async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.addFile(".obsidian", "not a folder");
+    await expect(vault(adapter).write(".obsidian/app.json", new Uint8Array([1])))
+      .rejects.toThrow(/not a folder/);
+  });
+});

@@ -1,0 +1,21 @@
+{
+  "name": "cloudflare-r2do-sync-plugin",
+  "private": true,
+  "type": "module",
+  "version": "0.1.6",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "build": "node build.mjs",
+    "validate": "node ../scripts/release-validate.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.1",
+    "obsidian": "^1.7.2",
+    "qrcode-generator": "^2.0.4",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.10"
+  }
+}

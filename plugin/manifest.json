@@ -1,0 +1,10 @@
+{
+  "id": "cloudflare-rdo-sync",
+  "name": "R2DO Sync",
+  "version": "0.1.6",
+  "minAppVersion": "1.5.0",
+  "description": "Versioned vault sync to Cloudflare R2 with content-addressed snapshots and serialized commits.",
+  "author": "pc418",
+  "authorUrl": "https://github.com/pc418",
+  "isDesktopOnly": false
+}

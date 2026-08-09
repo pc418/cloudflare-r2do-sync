@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ["*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            plugin/package-lock.json
+            worker/package-lock.json
+      - name: Install dependencies
+        run: |
+          npm ci --prefix plugin
+          npm ci --prefix worker
+      - name: Test scripts
+        run: node --test scripts/*.test.mjs
+      - name: Test and typecheck plugin
+        run: |
+          npm test --prefix plugin
+          npm run typecheck --prefix plugin
+      - name: Test and typecheck Worker
+        run: |
+          npm test --prefix worker
+          npm run typecheck --prefix worker
+      - name: Build and validate tagged release
+        run: |
+          npm run build --prefix plugin
+          node scripts/release-validate.mjs "$GITHUB_REF_NAME"
+      - name: Attest release assets
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            plugin/dist/main.js
+            plugin/dist/manifest.json
+            plugin/dist/styles.css
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          plugin/dist/main.js
+          plugin/dist/manifest.json
+          plugin/dist/styles.css
+          --verify-tag
+          --generate-notes
+          --title "$GITHUB_REF_NAME"

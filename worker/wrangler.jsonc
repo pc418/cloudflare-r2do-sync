@@ -1,0 +1,17 @@
+// LOCAL TEST CONFIG ONLY.
+// This file exists solely so @cloudflare/vitest-pool-workers can construct the
+// test runtime bindings. NEVER deploy with the wrangler CLI — the local wrangler
+// login belongs to a DIFFERENT Cloudflare account. Deploys go through
+// scripts/deploy.mjs (REST API, token from ../.env).
+{
+  "name": "obsidian-log-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-03",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "VAULT_LOCK", "class_name": "VaultLock" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VaultLock"] }],
+  "r2_buckets": [{ "binding": "VAULT", "bucket_name": "obsidian-log-sync" }],
+  "triggers": { "crons": ["0 4 * * *"] }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "cloudflare-r2do-sync-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "deploy": "node ../scripts/deploy.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.6.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.20.1",
+    "@cloudflare/workers-types": "^5.20260801.0",
+    "esbuild": "^0.28.1",
+    "jsonc-parser": "^3.3.1",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.0.0"
+  },
+  "overrides": {
+    "undici": "7.29.0"
+  }
+}
