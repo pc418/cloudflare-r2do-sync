@@ -19,7 +19,7 @@ import {
   netLines,
   type LineCounts,
 } from "./lines";
-import { alwaysSkip, makeExcluder, pathError } from "./paths";
+import { alwaysSkip, isConfigPath, makeExcluder, pathError } from "./paths";
 import { DEFAULT_LANES, clampLanes, mapPool } from "./pool";
 import { createUlidFactory } from "./ulid";
 import { isSyncMode, type SyncMode } from "./sync-policy";
@@ -1839,9 +1839,6 @@ function isGeneratedConflictPath(path: string): boolean {
   return /(?:^|\/)[^/]+\.conflict-.+-\d{6}-\d{4}(?:-\d+)?(?:\.[^/]*)?$/.test(path);
 }
 
-function isConfigPath(path: string): boolean {
-  return path === ".obsidian" || path.startsWith(".obsidian/");
-}
 
 function untouchable(skipped: SkippedFile[]): Set<string> {
   return new Set(skipped.map((s) => s.path));

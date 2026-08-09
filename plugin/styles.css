@@ -60,3 +60,22 @@
   border-left: 2px solid var(--background-modifier-border);
   padding-left: 0.75em;
 }
+
+/*
+ * A refusal has to look like one. Both of these are prose the page adds beside a control, and
+ * a page that reads identically whether or not it just rejected something has said nothing.
+ */
+.r2do-error {
+  color: var(--text-error);
+}
+
+.r2do-hint {
+  color: var(--text-muted);
+  font-size: var(--font-smaller);
+  margin: -0.5em 0 0.9em;
+}
+
+/* Globs are punctuation. Proportional type makes `**` and `*` hard to tell apart mid-line. */
+.r2do-globs {
+  font-family: var(--font-monospace);
+}

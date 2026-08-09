@@ -27,15 +27,26 @@ export function newRenderLog(): RenderLog {
 class FakeInput {
   type = "text";
   value = "";
-  private readonly listeners = new Map<string, Array<() => void>>();
-  addEventListener(event: string, fn: () => void): void {
+  rows = 0;
+  readonly classes: string[] = [];
+  private readonly listeners = new Map<string, Array<(arg?: unknown) => void>>();
+  addEventListener(event: string, fn: (arg?: unknown) => void): void {
     const list = this.listeners.get(event) ?? [];
     list.push(fn);
     this.listeners.set(event, list);
   }
-  /** Test helper: fire a listener the UI registered (blur staging, etc.). */
-  fire(event: string): void {
-    for (const fn of this.listeners.get(event) ?? []) fn();
+  addClass(cls: string): void {
+    this.classes.push(cls);
+  }
+  removeClass(): void {}
+  focus(): void {}
+  select(): void {}
+  /**
+   * Test helper: fire a listener the UI registered (blur staging, Enter, …). The argument is
+   * the event, because a field that commits on Enter has to be told which key was pressed.
+   */
+  fire(event: string, arg?: unknown): void {
+    for (const fn of this.listeners.get(event) ?? []) fn(arg);
   }
 }
 
@@ -48,30 +59,68 @@ export class FakeElement {
   readOnly = false;
   rows = 0;
   selected = false;
+  /** Where this element's text is recorded, so later writes to it stay visible to tests. */
+  #recordedIn: string[] | null = null;
+  #recordedAt = -1;
   constructor(
     readonly tag: string,
-    readonly text: string,
+    public text: string,
     readonly log: RenderLog,
-    readonly cls: string = ""
+    readonly cls: string = "",
+    readonly href: string = "",
+    /** True for a container the UI itself owns and re-renders wholesale. */
+    readonly root: boolean = false
   ) {}
   focus(): void {}
   select(): void {
     this.selected = true;
   }
   setAttr(): void {}
+  /**
+   * Clearing a container the UI owns (a settings page, a modal body) resets the record with
+   * it. Clearing a nested div does not: the UI empties those to redraw one region — an export
+   * that is no longer valid, say — and the rest of the page it sits in is still on screen.
+   */
   empty(): void {
     this.children.length = 0;
+    this.text = "";
+    this.#rerecord();
+    if (!this.root) return;
     this.log.headings.length = 0;
     this.log.paragraphs.length = 0;
     this.log.settings.length = 0;
     this.log.rows.length = 0;
   }
-  createEl(tag: string, opts?: { text?: string; cls?: string }): FakeElement {
-    const el = new FakeElement(tag, opts?.text ?? "", this.log, opts?.cls ?? "");
+  createEl(tag: string, opts?: { text?: string; cls?: string; href?: string }): FakeElement {
+    const el = new FakeElement(tag, opts?.text ?? "", this.log, opts?.cls ?? "", opts?.href ?? "");
     this.children.push(el);
-    if (tag === "h3" || tag === "h2") this.log.headings.push(el.text);
-    if (tag === "p") this.log.paragraphs.push(el.text);
+    if (tag === "h3" || tag === "h2") el.#recordIn(this.log.headings);
+    if (tag === "p") el.#recordIn(this.log.paragraphs);
+    // A paragraph built from inline children (<strong>, <a>) still reads as one string, the
+    // way textContent does. Without this, prose split across children vanishes from the log.
+    // Only for elements whose own text is recorded: a container div that absorbed everything
+    // its children ever held would still read as full after it is emptied.
+    if (el.text !== "" && this.#recordedIn !== null) this.#grow(el.text);
     return el;
+  }
+  /** Obsidian's own DOM extension: text appended around inline children. */
+  appendText(value: string): this {
+    this.#grow(value);
+    return this;
+  }
+  #recordIn(sink: string[]): void {
+    this.#recordedIn = sink;
+    this.#recordedAt = sink.length;
+    sink.push(this.text);
+  }
+  #grow(value: string): void {
+    this.text += value;
+    this.#rerecord();
+  }
+  #rerecord(): void {
+    const sink = this.#recordedIn;
+    // A stale element (its container was emptied) must not write into the cleared log.
+    if (sink !== null && this.#recordedAt < sink.length) sink[this.#recordedAt] = this.text;
   }
   createDiv(opts?: { text?: string; cls?: string }): FakeElement {
     return this.createEl("div", opts);
@@ -84,14 +133,17 @@ export class FakeElement {
   byClass(cls: string): FakeElement[] {
     return this.children.flatMap((c) => [...(c.cls === cls ? [c] : []), ...c.byClass(cls)]);
   }
-  setText(): void {}
+  setText(value: string): void {
+    this.text = value;
+    this.#rerecord();
+  }
   addClass(): void {}
   removeClass(): void {}
   setAttribute(): void {}
 }
 
 export function fakeContainer(log = newRenderLog()): FakeElement {
-  return new FakeElement("div", "", log);
+  return new FakeElement("div", "", log, "", "", true);
 }
 
 export class TextComponent {
@@ -212,7 +264,7 @@ export class Setting {
 
   // Registered on construction, so a throw part-way through a chain still shows how far
   // rendering got — that is exactly the failure this fake exists to catch.
-  constructor(container: FakeElement) {
+  constructor(private readonly container: FakeElement) {
     container.log.settings.push(this.rendered);
     container.log.rows.push(this);
   }
@@ -224,7 +276,19 @@ export class Setting {
     this.rendered.desc = desc;
     return this;
   }
+  /**
+   * A section title, which is what Obsidian renders this as. Recorded as a heading and taken
+   * back out of the settings list: counting it as a setting would fail "every setting has a
+   * control" for something that is not one.
+   */
   setHeading(): this {
+    const log = this.container.log;
+    const at = log.settings.indexOf(this.rendered);
+    if (at >= 0) {
+      log.settings.splice(at, 1);
+      log.rows.splice(at, 1);
+    }
+    log.headings.push(this.rendered.name);
     return this;
   }
   addText(cb: (t: TextComponent) => unknown): this {
@@ -306,16 +370,26 @@ export class PluginSettingTab {
 }
 
 export class Modal {
+  /**
+   * Every modal that has been opened, newest last. A window the page raises is part of what
+   * the page does — a test that cannot reach it can only assert that a button was wired, not
+   * that clicking it asks anything or that answering has an effect.
+   */
+  static readonly shown: Modal[] = [];
   contentEl: FakeElement = fakeContainer();
   titleEl: FakeElement = fakeContainer();
   opened = false;
   constructor(readonly app: App) {}
   open(): void {
     this.opened = true;
+    Modal.shown.push(this);
     (this as unknown as { onOpen?: () => void }).onOpen?.();
   }
   close(): void {
     this.opened = false;
+    // Obsidian runs onClose on the way out, and several of this plugin's windows rely on it:
+    // a dismissal is a refusal, so a caller awaiting an answer settles instead of hanging.
+    (this as unknown as { onClose?: () => void }).onClose?.();
   }
 }
 

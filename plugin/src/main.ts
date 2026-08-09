@@ -9,6 +9,7 @@ import {
   TFolder,
   requestUrl,
   setIcon,
+  type Vault,
 } from "obsidian";
 import qrcode from "qrcode-generator";
 import { SyncApi, type HttpClient } from "./api";
@@ -65,6 +66,7 @@ import {
   passChangedSomething,
   type SyncLogEntry,
 } from "./log";
+import { countInScope, parseGlobs } from "./paths";
 import { DEFAULT_LANES, MAX_LANES, clampLanes } from "./pool";
 import { SyncScheduler } from "./queue";
 import {
@@ -270,6 +272,9 @@ interface PendingEncryptionTransition {
   vaultSalt: string;
 }
 
+/** Where a user with no clone can read the setup instructions the first-run panel names. */
+const REPO_URL = "https://github.com/pc418/cloudflare-r2do-sync#readme";
+
 /** How often the status bar re-renders so "synced 3m ago" keeps counting up. */
 const STATUS_REFRESH_MS = 30_000;
 
@@ -314,6 +319,9 @@ export default class LogSyncPlugin extends Plugin {
   #stateServerUrl = "";
   #statusBar: HTMLElement | null = null;
   #ribbon: HTMLElement | null = null;
+  /** The live periodic-sync timer and the interval it was built from, so a change can replace it. */
+  #autoSyncTimer: number | null = null;
+  #autoSyncMinutes = 0;
 
   #log: SyncLogEntry[] = [];
   #lastSuccessAt: number | undefined;
@@ -464,11 +472,7 @@ export default class LogSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("delete", onChange));
     this.registerEvent(this.app.vault.on("rename", onChange));
 
-    if (this.settings.intervalMinutes > 0) {
-      this.registerInterval(
-        window.setInterval(() => void this.#autoSync(), this.settings.intervalMinutes * 60_000)
-      );
-    }
+    this.#restartAutoSyncTimer();
 
     if (this.settings.syncOnStartup) {
       this.app.workspace.onLayoutReady(() => void this.#autoSync());
@@ -486,6 +490,31 @@ export default class LogSyncPlugin extends Plugin {
         void this.#autoSync();
       });
     }
+  }
+
+  /**
+   * Rebuilds the periodic-sync timer when its interval changes.
+   *
+   * The timer used to be registered once during `onload`, so a new interval only took effect
+   * after restarting Obsidian — a settings change that does nothing until the app is restarted
+   * is indistinguishable from one that did not save. Rebuilt only on an actual change, so the
+   * unrelated saves that `saveSettings` performs do not keep resetting the countdown.
+   */
+  #restartAutoSyncTimer(): void {
+    if (this.settings.intervalMinutes === this.#autoSyncMinutes) return;
+    if (this.#autoSyncTimer !== null) {
+      window.clearInterval(this.#autoSyncTimer);
+      this.#autoSyncTimer = null;
+    }
+    this.#autoSyncMinutes = this.settings.intervalMinutes;
+    if (this.#autoSyncMinutes <= 0) return;
+    this.#autoSyncTimer = window.setInterval(
+      () => void this.#autoSync(),
+      this.#autoSyncMinutes * 60_000
+    );
+    // Registered as well as tracked: `onunload` clears the current one, and this is the
+    // platform's own guarantee that no timer of ours outlives the plugin.
+    this.registerInterval(this.#autoSyncTimer);
   }
 
   /**
@@ -520,6 +549,7 @@ export default class LogSyncPlugin extends Plugin {
 
   onunload(): void {
     if (this.#settingsPushTimer !== null) window.clearTimeout(this.#settingsPushTimer);
+    if (this.#autoSyncTimer !== null) window.clearInterval(this.#autoSyncTimer);
     this.#retireScheduler();
   }
 
@@ -774,8 +804,8 @@ export default class LogSyncPlugin extends Plugin {
       }),
       store,
       deviceName: this.settings.deviceName,
-      excludes: this.settings.excludes.split("\n").map((s) => s.trim()).filter(Boolean),
-      onlyPaths: this.settings.onlyPaths.split("\n").map((s) => s.trim()).filter(Boolean),
+      excludes: parseGlobs(this.settings.excludes),
+      onlyPaths: parseGlobs(this.settings.onlyPaths),
       mode: this.settings.syncMode,
       syncConfigDir: this.settings.syncConfigDir,
       maxBlobBytes: Math.round(this.settings.maxBlobMB * 1024 * 1024),
@@ -1557,6 +1587,9 @@ export default class LogSyncPlugin extends Plugin {
     }
     this.#stateServerUrl = nextStateServerUrl;
     await this.#persist();
+    // Before the rebuild's awaits: a new interval is live as soon as the value is stored,
+    // whether or not the engine behind it could be rebuilt.
+    this.#restartAutoSyncTimer();
     await this.#finishRebuild(generation);
     this.#schedulePushSharedSettings();
   }
@@ -1605,6 +1638,32 @@ function addReveal(setting: Setting, input: HTMLInputElement): void {
         b.setIcon(hidden ? "eye-off" : "eye");
       })
   );
+}
+
+/**
+ * A secret shown where it can be read and copied: selectable, and still there after the
+ * clipboard is refused. A `Notice` cannot do this job — it floats over the page until it is
+ * dismissed, cannot be selected on a phone, and is what ends up in a screenshot.
+ */
+function secretField(parent: HTMLElement, value: string, label: string): HTMLTextAreaElement {
+  const field = parent.createEl("textarea");
+  field.value = value;
+  field.readOnly = true;
+  field.rows = 3;
+  field.setAttr("aria-label", label);
+  return field;
+}
+
+/** Copies a secret, falling back to selecting it when the platform refuses the clipboard. */
+async function copySecret(value: string, field: HTMLTextAreaElement, label: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(value);
+    new Notice(`${label} copied`);
+  } catch (error) {
+    new Notice(`Could not copy the ${label.toLowerCase()}: ${message(error)}. Select it manually.`, 10_000);
+    field.focus();
+    field.select();
+  }
 }
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -2193,24 +2252,13 @@ class BackupKeyModal extends Modal {
         "This key is the only way to recover encrypted snapshots. Save it in a password " +
         "manager now. Sync remains disabled until you confirm the backup.",
     });
-    const key = contentEl.createEl("textarea");
-    key.value = this.opts.key;
-    key.readOnly = true;
-    key.rows = 3;
-    key.setAttr("aria-label", "Vault master key");
+    const key = secretField(contentEl, this.opts.key, "Vault master key");
 
     new Setting(contentEl)
       .addButton((button) =>
-        button.setButtonText("Copy key").onClick(async () => {
-          try {
-            await navigator.clipboard.writeText(this.opts.key);
-            new Notice("Vault master key copied");
-          } catch (error) {
-            new Notice(`Could not copy the key: ${message(error)}. Select it manually.`, 10_000);
-            key.focus();
-            key.select();
-          }
-        })
+        button
+          .setButtonText("Copy key")
+          .onClick(() => copySecret(this.opts.key, key, "Vault master key"))
       )
       .addButton((button) =>
         button
@@ -2232,6 +2280,48 @@ class BackupKeyModal extends Modal {
   onClose(): void {
     // Merely dismissing the window is never equivalent to acknowledging a backup.
     this.opts.onClose();
+    this.contentEl.empty();
+  }
+}
+
+/**
+ * Shows the active key so it can be copied to a password manager or another device.
+ *
+ * Separate from `BackupKeyModal` because it grants nothing and gates nothing: the same key,
+ * shown on request. It exists because this used to be a `Notice`, which is the one container
+ * a secret must not go in — it cannot be selected on a phone, it stays on top of the page
+ * until dismissed, and it is the part of the screen people photograph.
+ */
+export class RevealKeyModal extends Modal {
+  constructor(
+    app: App,
+    private readonly key: string
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Vault master key" });
+    contentEl.createEl("p", {
+      text:
+        "Every device on this vault needs this exact key, and no snapshot can be read " +
+        "without it. Keep it in a password manager — not in a note in this vault, which is " +
+        "the thing it protects.",
+    });
+    const field = secretField(contentEl, this.key, "Vault master key");
+    new Setting(contentEl)
+      .addButton((b) =>
+        b
+          .setButtonText("Copy key")
+          .setCta()
+          .onClick(() => copySecret(this.key, field, "Vault master key"))
+      )
+      .addButton((b) => b.setButtonText("Close").onClick(() => this.close()));
+  }
+
+  onClose(): void {
     this.contentEl.empty();
   }
 }
@@ -2350,11 +2440,24 @@ export class DeviceSetupModal extends Modal {
         "how conflict copies say where they came from.",
     });
 
-    new Setting(contentEl)
-      .setName("New device name")
-      .addText((t) => t.setValue(this.#name).onChange((v) => (this.#name = v.trim())));
+    // Three containers up front so the export can sit between the fields and the buttons and
+    // still be reachable from the fields' change handlers, which is what lets an edited field
+    // discard it. A code left on screen after the name or token changed describes a payload
+    // the page no longer shows, and the next scan hands over the stale one.
+    const fields = contentEl.createDiv();
+    const out = contentEl.createDiv();
+    const actions = contentEl.createDiv();
 
-    new Setting(contentEl)
+    new Setting(fields)
+      .setName("New device name")
+      .addText((t) =>
+        t.setValue(this.#name).onChange((v) => {
+          this.#name = v.trim();
+          out.empty();
+        })
+      );
+
+    new Setting(fields)
       .setName("Token")
       .setDesc(
         "Sharing this device's token is fine. To be able to lock out ONE device later " +
@@ -2363,11 +2466,13 @@ export class DeviceSetupModal extends Modal {
       )
       .addText((t) => {
         t.inputEl.type = "password";
-        t.setValue(this.#token).onChange((v) => (this.#token = v.trim()));
+        t.setValue(this.#token).onChange((v) => {
+          this.#token = v.trim();
+          out.empty();
+        });
       });
 
-    const out = contentEl.createDiv();
-    new Setting(contentEl)
+    new Setting(actions)
       .addButton((b) =>
         b
           .setButtonText("Show QR")
@@ -2494,7 +2599,7 @@ export class DeviceSetupModal extends Modal {
 }
 
 /** Mobile side of QR setup: confirm before overwriting settings. */
-class ApplySetupModal extends Modal {
+export class ApplySetupModal extends Modal {
   constructor(
     app: App,
     private readonly plugin: LogSyncPlugin,
@@ -2514,9 +2619,25 @@ class ApplySetupModal extends Modal {
         ? "Includes a vault master key (end-to-end encryption on)."
         : "No master key included — the vault will sync unencrypted.",
     });
+
+    // Repointing a working device at a different vault is the one case where this dialog is
+    // consequential, and a flat "replaces the current server, token and key" reads identically
+    // on a device that has none. Name both ends so the difference is on the page.
+    const current = this.plugin.settings.serverUrl.trim();
+    const moving = current !== "" && endpointIdentity(current) !== endpointIdentity(this.payload.url);
     contentEl.createEl("p", {
-      text: "This replaces the current server, token and key on this device.",
+      text: moving
+        ? `This device currently syncs with ${current}. Applying this link points it at ` +
+          `${this.payload.url} instead — a different vault, holding different files.`
+        : "This replaces the current server, token and key on this device.",
     });
+    if (moving) {
+      contentEl.createEl("p", {
+        text:
+          "Nothing local is deleted now, and the next pass asks before it reconciles this " +
+          "vault against the new server for the first time.",
+      });
+    }
 
     new Setting(contentEl)
       .addButton((b) =>
@@ -2551,7 +2672,7 @@ class ApplySetupModal extends Modal {
  * set up at all except retyping a 64-character token and a master key by hand — which is
  * exactly the silent-misconfiguration risk the QR exists to remove.
  */
-class PasteSetupModal extends Modal {
+export class PasteSetupModal extends Modal {
   constructor(
     app: App,
     private readonly plugin: LogSyncPlugin
@@ -2571,31 +2692,50 @@ class PasteSetupModal extends Modal {
     });
 
     let text = "";
-    new Setting(contentEl).setName("Setup link").addTextArea((t) =>
+    let field: HTMLTextAreaElement | null = null;
+    new Setting(contentEl).setName("Setup link").addTextArea((t) => {
+      field = t.inputEl;
       t.setPlaceholder(`obsidian://${SETUP_ACTION}?d=…`).onChange((v) => {
         text = v;
-      })
-    );
+      });
+    });
 
-    const error = contentEl.createEl("p", { text: "" });
+    // Styled as an error, because a page that looks identical whether or not it just refused
+    // something has not told the user anything.
+    const error = contentEl.createEl("p", { text: "", cls: "r2do-error" });
+    const fail = (said: string) => error.setText(said);
+
+    const advance = (): void => {
+      try {
+        // Parse before closing: an unusable paste must say why, in place, rather
+        // than dismissing the dialog and leaving the device unconfigured.
+        const payload = parseSetupText(text);
+        this.close();
+        new ApplySetupModal(this.app, this.plugin, payload).open();
+      } catch (e) {
+        fail(`Cannot use that link: ${message(e)}`);
+      }
+    };
 
     new Setting(contentEl)
+      // The link is already on the clipboard — that is how it got to this device. Reading it
+      // here is one tap instead of a long-press paste into a field, which is the difference
+      // between routes on a phone, where this window is the main way in.
       .addButton((b) =>
-        b
-          .setButtonText("Continue")
-          .setCta()
-          .onClick(() => {
-            try {
-              // Parse before closing: an unusable paste must say why, in place, rather
-              // than dismissing the dialog and leaving the device unconfigured.
-              const payload = parseSetupText(text);
-              this.close();
-              new ApplySetupModal(this.app, this.plugin, payload).open();
-            } catch (e) {
-              error.setText(`Cannot use that link: ${message(e)}`);
-            }
-          })
+        b.setButtonText("Paste from clipboard").onClick(async () => {
+          let read: string;
+          try {
+            read = await navigator.clipboard.readText();
+          } catch (e) {
+            fail(`Could not read the clipboard: ${message(e)}. Paste into the field instead.`);
+            return;
+          }
+          text = read;
+          if (field !== null) field.value = read;
+          advance();
+        })
       )
+      .addButton((b) => b.setButtonText("Continue").setCta().onClick(advance))
       .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
   }
 
@@ -2605,6 +2745,12 @@ class PasteSetupModal extends Modal {
 }
 
 export class LogSyncSettingTab extends PluginSettingTab {
+  /**
+   * Fields that stage their value until they lose focus, so the page can flush them if it
+   * closes first. Rebuilt by every `display()`, because the controls are.
+   */
+  #pending: Array<() => void> = [];
+
   constructor(
     app: App,
     private readonly plugin: LogSyncPlugin
@@ -2612,12 +2758,44 @@ export class LogSyncSettingTab extends PluginSettingTab {
     super(app, plugin);
   }
 
+  /** Section title. `setHeading()` rather than a hand-rolled `<h3>`, which no theme styles. */
+  #heading(containerEl: HTMLElement, text: string): void {
+    new Setting(containerEl).setName(text).setHeading();
+  }
+
   /**
-   * A numeric setting that refuses what it cannot use.
+   * Commits a staged field on blur, on Enter, and once more if the page closes while it is
+   * still focused.
    *
-   * Out-of-range input is left in the box and *not* saved, so the field visibly disagrees
-   * with what is stored rather than silently rounding to something the user did not ask
-   * for. The stored value only ever changes to something inside the documented range.
+   * Saving per keystroke stores every prefix of what is being typed: each one rebuilds the
+   * engine, and for a value with a guard behind it — `protectPercent` — typing "100" over a
+   * 50 stores 1, then 10, and raises the "turn the guard off?" modal in the middle of the
+   * word. Every commit here is idempotent (unchanged input returns early), so blur followed
+   * by the close-flush costs nothing.
+   */
+  #stage(input: HTMLElement, commit: () => void | Promise<void>, commitOnEnter = true): void {
+    input.addEventListener("blur", () => void commit());
+    if (commitOnEnter) {
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") void commit();
+      });
+    }
+    this.#pending.push(() => void commit());
+  }
+
+  /** Obsidian closes the tab without blurring the focused field. Do not lose what it holds. */
+  hide(): void {
+    const pending = this.#pending;
+    this.#pending = [];
+    for (const flush of pending) flush();
+  }
+
+  /**
+   * A numeric setting that stores what it can use, and says so when it cannot.
+   *
+   * Out-of-range input is refused rather than rounded: the stored value only ever changes to
+   * something inside the documented range. Refusals are announced — the field silently
+   * disagreeing with what is stored looks exactly like a value that was accepted.
    */
   #number(
     containerEl: HTMLElement,
@@ -2625,21 +2803,39 @@ export class LogSyncSettingTab extends PluginSettingTab {
       name: string;
       desc: string;
       value: number;
+      /** Accepted range in words, used verbatim when a value is refused. */
+      range: string;
       accept: (n: number) => boolean;
       apply: (n: number) => void;
+      /** A second look before a value that switches a protection off. False keeps the old one. */
+      confirm?: (n: number) => Promise<boolean>;
     }
   ): void {
     new Setting(containerEl)
       .setName(opts.name)
       .setDesc(opts.desc)
-      .addText((t) =>
-        t.setValue(String(opts.value)).onChange(async (v) => {
-          const n = Number(v);
-          if (!Number.isFinite(n) || !Number.isInteger(n) || !opts.accept(n)) return;
+      .addText((t) => {
+        let stored = opts.value;
+        t.setValue(String(stored));
+        this.#stage(t.inputEl, async () => {
+          const raw = t.inputEl.value.trim();
+          if (raw === String(stored)) return;
+          const n = Number(raw);
+          if (raw === "" || !Number.isInteger(n) || !opts.accept(n)) {
+            t.setValue(String(stored));
+            new Notice(`${opts.name} takes ${opts.range}. Keeping ${stored}.`, 8000);
+            return;
+          }
+          if (opts.confirm !== undefined && !(await opts.confirm(n))) {
+            t.setValue(String(stored));
+            return;
+          }
           opts.apply(n);
+          stored = n;
+          t.setValue(String(stored));
           await this.plugin.saveSettings();
-        })
-      );
+        });
+      });
   }
 
   /**
@@ -2714,7 +2910,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
    * the failure. Leading with both routes puts the choice before the mistake.
    */
   #renderFirstRun(containerEl: HTMLElement): void {
-    containerEl.createEl("h3", { text: "Set up sync" });
+    this.#heading(containerEl, "Set up sync");
     containerEl.createEl("p", {
       text:
         "This device is not connected to a vault yet. There are two ways in, and they are " +
@@ -2724,12 +2920,9 @@ export class LogSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Join a vault that already syncs")
       .setDesc(
-        "On a device that already syncs, open Settings → R2DO Sync → \"Set up another " +
-          "device\". Scan the QR with this device's camera, or press \"Copy setup link\" " +
-          "there and paste it with the button here — that is the route for a second " +
-          "computer, which has nothing to scan with. A server URL and access token typed in " +
-          "by hand cannot join an encrypted vault: they do not carry the master key, so this " +
-          "device would mint a key of its own and be refused at the first pass."
+        "A server URL and access token typed in by hand cannot join an encrypted vault: they " +
+          "do not carry the master key, so this device would mint a key of its own and be " +
+          "refused at the first pass. Bring the key across instead."
       )
       .addButton((b) =>
         b
@@ -2738,13 +2931,27 @@ export class LogSyncSettingTab extends PluginSettingTab {
           .onClick(() => new PasteSetupModal(this.app, this.plugin).open())
       );
 
-    containerEl.createEl("p", {
-      text:
-        "Setting up the first device instead? Run scripts/setup.mjs from the repository on a " +
-        "computer and paste the server URL and access token it prints into the two fields " +
+    // Short paragraphs with the path in bold, because this is a procedure to follow on another
+    // device while reading it here — six sentences in a row is not something anyone follows.
+    const join = containerEl.createEl("p");
+    join.appendText("On the device that already syncs, open ");
+    join.createEl("strong", { text: "Settings → R2DO Sync → Set up another device" });
+    join.appendText(
+      ". Scan the QR with this device's camera, or press \"Copy setup link\" there and paste " +
+        "it with the button above — that is the route for a second computer, which has " +
+        "nothing to scan with."
+    );
+
+    const first = containerEl.createEl("p");
+    first.appendText("Setting up the first device instead? Run ");
+    first.createEl("strong", { text: "scripts/setup.mjs" });
+    first.appendText(" from the ");
+    first.createEl("a", { text: "project repository", href: REPO_URL });
+    first.appendText(
+      " on a computer, then paste the server URL and access token it prints into the fields " +
         "below. This device then generates the vault's master key and asks you to save it " +
-        "before anything is uploaded.",
-    });
+        "before anything is uploaded."
+    );
 
     containerEl.createEl("p", {
       text: dataResponsibility(this.plugin.settings.encryptionMode),
@@ -2752,52 +2959,64 @@ export class LogSyncSettingTab extends PluginSettingTab {
     });
   }
 
-  display(): void {
-    const { containerEl } = this;
-    containerEl.empty();
+  /**
+   * How this plugin behaves, at the top where it is read.
+   *
+   * This used to be the last paragraph on the page, below "Advanced" — the best orientation
+   * text here, placed where someone deciding whether to trust the thing would never reach it.
+   */
+  #renderOverview(containerEl: HTMLElement): void {
+    containerEl.createEl("p", {
+      text:
+        "Two-way sync: changes from other devices are pulled and merged into this vault " +
+        "before anything is uploaded. Notes that both devices edited in the same place are " +
+        "never merged blindly — the other version is saved as a .conflict-… copy beside " +
+        "yours. Sync halts only if the remote is unreadable with this device's master key, " +
+        "and pauses to ask if a pull would destroy a large share of this vault. Every " +
+        "snapshot stays restorable from Snapshot history until the server's retention " +
+        "policy trims it.",
+    });
+  }
 
-    // The cure, where the problem is. A wrong master key is the one failure a user cannot
-    // fix from these fields — server URL and access token do not carry the key — so the
-    // action that does fix it belongs above them, not further down the page.
-    const mismatch = this.plugin.keyMismatch;
-    if (mismatch !== null) {
-      new Setting(containerEl)
-        .setName("This device is not set up for this vault")
-        .setDesc(
-          `${mismatch} Applying a setup link replaces this device's key, server URL and ` +
-            "token in one step."
-        )
-        .addButton((b) =>
-          b
-            .setButtonText("Paste setup link")
-            .setCta()
-            .onClick(() => new PasteSetupModal(this.app, this.plugin).open())
-        );
-    } else if (isUnconfigured(this.plugin.settings)) {
-      // Never both: the mismatch banner's cure is also "paste a setup link", and two primary
-      // buttons doing the same thing on one page is a page that has stopped giving advice.
-      this.#renderFirstRun(containerEl);
-    }
+  /**
+   * Saves a credential, and re-renders only when the page's shape actually changed.
+   *
+   * An unconfigured device shows a short page; completing the pair earns the rest of it. The
+   * re-render is conditional because it destroys the controls, and doing that on every commit
+   * would pull the page out from under someone tabbing between the two fields.
+   */
+  async #commitCredential(apply: () => void): Promise<void> {
+    const wasUnconfigured = isUnconfigured(this.plugin.settings);
+    apply();
+    await this.plugin.saveSettings();
+    if (isUnconfigured(this.plugin.settings) !== wasUnconfigured) this.display();
+  }
+
+  #renderConnection(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "Connection");
 
     new Setting(containerEl)
       .setName("Server URL")
       .setDesc("Base URL of the sync Worker, e.g. https://obsidian-log-sync.<sub>.workers.dev")
       .addText((t) => {
-        let previous = this.plugin.settings.serverUrl;
-        t.setValue(previous);
-        t.inputEl.addEventListener("blur", async () => {
+        let stored = this.plugin.settings.serverUrl;
+        t.setValue(stored);
+        this.#stage(t.inputEl, async () => {
           const entered = t.inputEl.value.trim();
-          if (entered === previous) return;
+          if (entered === stored) return;
+          let next: string;
           try {
-            this.plugin.settings.serverUrl = entered === "" ? "" : normalizeServerUrl(entered);
+            next = entered === "" ? "" : normalizeServerUrl(entered);
           } catch (e) {
-            t.setValue(previous);
+            t.setValue(stored);
             new Notice(`R2DO Sync server URL rejected: ${message(e)}`, 10_000);
             return;
           }
-          await this.plugin.saveSettings();
-          previous = this.plugin.settings.serverUrl;
-          t.setValue(previous);
+          stored = next;
+          t.setValue(next);
+          await this.#commitCredential(() => {
+            this.plugin.settings.serverUrl = next;
+          });
         });
       });
 
@@ -2812,24 +3031,101 @@ export class LogSyncSettingTab extends PluginSettingTab {
       );
     tokenSetting.addText((t) => {
       t.inputEl.type = "password";
-      t.setValue(this.plugin.settings.accessToken).onChange(async (v) => {
-        this.plugin.settings.accessToken = v.trim();
-        await this.plugin.saveSettings();
-      });
+      let stored = this.plugin.settings.accessToken;
+      t.setValue(stored);
       addReveal(tokenSetting, t.inputEl);
+      this.#stage(t.inputEl, async () => {
+        const entered = t.inputEl.value.trim();
+        if (entered === stored) return;
+        stored = entered;
+        t.setValue(entered);
+        await this.#commitCredential(() => {
+          this.plugin.settings.accessToken = entered;
+        });
+      });
     });
 
+    // Beside the two fields it tests. It was at the bottom of "Advanced", a page away from
+    // the only two values it can tell you anything about, and it is a first-run tool.
+    new Setting(containerEl)
+      .setName("Test connection")
+      .setDesc("Checks the URL and token against the server.")
+      .addButton((b) =>
+        b.setButtonText("Test").onClick(async () => {
+          try {
+            const api = new SyncApi({
+              baseUrl: this.plugin.settings.serverUrl,
+              token: this.plugin.settings.accessToken,
+              http: obsidianHttp,
+            });
+            const head = await api.getHead();
+            new Notice(`R2DO Sync OK. Remote head: ${head ?? "(empty vault)"}`);
+          } catch (e) {
+            new Notice(`R2DO Sync failed: ${message(e)}`, 10_000);
+          }
+        })
+      );
+  }
+
+  #deviceNameRow(containerEl: HTMLElement): void {
     new Setting(containerEl)
       .setName("Device name")
       .setDesc("Recorded in each commit so you can tell devices apart in history.")
-      .addText((t) =>
-        t.setValue(this.plugin.settings.deviceName).onChange(async (v) => {
-          this.plugin.settings.deviceName = v.trim() || "device";
+      .addText((t) => {
+        let stored = this.plugin.settings.deviceName;
+        t.setValue(stored);
+        this.#stage(t.inputEl, async () => {
+          const next = t.inputEl.value.trim() || "device";
+          if (next === stored) return;
+          stored = next;
+          t.setValue(next);
+          this.plugin.settings.deviceName = next;
           await this.plugin.saveSettings();
-        })
+        });
+      });
+  }
+
+  #renderThisDevice(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "This device");
+    this.#deviceNameRow(containerEl);
+
+    const hasKey = this.plugin.settings.masterKey.trim() !== "";
+    const blockedReason = isUnconfigured(this.plugin.settings)
+      ? "Set the server URL and access token first — there is nothing to hand over yet."
+      : this.plugin.encryptionEnabled && !hasKey
+        ? "Waiting for this device's master key to be generated."
+        : this.plugin.encryptionEnabled && !this.plugin.settings.masterKeyBackedUp
+          ? "Back up the vault master key first. Sending it to another device is not a backup."
+          : null;
+    new Setting(containerEl)
+      .setName("Set up another device")
+      .setDesc(
+        blockedReason ??
+          "Hands the server URL, an access token and the master key to a new device — as a " +
+            "QR code to scan from a phone, or as a link to paste into one that cannot scan."
+      )
+      .addButton((b) =>
+        b
+          .setButtonText("Set up device")
+          // Offering a window whose every button can only refuse is a dead end dressed as
+          // an action. The reason belongs in the description, not in a notice after a click.
+          .setDisabled(blockedReason !== null)
+          .onClick(() => new DeviceSetupModal(this.app, this.plugin).open())
       );
 
-    containerEl.createEl("h3", { text: "Encryption" });
+    new Setting(containerEl)
+      .setName("Apply a setup link")
+      .setDesc(
+        "Paste a setup link copied from another device. Use this when scanning the QR opens " +
+          "a browser instead of Obsidian — common on phones."
+      )
+      .addButton((b) =>
+        b.setButtonText("Paste link").onClick(() => new PasteSetupModal(this.app, this.plugin).open())
+      );
+  }
+
+  #renderEncryption(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "Encryption");
     containerEl.createEl("p", {
       text:
         "Encryption is the default. File contents and paths are encrypted before upload, " +
@@ -2857,16 +3153,21 @@ export class LogSyncSettingTab extends PluginSettingTab {
       }).open();
     };
 
+    // `masterKey` is empty until the engine generates one, which is a state with its own
+    // description: the old text told a brand-new device that sync was blocked on backing up
+    // a key that did not exist yet, beside an empty field.
+    const hasKey = this.plugin.settings.masterKey.trim() !== "";
+    const keyDesc = !this.plugin.encryptionEnabled
+      ? "Plaintext was explicitly selected. Paste a key here to encrypt the vault."
+      : !hasKey
+        ? "A random key is generated for this vault as soon as the server URL and access " +
+          "token are in place, and shown for you to save before anything is uploaded."
+        : this.plugin.settings.masterKeyBackedUp
+          ? "Encryption is ON and the backup gate is complete. Paste only to stage an explicit re-key."
+          : "Encryption is ON but sync is blocked until you back up and acknowledge this key.";
+
     // Same two-step shape as the access-token field, for the same TDZ reason.
-    const keySetting = new Setting(containerEl)
-      .setName("Vault master key")
-      .setDesc(
-        this.plugin.encryptionEnabled
-          ? this.plugin.settings.masterKeyBackedUp
-            ? "Encryption is ON and the backup gate is complete. Paste only to stage an explicit re-key."
-            : "Encryption is ON but sync is blocked until you back up and acknowledge this key."
-          : "Plaintext was explicitly selected. Paste a key here to encrypt the vault."
-      );
+    const keySetting = new Setting(containerEl).setName("Vault master key").setDesc(keyDesc);
     keySetting
       .addText((t) => {
         const previous = this.plugin.settings.masterKey;
@@ -2910,10 +3211,6 @@ export class LogSyncSettingTab extends PluginSettingTab {
         )
       );
 
-    // `masterKey` is empty until the engine generates one, and the CTA below feeds it
-    // straight to parseMasterKey — so on a brand-new device this row rendered a primary
-    // button whose only possible outcome was an error notice.
-    const hasKey = this.plugin.settings.masterKey.trim() !== "";
     if (this.plugin.encryptionEnabled && hasKey && !this.plugin.settings.masterKeyBackedUp) {
       new Setting(containerEl)
         .setName("Key backup required")
@@ -2932,10 +3229,12 @@ export class LogSyncSettingTab extends PluginSettingTab {
         .setName("Reveal master key")
         .setDesc("Shows the key so you can back it up or copy it to another device.")
         .addButton((b) =>
-          b.setButtonText("Reveal").onClick(() => {
-            new Notice(`Vault master key:\n${this.plugin.settings.masterKey}`, 0);
-          })
-      );
+          // A window, not a notice: a secret has to be selectable and copyable, and a notice
+          // is neither on a phone. It also floats over the page until it is dismissed.
+          b.setButtonText("Reveal").onClick(() =>
+            new RevealKeyModal(this.app, this.plugin.settings.masterKey).open()
+          )
+        );
 
       new Setting(containerEl)
         .setName("Turn off encryption")
@@ -2953,64 +3252,94 @@ export class LogSyncSettingTab extends PluginSettingTab {
           })
         );
     }
+  }
 
-    const blockedReason = isUnconfigured(this.plugin.settings)
-      ? "Set the server URL and access token first — there is nothing to hand over yet."
-      : this.plugin.encryptionEnabled && !hasKey
-        ? "Waiting for this device's master key to be generated."
-        : this.plugin.encryptionEnabled && !this.plugin.settings.masterKeyBackedUp
-          ? "Back up the vault master key first. Sending it to another device is not a backup."
-          : null;
-    new Setting(containerEl)
-      .setName("Set up another device")
-      .setDesc(
-        blockedReason ??
-          "Hands the server URL, an access token and the master key to a new device — as a " +
-            "QR code to scan from a phone, or as a link to paste into one that cannot scan."
-      )
-      .addButton((b) =>
-        b
-          .setButtonText("Set up device")
-          // Offering a window whose every button can only refuse is a dead end dressed as
-          // an action. The reason belongs in the description, not in a notice after a click.
-          .setDisabled(blockedReason !== null)
-          .onClick(() => new DeviceSetupModal(this.app, this.plugin).open())
-      );
+  /**
+   * Every file Obsidian has indexed, or null when that cannot be read.
+   *
+   * The index is the only source cheap enough to consult while someone types: a true scan
+   * stats every file in the vault, which is a sync's job. It also holds no hidden files, so
+   * the counts built from it say "indexed" rather than "in this vault". A partly-built App
+   * has no index at all, and then the page shows no count instead of a wrong one.
+   */
+  #indexedPaths(): string[] | null {
+    const vault: Partial<Vault> | undefined = this.app.vault;
+    if (typeof vault?.getFiles !== "function") return null;
+    return vault.getFiles().map((file) => file.path);
+  }
 
-    new Setting(containerEl)
-      .setName("Apply a setup link")
-      .setDesc(
-        "Paste a setup link copied from another device. Use this when scanning the QR opens " +
-          "a browser instead of Obsidian — common on phones."
-      )
-      .addButton((b) =>
-        b.setButtonText("Paste link").onClick(() => new PasteSetupModal(this.app, this.plugin).open())
+  #renderScope(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "What syncs");
+
+    // Drafts, not settings: the count has to follow what is being typed, while the setting
+    // itself is only written on blur — a half-finished glob must never be the live rule.
+    let onlyDraft = this.plugin.settings.onlyPaths;
+    let excludeDraft = this.plugin.settings.excludes;
+    const indexed = this.#indexedPaths();
+    let onlyHint: HTMLElement | null = null;
+    let excludeHint: HTMLElement | null = null;
+    const refresh = (): void => {
+      if (indexed === null) return;
+      const rules = {
+        excludes: parseGlobs(excludeDraft),
+        onlyPaths: parseGlobs(onlyDraft),
+        syncConfigDir: this.plugin.settings.syncConfigDir,
+      };
+      const kept = countInScope(indexed, rules);
+      const unexcluded = countInScope(indexed, { ...rules, excludes: [] });
+      const dropped = unexcluded - kept;
+      onlyHint?.setText(
+        rules.onlyPaths.length === 0
+          ? `No allow-list: ${kept} of ${indexed.length} files in Obsidian's index sync. Hidden files are not counted here.`
+          : `Allow-list matches ${kept} of ${indexed.length} files in Obsidian's index. Hidden files are not counted here.`
       );
+      excludeHint?.setText(
+        `Excludes drop ${dropped} file${dropped === 1 ? "" : "s"} of the ${unexcluded} that would otherwise sync.`
+      );
+    };
 
     new Setting(containerEl)
       .setName("Only sync matching paths")
       .setDesc("Optional allow-list, one glob per line. Empty means the whole vault. Non-matching remote paths are carried, never deleted.")
-      .addTextArea((t) =>
-        t.setValue(this.plugin.settings.onlyPaths).onChange(async (v) => {
-          this.plugin.settings.onlyPaths = v;
-          await this.plugin.saveSettings();
-        })
-      );
+      .addTextArea((t) => {
+        t.inputEl.addClass("r2do-globs");
+        t.setValue(onlyDraft).onChange((v) => {
+          onlyDraft = v;
+          refresh();
+        });
+        this.#stage(
+          t.inputEl,
+          async () => {
+            if (onlyDraft === this.plugin.settings.onlyPaths) return;
+            this.plugin.settings.onlyPaths = onlyDraft;
+            await this.plugin.saveSettings();
+          },
+          false
+        );
+      });
+    if (indexed !== null) onlyHint = containerEl.createDiv({ cls: "r2do-hint" });
 
     new Setting(containerEl)
-      .setName("Sync direction")
-      .setDesc("Two-way merges both sides. Pull-only never commits. Push-only never writes local files and preserves remote conflicts in the snapshot.")
-      .addDropdown((d) =>
-        d
-          .addOption("two-way", "Two-way")
-          .addOption("pull-only", "Pull-only")
-          .addOption("push-only", "Push-only (backup)")
-          .setValue(this.plugin.settings.syncMode)
-          .onChange(async (value) => {
-            this.plugin.settings.syncMode = value as SyncMode;
+      .setName("Exclude globs")
+      .setDesc("One per line. Supports * and **.")
+      .addTextArea((t) => {
+        t.inputEl.addClass("r2do-globs");
+        t.setValue(excludeDraft).onChange((v) => {
+          excludeDraft = v;
+          refresh();
+        });
+        this.#stage(
+          t.inputEl,
+          async () => {
+            if (excludeDraft === this.plugin.settings.excludes) return;
+            this.plugin.settings.excludes = excludeDraft;
             await this.plugin.saveSettings();
-          })
-      );
+          },
+          false
+        );
+      });
+    if (indexed !== null) excludeHint = containerEl.createDiv({ cls: "r2do-hint" });
+    refresh();
 
     new Setting(containerEl)
       .setName("Sync Obsidian configuration directory")
@@ -3041,40 +3370,45 @@ export class LogSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Exclude globs")
-      .setDesc("One per line. Supports * and **.")
-      .addTextArea((t) =>
-        t.setValue(this.plugin.settings.excludes).onChange(async (v) => {
-          this.plugin.settings.excludes = v;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Debounce (seconds)")
-      .setDesc("How long edits must settle before a push.")
-      .addText((t) =>
-        t.setValue(String(this.plugin.settings.debounceSeconds)).onChange(async (v) => {
-          const n = Number(v);
-          if (Number.isFinite(n) && n >= 0) {
-            this.plugin.settings.debounceSeconds = n;
+      .setName("Sync direction")
+      .setDesc("Two-way merges both sides. Pull-only never commits. Push-only never writes local files and preserves remote conflicts in the snapshot.")
+      .addDropdown((d) =>
+        d
+          .addOption("two-way", "Two-way")
+          .addOption("pull-only", "Pull-only")
+          .addOption("push-only", "Push-only (backup)")
+          .setValue(this.plugin.settings.syncMode)
+          .onChange(async (value) => {
+            this.plugin.settings.syncMode = value as SyncMode;
             await this.plugin.saveSettings();
-          }
-        })
+          })
       );
+  }
 
-    new Setting(containerEl)
-      .setName("Periodic sync (minutes)")
-      .setDesc("0 disables. Takes effect after an Obsidian restart.")
-      .addText((t) =>
-        t.setValue(String(this.plugin.settings.intervalMinutes)).onChange(async (v) => {
-          const n = Number(v);
-          if (Number.isFinite(n) && n >= 0) {
-            this.plugin.settings.intervalMinutes = n;
-            await this.plugin.saveSettings();
-          }
-        })
-      );
+  #renderSchedule(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "When it syncs");
+
+    this.#number(containerEl, {
+      name: "Debounce (seconds)",
+      desc: "How long edits must settle before a push.",
+      value: this.plugin.settings.debounceSeconds,
+      range: "0–3600",
+      accept: (n) => n >= 0 && n <= 3600,
+      apply: (n) => {
+        this.plugin.settings.debounceSeconds = n;
+      },
+    });
+
+    this.#number(containerEl, {
+      name: "Periodic sync (minutes)",
+      desc: "0 disables. A change takes effect immediately.",
+      value: this.plugin.settings.intervalMinutes,
+      range: "0–1440",
+      accept: (n) => n >= 0 && n <= 1440,
+      apply: (n) => {
+        this.plugin.settings.intervalMinutes = n;
+      },
+    });
 
     new Setting(containerEl)
       .setName("Sync on startup")
@@ -3090,43 +3424,45 @@ export class LogSyncSettingTab extends PluginSettingTab {
         })
       );
 
-    this.#hotkeyRow(containerEl);
+    // A row about keystrokes on a device with no keyboard is noise: mobile Obsidian has no
+    // Hotkeys page to send anyone to either.
+    if (!Platform.isMobile) this.#hotkeyRow(containerEl);
+  }
 
-    containerEl.createEl("h3", { text: "Safety" });
+  #renderSafety(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "Safety");
 
-    new Setting(containerEl)
-      .setName("Ask before large changes (%)")
-      .setDesc(
+    this.#number(containerEl, {
+      name: "Ask before large changes (%)",
+      desc:
         "If a pull would delete or overwrite MORE than this share of the files this device " +
-          "syncs, sync pauses and asks which side to keep. At or below it, changes merge " +
-          "automatically — anything that cannot be merged is still kept as a .conflict-… " +
-          "copy, so nothing is lost by not asking. 100 turns the check off."
-      )
-      .addText((t) =>
-        t.setValue(String(this.plugin.settings.protectPercent)).onChange(async (v) => {
-          const n = Number(v);
-          if (!Number.isFinite(n) || n < 0 || n > 100) return;
-          const previous = this.plugin.settings.protectPercent;
-          if (n === 100 && previous !== 100) {
-            // 100 is not a threshold, it is the off switch — worth a second look.
-            new ConfirmModal(this.app, {
-              title: "Turn off the mass-change guard?",
-              body:
-                "At 100 a pull may delete or replace every file on this device without " +
-                "asking. The guard exists for the day a mistaken or malicious remote " +
-                "snapshot arrives; snapshots stay restorable, but only if you notice.",
-              onConfirm: async () => {
-                this.plugin.settings.protectPercent = 100;
-                await this.plugin.saveSettings();
-              },
-              onCancel: () => t.setValue(String(previous)),
-            }).open();
-            return;
-          }
-          this.plugin.settings.protectPercent = n;
-          await this.plugin.saveSettings();
-        })
-      );
+        "syncs, sync pauses and asks which side to keep. At or below it, changes merge " +
+        "automatically — anything that cannot be merged is still kept as a .conflict-… " +
+        "copy, so nothing is lost by not asking. 100 turns the check off.",
+      value: this.plugin.settings.protectPercent,
+      range: "whole numbers 0–100",
+      accept: (n) => n >= 0 && n <= 100,
+      apply: (n) => {
+        this.plugin.settings.protectPercent = n;
+      },
+      // 100 is not a threshold, it is the off switch — worth a second look.
+      confirm: (n) =>
+        n !== 100
+          ? Promise.resolve(true)
+          : new Promise<boolean>((resolve) => {
+              new ConfirmModal(this.app, {
+                title: "Turn off the mass-change guard?",
+                body:
+                  "At 100 a pull may delete or replace every file on this device without " +
+                  "asking. The guard exists for the day a mistaken or malicious remote " +
+                  "snapshot arrives; snapshots stay restorable, but only if you notice.",
+                confirmText: "Turn it off",
+                cancelText: "Keep the guard",
+                onConfirm: () => resolve(true),
+                onCancel: () => resolve(false),
+              }).open();
+            }),
+    });
 
     new Setting(containerEl)
       .setName("Conflict handling")
@@ -3220,76 +3556,10 @@ export class LogSyncSettingTab extends PluginSettingTab {
       .setName("Sync log")
       .setDesc("Writes the recent sync passes to a note in this vault, for troubleshooting.")
       .addButton((b) => b.setButtonText("Export").onClick(() => void this.plugin.exportLog()));
+  }
 
-    containerEl.createEl("h3", { text: "Advanced" });
-    containerEl.createEl("p", {
-      text:
-        "Defaults suit a typical vault. These are the knobs that were previously fixed in " +
-        "code; each says what it costs, because every one of them trades something.",
-    });
-
-    this.#number(containerEl, {
-      name: "Parallel lanes",
-      desc:
-        `How many files are read, encrypted, uploaded or downloaded at once (1–${MAX_LANES}). ` +
-        "Higher finishes a large vault sooner but uses more memory and can overwhelm a " +
-        "phone or a slow link. 1 restores the old one-at-a-time behaviour.",
-      value: this.plugin.settings.lanes,
-      accept: (n) => n >= 1 && n <= MAX_LANES,
-      apply: (n) => {
-        this.plugin.settings.lanes = clampLanes(n);
-      },
-    });
-
-    this.#number(containerEl, {
-      name: "Sync log length",
-      desc:
-        `Passes kept for troubleshooting (${LOG_ENTRIES_RANGE.min}–${LOG_ENTRIES_RANGE.max}). ` +
-        "Each entry is small, but they all live in this plugin's data file.",
-      value: this.plugin.settings.logEntries,
-      accept: (n) => n >= LOG_ENTRIES_RANGE.min && n <= LOG_ENTRIES_RANGE.max,
-      apply: (n) => {
-        this.plugin.settings.logEntries = n;
-      },
-    });
-
-    new Setting(containerEl)
-      .setName("Report folder")
-      .setDesc(
-        "Where Export writes its note. Empty means the vault root. The folder is created " +
-          "if it does not exist. Remember it is synced like any other note unless excluded."
-      )
-      .addText((t) =>
-        t
-          .setPlaceholder("(vault root)")
-          .setValue(this.plugin.settings.logNoteFolder)
-          .onChange(async (v) => {
-            this.plugin.settings.logNoteFolder = v;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    this.#number(containerEl, {
-      name: "Snapshots listed in history",
-      desc: "How far back the history browser walks (1–200). Each one is a request.",
-      value: this.plugin.settings.historyLimit,
-      accept: (n) => n >= 1 && n <= 200,
-      apply: (n) => {
-        this.plugin.settings.historyLimit = n;
-      },
-    });
-
-    this.#number(containerEl, {
-      name: "Automatic retries",
-      desc:
-        `Retries after a failed pass before it is reported and left alone (0–${MAX_RETRY_ATTEMPTS}), ` +
-        "backing off 1s, 4s, 15s, 1m, 5m. A halted sync is never retried — it needs a person.",
-      value: this.plugin.settings.retryAttempts,
-      accept: (n) => n >= 0 && n <= MAX_RETRY_ATTEMPTS,
-      apply: (n) => {
-        this.plugin.settings.retryAttempts = n;
-      },
-    });
+  #renderNotices(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "Notices");
 
     new Setting(containerEl)
       .setName("Notice when a sync finishes")
@@ -3333,6 +3603,86 @@ export class LogSyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
+  }
+
+  #renderAdvanced(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "Advanced");
+    containerEl.createEl("p", {
+      text:
+        "Defaults suit a typical vault. These are the knobs that were previously fixed in " +
+        "code; each says what it costs, because every one of them trades something.",
+    });
+
+    this.#number(containerEl, {
+      name: "Parallel lanes",
+      desc:
+        `How many files are read, encrypted, uploaded or downloaded at once (1–${MAX_LANES}). ` +
+        "Higher finishes a large vault sooner but uses more memory and can overwhelm a " +
+        "phone or a slow link. 1 restores the old one-at-a-time behaviour.",
+      value: this.plugin.settings.lanes,
+      range: `1–${MAX_LANES}`,
+      accept: (n) => n >= 1 && n <= MAX_LANES,
+      apply: (n) => {
+        this.plugin.settings.lanes = clampLanes(n);
+      },
+    });
+
+    this.#number(containerEl, {
+      name: "Sync log length",
+      desc:
+        `Passes kept for troubleshooting (${LOG_ENTRIES_RANGE.min}–${LOG_ENTRIES_RANGE.max}). ` +
+        "Each entry is small, but they all live in this plugin's data file.",
+      value: this.plugin.settings.logEntries,
+      range: `${LOG_ENTRIES_RANGE.min}–${LOG_ENTRIES_RANGE.max}`,
+      accept: (n) => n >= LOG_ENTRIES_RANGE.min && n <= LOG_ENTRIES_RANGE.max,
+      apply: (n) => {
+        this.plugin.settings.logEntries = n;
+      },
+    });
+
+    new Setting(containerEl)
+      .setName("Report folder")
+      .setDesc(
+        "Where Export writes its note. Empty means the vault root. The folder is created " +
+          "if it does not exist. Remember it is synced like any other note unless excluded."
+      )
+      .addText((t) => {
+        let stored = this.plugin.settings.logNoteFolder;
+        t.setPlaceholder("(vault root)");
+        t.setValue(stored);
+        this.#stage(t.inputEl, async () => {
+          const next = t.inputEl.value.trim();
+          if (next === stored) return;
+          stored = next;
+          t.setValue(next);
+          this.plugin.settings.logNoteFolder = next;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    this.#number(containerEl, {
+      name: "Snapshots listed in history",
+      desc: "How far back the history browser walks (1–200). Each one is a request.",
+      value: this.plugin.settings.historyLimit,
+      range: "1–200",
+      accept: (n) => n >= 1 && n <= 200,
+      apply: (n) => {
+        this.plugin.settings.historyLimit = n;
+      },
+    });
+
+    this.#number(containerEl, {
+      name: "Automatic retries",
+      desc:
+        `Retries after a failed pass before it is reported and left alone (0–${MAX_RETRY_ATTEMPTS}), ` +
+        "backing off 1s, 4s, 15s, 1m, 5m. A halted sync is never retried — it needs a person.",
+      value: this.plugin.settings.retryAttempts,
+      range: `0–${MAX_RETRY_ATTEMPTS}`,
+      accept: (n) => n >= 0 && n <= MAX_RETRY_ATTEMPTS,
+      apply: (n) => {
+        this.plugin.settings.retryAttempts = n;
+      },
+    });
 
     new Setting(containerEl)
       .setName("Sync settings between devices")
@@ -3348,35 +3698,56 @@ export class LogSyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
+  }
 
-    new Setting(containerEl)
-      .setName("Test connection")
-      .setDesc("Checks the URL and token against the server.")
-      .addButton((b) =>
-        b.setButtonText("Test").onClick(async () => {
-          try {
-            const api = new SyncApi({
-              baseUrl: this.plugin.settings.serverUrl,
-              token: this.plugin.settings.accessToken,
-              http: obsidianHttp,
-            });
-            const head = await api.getHead();
-            new Notice(`R2DO Sync OK. Remote head: ${head ?? "(empty vault)"}`);
-          } catch (e) {
-            new Notice(`R2DO Sync failed: ${message(e)}`, 10_000);
-          }
-        })
-      );
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+    // The controls these referred to are gone; a flush against them would read stale fields.
+    this.#pending = [];
 
-    containerEl.createEl("p", {
-      text:
-        "Two-way sync: changes from other devices are pulled and merged into this vault " +
-        "before anything is uploaded. Notes that both devices edited in the same place are " +
-        "never merged blindly — the other version is saved as a .conflict-… copy beside " +
-        "yours. Sync halts only if the remote is unreadable with this device's master key, " +
-        "and pauses to ask if a pull would destroy a large share of this vault. Every " +
-        "snapshot stays restorable from Snapshot history until the server's retention " +
-        "policy trims it.",
-    });
+    // The cure, where the problem is. A wrong master key is the one failure a user cannot
+    // fix from these fields — server URL and access token do not carry the key — so the
+    // action that does fix it belongs above them, not further down the page.
+    const mismatch = this.plugin.keyMismatch;
+    const fresh = mismatch === null && isUnconfigured(this.plugin.settings);
+    if (mismatch !== null) {
+      new Setting(containerEl)
+        .setName("This device is not set up for this vault")
+        .setDesc(
+          `${mismatch} Applying a setup link replaces this device's key, server URL and ` +
+            "token in one step."
+        )
+        .addButton((b) =>
+          b
+            .setButtonText("Paste setup link")
+            .setCta()
+            .onClick(() => new PasteSetupModal(this.app, this.plugin).open())
+        );
+    } else if (fresh) {
+      // Never both: the mismatch banner's cure is also "paste a setup link", and two primary
+      // buttons doing the same thing on one page is a page that has stopped giving advice.
+      this.#renderFirstRun(containerEl);
+    }
+
+    if (fresh) {
+      // Nothing below this point can act without a server, and every one of those rows is
+      // something to scroll past before reaching the two fields that can. They arrive the
+      // moment the credentials do.
+      this.#renderConnection(containerEl);
+      this.#deviceNameRow(containerEl);
+      this.#renderOverview(containerEl);
+      return;
+    }
+
+    this.#renderOverview(containerEl);
+    this.#renderConnection(containerEl);
+    this.#renderThisDevice(containerEl);
+    this.#renderEncryption(containerEl);
+    this.#renderScope(containerEl);
+    this.#renderSchedule(containerEl);
+    this.#renderSafety(containerEl);
+    this.#renderNotices(containerEl);
+    this.#renderAdvanced(containerEl);
   }
 }

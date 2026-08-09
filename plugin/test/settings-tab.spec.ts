@@ -1,11 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_SETTINGS,
   LogSyncSettingTab,
   dataResponsibility,
   type Settings,
 } from "../src/main";
-import { App, type FakeElement, type RenderLog } from "./obsidian-fake";
+import { App, type FakeElement, Modal, Notice, Platform, type RenderLog } from "./obsidian-fake";
 
 // Vitest aliases "obsidian" to the fake at runtime, but tsc still resolves the real types
 // (src must keep typechecking against the real API). Bridge the two here, in one place.
@@ -15,6 +15,22 @@ function logOf(tab: LogSyncSettingTab): RenderLog {
 function newTab(plugin: unknown, app: unknown = new App()): LogSyncSettingTab {
   return new LogSyncSettingTab(app as never, plugin as never);
 }
+function bodyOf(modal: Modal): FakeElement {
+  return modal.contentEl as unknown as FakeElement;
+}
+/** Lets a staged commit finish: its handler is fire-and-forget, by design. */
+function flush(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+beforeEach(() => {
+  Notice.shown.length = 0;
+  Modal.shown.length = 0;
+});
+
+afterEach(() => {
+  Platform.isMobile = false;
+});
 
 // The settings tab is the plugin's whole configuration surface. It used to render only
 // "Server URL" and "Access token" in real Obsidian: `const tokenSetting = new Setting(...)`
@@ -75,13 +91,31 @@ function render(
 describe("settings tab rendering", () => {
   it("renders every section heading", () => {
     const { log } = render();
-    expect(log.headings).toEqual(["Encryption", "Safety", "Advanced"]);
+    expect(log.headings).toEqual([
+      "Connection",
+      "This device",
+      "Encryption",
+      "What syncs",
+      "When it syncs",
+      "Safety",
+      "Notices",
+      "Advanced",
+    ]);
   });
 
-  it("renders the credential fields and the device name below them", () => {
+  it("renders the credential fields with the connection test beside them", () => {
     const { names } = render();
-    // The TDZ bug stopped exactly here: the first two rendered, "Device name" did not.
-    expect(names.slice(0, 3)).toEqual(["Server URL", "Access token", "Device name"]);
+    // The TDZ bug stopped after the first two: "Device name" never rendered at all. The test
+    // moved up here from the bottom of "Advanced", a page away from the only two values it
+    // can say anything about.
+    expect(names.slice(0, 3)).toEqual(["Server URL", "Access token", "Test connection"]);
+    expect(names.indexOf("Device name")).toBeGreaterThan(names.indexOf("Test connection"));
+  });
+
+  it("opens with what the plugin does, rather than closing with it", () => {
+    // This paragraph is the page's orientation text. It used to be the very last thing below
+    // "Advanced", where the person deciding whether to trust the plugin never reaches it.
+    expect(render().log.paragraphs[0]).toContain("Two-way sync");
   });
 
   it.each([
@@ -362,10 +396,17 @@ describe("settings tab rendering", () => {
       return { setting: log.settings[index], button: log.rows[index].buttons[0] };
     }
 
-    it("will not offer device setup before there is anything to hand over", () => {
-      const { setting, button } = setupRow({ serverUrl: "", accessToken: "" });
-      expect(button.disabled).toBe(true);
-      expect(setting.desc).toContain("nothing to hand over");
+    it("does not put the row on a page with nothing to hand over at all", () => {
+      // Stronger than disabling it: an unconfigured device renders none of the rows that
+      // depend on a server, so there is nothing to explain away.
+      expect(render({ serverUrl: "", accessToken: "" }).names).not.toContain("Set up another device");
+    });
+
+    it("still says why it is blocked when the row renders beside the mismatch banner", () => {
+      const { log, names } = render({ serverUrl: "", accessToken: "" }, "a different master key");
+      const index = names.indexOf("Set up another device");
+      expect(log.rows[index].buttons[0].disabled).toBe(true);
+      expect(log.settings[index].desc).toContain("nothing to hand over");
     });
 
     it("will not offer device setup before the key exists", () => {
@@ -395,13 +436,41 @@ describe("settings tab rendering", () => {
   describe("first run", () => {
     const FRESH: Partial<Settings> = { serverUrl: "", accessToken: "" };
 
-    it("leads with the setup panel, ahead of every other section", () => {
-      expect(render(FRESH).log.headings).toEqual([
-        "Set up sync",
-        "Encryption",
-        "Safety",
-        "Advanced",
+    it("leads with the setup panel and shows nothing that needs a server yet", () => {
+      // Every section below "Connection" needs credentials to do anything, and each one is
+      // something to scroll past on the way to the two fields that provide them.
+      const { log, names } = render(FRESH);
+      expect(log.headings).toEqual(["Set up sync", "Connection"]);
+      expect(names).toEqual([
+        "Join a vault that already syncs",
+        "Server URL",
+        "Access token",
+        "Test connection",
+        "Device name",
       ]);
+    });
+
+    it("grows into the whole page the moment both credentials are in", async () => {
+      const plugin = fakePlugin(FRESH);
+      const tab = newTab(plugin);
+      tab.display();
+      const url = logOf(tab).rows[1].texts[0];
+      const token = logOf(tab).rows[2].texts[0];
+
+      url.inputEl.value = "https://vault.example.workers.dev";
+      url.inputEl.fire("blur");
+      await flush();
+      // Half a pair configures nothing, so the page is still the short one.
+      expect(logOf(tab).settings.map((s) => s.name)).not.toContain("Vault master key");
+
+      token.inputEl.value = "access-token";
+      token.inputEl.fire("blur");
+      await flush();
+
+      const names = logOf(tab).settings.map((s) => s.name);
+      expect(names).toContain("Vault master key");
+      expect(names).toContain("Exclude globs");
+      expect(names).not.toContain("Join a vault that already syncs");
     });
 
     it("offers the setup-link route first, as the default action", () => {
@@ -422,6 +491,25 @@ describe("settings tab rendering", () => {
 
     it("points a first device at the setup script and the fields below", () => {
       expect(render(FRESH).log.paragraphs.join(" ")).toContain("scripts/setup.mjs");
+    });
+
+    // The instruction is a procedure to carry out on another device while reading it here, so
+    // it is short paragraphs with the path called out — not the six-sentence block it was.
+    it("spells out where to click on the device that already syncs", () => {
+      const said = render(FRESH).log.paragraphs.join(" ");
+      expect(said).toContain("Settings → R2DO Sync → Set up another device");
+      expect(said).toContain("Copy setup link");
+    });
+
+    it("links to the instructions, for a user who installed the plugin and has no clone", () => {
+      const tab = newTab(fakePlugin(FRESH));
+      tab.display();
+      const links = (tab.containerEl as unknown as FakeElement).children
+        .flatMap((c) => c.children)
+        .filter((c) => c.tag === "a");
+      expect(links.map((a) => a.href)).toEqual([
+        "https://github.com/pc418/cloudflare-r2do-sync#readme",
+      ]);
     });
 
     it("states that the user is responsible for their own data", () => {
@@ -463,6 +551,244 @@ describe("settings tab rendering", () => {
       expect(log.headings).not.toContain("Set up sync");
       expect(names).not.toContain("Join a vault that already syncs");
     });
+  });
+
+  // Every field on this page used to store what it held after each keystroke. Typing "100"
+  // into a field holding 50 therefore stored 1, then 10, then 100 — two values nobody asked
+  // for — and for the guard threshold the 100 raised a confirmation in the middle of the word,
+  // whose Cancel then restored the intermediate 10 rather than the 50 the user started with.
+  describe("staged fields", () => {
+    function field(over: Partial<Settings>, row: string) {
+      const plugin = fakePlugin(over);
+      const tab = newTab(plugin);
+      tab.display();
+      const log = logOf(tab);
+      const index = log.settings.findIndex((s) => s.name === row);
+      if (index < 0) throw new Error(`no "${row}" row`);
+      return { plugin, tab, text: log.rows[index].texts[0] };
+    }
+
+    it("stores nothing while the value is being typed", async () => {
+      const { plugin, text } = field({}, "Periodic sync (minutes)");
+      text.change("3");
+      text.change("30");
+      await flush();
+      expect(plugin.saved).toBe(0);
+      expect(plugin.settings.intervalMinutes).toBe(DEFAULT_SETTINGS.intervalMinutes);
+    });
+
+    it("stores the finished value when the field loses focus", async () => {
+      const { plugin, text } = field({}, "Periodic sync (minutes)");
+      text.change("30");
+      text.inputEl.fire("blur");
+      await flush();
+      expect(plugin.settings.intervalMinutes).toBe(30);
+      expect(plugin.saved).toBe(1);
+    });
+
+    it("stores it on Enter too, without waiting for focus to move", async () => {
+      const { plugin, text } = field({}, "Debounce (seconds)");
+      text.change("12");
+      text.inputEl.fire("keydown", { key: "Enter" });
+      await flush();
+      expect(plugin.settings.debounceSeconds).toBe(12);
+    });
+
+    it("ignores other keys", async () => {
+      const { plugin, text } = field({}, "Debounce (seconds)");
+      text.change("12");
+      text.inputEl.fire("keydown", { key: "2" });
+      await flush();
+      expect(plugin.saved).toBe(0);
+    });
+
+    // A settings page can close with a field still focused, and on some platforms that never
+    // fires blur. Silently discarding what was typed is the worst of the three outcomes.
+    it("flushes a still-focused field when the page closes", async () => {
+      const { plugin, tab, text } = field({}, "Parallel lanes");
+      text.change("8");
+      tab.hide();
+      await flush();
+      expect(plugin.settings.lanes).toBe(8);
+    });
+
+    it("does not save again for a field that was already committed", async () => {
+      const { plugin, tab, text } = field({}, "Parallel lanes");
+      text.change("8");
+      text.inputEl.fire("blur");
+      await flush();
+      tab.hide();
+      await flush();
+      expect(plugin.saved).toBe(1);
+    });
+
+    it.each([
+      ["out of range", "99"],
+      ["not a number", "four"],
+      ["fractional", "2.5"],
+      ["empty", ""],
+    ])("refuses a %s value out loud and keeps the stored one", async (_label, typed) => {
+      const { plugin, text } = field({ lanes: 4 }, "Parallel lanes");
+      text.change(typed);
+      text.inputEl.fire("blur");
+      await flush();
+      expect(plugin.settings.lanes).toBe(4);
+      expect(plugin.saved).toBe(0);
+      // The field must not be left disagreeing with what is stored: that reads as accepted.
+      expect(text.getValue()).toBe("4");
+      expect(Notice.shown.join(" ")).toContain("Parallel lanes takes 1–16");
+    });
+
+    it("asks before the threshold's off switch, and applies it when answered", async () => {
+      const { plugin, text } = field({ protectPercent: 50 }, "Ask before large changes (%)");
+      text.change("100");
+      text.inputEl.fire("blur");
+      await flush();
+
+      const confirm = Modal.shown.at(-1);
+      expect(bodyOf(confirm!).log.headings).toContain("Turn off the mass-change guard?");
+      expect(plugin.settings.protectPercent).toBe(50);
+
+      const button = bodyOf(confirm!).log.rows.flatMap((r) => r.buttons).find((b) => b.text === "Turn it off");
+      await button?.click();
+      await flush();
+      expect(plugin.settings.protectPercent).toBe(100);
+    });
+
+    it("restores the threshold that was there when the question is declined", async () => {
+      const { plugin, text } = field({ protectPercent: 50 }, "Ask before large changes (%)");
+      text.change("100");
+      text.inputEl.fire("blur");
+      await flush();
+
+      const cancel = bodyOf(Modal.shown.at(-1)!)
+        .log.rows.flatMap((r) => r.buttons)
+        .find((b) => b.text === "Keep the guard");
+      await cancel?.click();
+      await flush();
+
+      expect(plugin.settings.protectPercent).toBe(50);
+      // Not the 10 that "100" passed through on its way in.
+      expect(text.getValue()).toBe("50");
+      expect(plugin.saved).toBe(0);
+    });
+
+    it("does not ask again for any other threshold", async () => {
+      const { plugin, text } = field({ protectPercent: 50 }, "Ask before large changes (%)");
+      text.change("75");
+      text.inputEl.fire("blur");
+      await flush();
+      expect(Modal.shown).toEqual([]);
+      expect(plugin.settings.protectPercent).toBe(75);
+    });
+
+    it("refuses a server URL it cannot normalise and says so", async () => {
+      const { plugin, text } = field({}, "Server URL");
+      text.change("definitely not a url");
+      text.inputEl.fire("blur");
+      await flush();
+      expect(plugin.settings.serverUrl).toBe("https://vault.example.workers.dev");
+      expect(text.getValue()).toBe("https://vault.example.workers.dev");
+      expect(Notice.shown.join(" ")).toContain("server URL rejected");
+    });
+
+    it("trims a pasted access token on commit", async () => {
+      const { plugin, text } = field({}, "Access token");
+      text.change("  pasted-token\n");
+      await flush();
+      expect(plugin.saved).toBe(0);
+      text.inputEl.fire("blur");
+      await flush();
+      expect(plugin.settings.accessToken).toBe("pasted-token");
+    });
+
+    it("keeps a name for a device whose name field was cleared", async () => {
+      const { plugin, text } = field({ deviceName: "laptop" }, "Device name");
+      text.change("   ");
+      text.inputEl.fire("blur");
+      await flush();
+      expect(plugin.settings.deviceName).toBe("device");
+    });
+
+    it("commits glob lists on blur rather than on every keystroke", async () => {
+      const { plugin, text } = field({}, "Exclude globs");
+      text.change(".trash/**\n.arch");
+      await flush();
+      // A half-typed glob must never be the live exclude rule.
+      expect(plugin.settings.excludes).toBe(DEFAULT_SETTINGS.excludes);
+      text.change(".trash/**\n.archive/**");
+      text.inputEl.fire("blur");
+      await flush();
+      expect(plugin.settings.excludes).toBe(".trash/**\n.archive/**");
+      expect(plugin.saved).toBe(1);
+    });
+  });
+
+  // A glob's effect used to be visible only in the aftermath of a sync.
+  describe("glob match counts", () => {
+    const VAULT = ["note.md", "log/2026-08-08.md", "log/2026-08-07.md", "img/a.png", ".trash/old.md"];
+    const indexedApp = { vault: { getFiles: () => VAULT.map((path) => ({ path })) } };
+
+    function scope(over: Partial<Settings> = {}) {
+      const tab = newTab(fakePlugin(over), indexedApp);
+      tab.display();
+      const container = tab.containerEl as unknown as FakeElement;
+      return { tab, hints: container.byClass("r2do-hint").map((h) => h.text), container };
+    }
+
+    it("counts what the current rules keep, not what the vault holds", () => {
+      // `.trash/**` is the default exclude, so four of five files sync.
+      const { hints } = scope();
+      expect(hints[0]).toContain("4 of 5 files in Obsidian's index");
+      expect(hints[1]).toContain("Excludes drop 1 file of the 5");
+    });
+
+    it("counts an allow-list", () => {
+      const { hints } = scope({ onlyPaths: "log/**" });
+      expect(hints[0]).toContain("Allow-list matches 2 of 5");
+    });
+
+    it("follows the draft while it is typed, before anything is stored", () => {
+      const { tab, container } = scope();
+      const log = logOf(tab);
+      const index = log.settings.findIndex((s) => s.name === "Only sync matching paths");
+      log.rows[index].texts[0].change("img/**");
+      expect(container.byClass("r2do-hint")[0].text).toContain("matches 1 of 5");
+    });
+
+    it("says nothing at all when the file index cannot be read", () => {
+      // "We cannot tell" and "nothing matches" are different answers, and a 0 that means the
+      // first one is the kind of number that sends someone rewriting a working glob.
+      const container = (() => {
+        const tab = newTab(fakePlugin());
+        tab.display();
+        return tab.containerEl as unknown as FakeElement;
+      })();
+      expect(container.byClass("r2do-hint")).toEqual([]);
+    });
+  });
+
+  it("shows the master key in a window that can be copied from, not in a notice", async () => {
+    const key = "a".repeat(44);
+    const { log, names } = render({ masterKey: key, masterKeyBackedUp: true });
+    const index = names.indexOf("Reveal master key");
+
+    log.rows[index].buttons[0].click();
+
+    // A Notice cannot be selected on a phone, stays on top of the page until dismissed, and
+    // is the part of the screen people photograph.
+    expect(Notice.shown.join(" ")).not.toContain(key);
+    const shown = bodyOf(Modal.shown.at(-1)!);
+    const field = shown.children.find((c) => c.tag === "textarea");
+    expect(field?.value).toBe(key);
+    expect(field?.readOnly).toBe(true);
+  });
+
+  // A row about keystrokes on a device with no keyboard, sending the user to a settings page
+  // that mobile Obsidian does not have.
+  it("leaves the hotkey row off a phone", () => {
+    Platform.isMobile = true;
+    expect(render().names).not.toContain("Sync hotkey");
   });
 
   it("renders identically on a second display() call", () => {

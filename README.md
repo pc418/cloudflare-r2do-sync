@@ -62,7 +62,9 @@ node scripts/install-plugin.mjs "/path/to/Your Vault"
 2. A device with no credentials opens on a **Set up sync** panel naming the two ways in and
    what self-hosting puts on you. This is the first device, so use the fields under it: the
    **Server URL** and **Access token** from the printed block, plus a **Device name** (any
-   label you like — it is what conflict copies are named after).
+   label you like — it is what conflict copies are named after). **Test connection**, beside
+   those two fields, checks them against the server before anything syncs. The rest of the
+   settings page appears once both are in — nothing there can act without them.
 3. R2DO Sync generates a random vault master key before the first upload and opens the
    required backup window. Copy the key into your password manager and press **I saved
    it**; sync stays disabled until you do. Then press **Sync now**.
@@ -119,7 +121,7 @@ Once it runs: there is no status bar on mobile, so the **ribbon icon** is the sy
 tap it to sync, and its tooltip carries the same state the desktop status bar shows. Every
 pass ends in a notice — background ones too, and including "up to date" — so a tap is never
 silently ignored and a quiet plugin is never mistaken for a working one. Three toggles under
-**Advanced** shape that: turn notices off entirely, narrow them to passes that changed
+**Notices** shape that: turn notices off entirely, narrow them to passes that changed
 something, or have them name each changed file. The command palette has the same actions
 ("Sync now", "Preview sync", "Browse snapshot history").
 
@@ -207,7 +209,7 @@ commands then ask for it with hidden input.)
   one file** with the disagreements marked for you to edit. The newer edit is labelled
   `LATEST` and its button is the default. Nothing is decided for you and nothing is decided
   during a background sync: the copy is parked first, so the choice waits as long as you like.
-  **Review and resolve conflicts** (command palette, or **Advanced → Unresolved conflicts**)
+  **Review and resolve conflicts** (command palette, or **Safety → Unresolved conflicts**)
   reopens the latest batch any time.
 - **Combining is the only thing that writes markers into a note**, and only for the file you
   asked. Lines the two versions agree on appear once; each disagreement is wrapped in
@@ -220,10 +222,11 @@ commands then ask for it with hidden input.)
   remote side always remains in snapshot history.
 - **Edits beat deletes** in both directions — a deletion is easy to redo, an edit is not.
 - **A keystroke can start a sync.** R2DO Sync claims no key of its own — plugins that do
-  collide with yours — so **Sync hotkey** in settings shows what "Sync now" is bound to and
-  offers `⇧⌘S` (`Ctrl+Shift+S` off macOS) in one click, but only when nothing else uses it.
-  Otherwise **Choose** opens Obsidian's Hotkeys page filtered to this plugin, where every
-  R2DO Sync action — preview, history, conflict review — can take a key too.
+  collide with yours — so **Sync hotkey** (under **When it syncs**, desktop only) shows what
+  "Sync now" is bound to and offers `⇧⌘S` (`Ctrl+Shift+S` off macOS) in one click, but only
+  when nothing else uses it. Otherwise **Choose** opens Obsidian's Hotkeys page filtered to
+  this plugin, where every R2DO Sync action — preview, history, conflict review — can take a
+  key too.
 - **Every pass says what it moved.** "3 files, +35 lines" going out, "1 file, -7 lines"
   coming in — a net line count, so five lines replaced by five others reads as 0 and the file
   count is what shows the work. Binary files have no count. Turning on **List the changed
@@ -270,12 +273,19 @@ be fixed in code, each stating what it trades:
 | **Sync log length** | 50 | Passes kept for troubleshooting. They live in the plugin's data file. |
 | **Report folder** | vault root | Where **Export** writes its note. Created if missing; it syncs like any other note unless excluded. |
 | **Snapshots listed in history** | 40 | How far back the history browser walks. Each one is a request. |
-| **Unresolved conflicts** | — | Opens the review window for the latest batch: the difference, and which side to keep. |
 | **Automatic retries** | 3 | Retries after a failed pass (1s, 4s, 15s, 1m, 5m). A *halted* sync is never retried — it needs a person. |
-| **Notice when a sync finishes** | on | A summary after every pass, background ones included: files moved each way and the net change in lines. The only confirmation a phone gets. |
-| **Only notice syncs that changed something** | off | Skips the notice when a pass found nothing to do. A sync you start yourself always answers, so a manual sync never looks like it failed to run. |
-| **List the changed files in the notice** | off | Names each file that moved, with its line change and the snapshot id. Line counts are net — five lines replaced by five others reads as 0 — and binary files have none. |
 | **Sync settings between devices** | on | Shares the vault-wide settings above through the server, encrypted like your notes. The most recent change on any device wins. |
+
+The three toggles in **Notices** decide what a finished pass says: **Notice when a sync
+finishes** (on — a summary of files moved each way and the net line change, and the only
+confirmation a phone gets), **Only notice syncs that changed something** (off — a sync you
+start yourself still always answers), and **List the changed files in the notice** (off —
+each file by name with its line change and the snapshot id).
+
+Numbers are stored when you leave the field or press Enter, not while you type: a value the
+setting cannot use is refused out loud and the field goes back to what is stored, rather than
+saving each digit on the way to the one you meant. Both glob fields show how many of the
+files Obsidian has indexed the current lists keep, updated as you type.
 
 Vault-wide settings — excludes, the safety threshold, debounce and sync intervals, the
 allow-list, sync direction, log/history/retry knobs, the report folder, notices, and the

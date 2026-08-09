@@ -1,8 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
   alwaysSkip,
+  countInScope,
   globToRegExp,
+  isConfigPath,
   makeExcluder,
+  makeScopeFilter,
+  parseGlobs,
   pathError,
   LEGACY_PLUGIN_DIR,
   PLUGIN_DIR,
@@ -118,5 +122,75 @@ describe("alwaysSkip — hard self-excludes", () => {
     expect(alwaysSkip(".obsidian/plugins/dataview/data.json")).toBe(false);
     expect(alwaysSkip(".obsidian/themes/mytheme/theme.css")).toBe(false);
     expect(alwaysSkip(".obsidian/hotkeys.json")).toBe(false);
+  });
+});
+
+describe("parseGlobs", () => {
+  it("takes one glob per line and drops the blanks", () => {
+    expect(parseGlobs("a/**\n\n  b/*  \n")).toEqual(["a/**", "b/*"]);
+  });
+
+  it("treats an empty setting as no globs at all", () => {
+    expect(parseGlobs("")).toEqual([]);
+    expect(parseGlobs("   \n  ")).toEqual([]);
+  });
+});
+
+describe("isConfigPath", () => {
+  it("covers the directory and everything under it", () => {
+    expect(isConfigPath(".obsidian")).toBe(true);
+    expect(isConfigPath(".obsidian/app.json")).toBe(true);
+  });
+
+  it("does not catch a note whose name merely starts the same way", () => {
+    expect(isConfigPath(".obsidian-notes/a.md")).toBe(false);
+    expect(isConfigPath("notes/.obsidian/a.md")).toBe(false);
+  });
+});
+
+// The settings page counts what a glob list would do without running a pass, so this predicate
+// has to agree with the engine's own scope rule. A count that disagrees is worse than none.
+describe("makeScopeFilter", () => {
+  const VAULT = [
+    "note.md",
+    "log/2026-08-08.md",
+    "img/a.png",
+    ".trash/old.md",
+    ".DS_Store",
+    ".obsidian/app.json",
+    `${PLUGIN_DIR}/data.json`,
+  ];
+
+  it("keeps ordinary files and drops junk, the config directory and our own folder", () => {
+    const rules = { excludes: [".trash/**"], onlyPaths: [], syncConfigDir: false };
+    expect(VAULT.filter(makeScopeFilter(rules))).toEqual(["note.md", "log/2026-08-08.md", "img/a.png"]);
+  });
+
+  it("lets the config directory in on request, still without our own folder", () => {
+    const rules = { excludes: [".trash/**"], onlyPaths: [], syncConfigDir: true };
+    const kept = VAULT.filter(makeScopeFilter(rules));
+    expect(kept).toContain(".obsidian/app.json");
+    expect(kept).not.toContain(`${PLUGIN_DIR}/data.json`);
+  });
+
+  it("narrows to the allow-list when there is one", () => {
+    const rules = { excludes: [], onlyPaths: ["log/**"], syncConfigDir: false };
+    expect(VAULT.filter(makeScopeFilter(rules))).toEqual(["log/2026-08-08.md"]);
+  });
+
+  it("applies excludes on top of the allow-list rather than instead of it", () => {
+    const rules = { excludes: ["log/2026-08-08.md"], onlyPaths: ["log/**", "note.md"], syncConfigDir: false };
+    expect(VAULT.filter(makeScopeFilter(rules))).toEqual(["note.md"]);
+  });
+
+  it("refuses a path the server would reject", () => {
+    const inScope = makeScopeFilter({ excludes: [], onlyPaths: [], syncConfigDir: false });
+    expect(inScope("bad\\path.md")).toBe(false);
+    expect(inScope("/absolute.md")).toBe(false);
+  });
+
+  it("counts what it keeps", () => {
+    expect(countInScope(VAULT, { excludes: [".trash/**"], onlyPaths: [], syncConfigDir: false })).toBe(3);
+    expect(countInScope([], { excludes: [], onlyPaths: [], syncConfigDir: false })).toBe(0);
   });
 });

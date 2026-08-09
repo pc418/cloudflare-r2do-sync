@@ -104,3 +104,52 @@ export function makeExcluder(globs: string[]): (path: string) => boolean {
   const patterns = globs.filter((g) => g.trim().length > 0).map(globToRegExp);
   return (path: string) => patterns.some((re) => re.test(path));
 }
+
+/** Obsidian's configuration directory: opt-in, and never this plugin's own folder inside it. */
+export function isConfigPath(path: string): boolean {
+  return path === ".obsidian" || path.startsWith(".obsidian/");
+}
+
+/** One glob per line, blank lines dropped. The stored form of every glob setting. */
+export function parseGlobs(text: string): string[] {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+/** The glob settings that decide whether a path is this device's business at all. */
+export interface ScopeRules {
+  excludes: string[];
+  /** Allow-list; empty means the whole vault. */
+  onlyPaths: string[];
+  /** Whether ordinary `.obsidian/**` files are in scope. */
+  syncConfigDir: boolean;
+}
+
+/**
+ * Whether a path is one this device puts in its own snapshots.
+ *
+ * This mirrors `SyncEngine.#notScanned`, which composes the same five rules inline because its
+ * snapshot loop has to distinguish a silent skip from a reported one. It lives here as a pure
+ * function so the settings page can say what a glob list *would* do without running a pass —
+ * a wrong glob is otherwise only discoverable from a sync's aftermath. Change one, change both.
+ */
+export function makeScopeFilter(rules: ScopeRules): (path: string) => boolean {
+  const excluded = makeExcluder(rules.excludes);
+  const only = rules.onlyPaths.filter((glob) => glob.trim().length > 0);
+  const included = makeExcluder(only);
+  return (path: string) =>
+    !alwaysSkip(path) &&
+    pathError(path) === null &&
+    (rules.syncConfigDir || !isConfigPath(path)) &&
+    !excluded(path) &&
+    (only.length === 0 || included(path));
+}
+
+export function countInScope(paths: readonly string[], rules: ScopeRules): number {
+  const inScope = makeScopeFilter(rules);
+  let kept = 0;
+  for (const path of paths) if (inScope(path)) kept++;
+  return kept;
+}

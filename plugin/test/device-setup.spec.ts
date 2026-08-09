@@ -1,8 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateMasterKey, generateVaultSalt } from "../src/crypto";
-import { DEFAULT_SETTINGS, DeviceSetupModal, type Settings } from "../src/main";
-import { parseSetupText } from "../src/setup-link";
-import { App, type FakeElement, Notice } from "./obsidian-fake";
+import {
+  ApplySetupModal,
+  DEFAULT_SETTINGS,
+  DeviceSetupModal,
+  PasteSetupModal,
+  type Settings,
+} from "../src/main";
+import { encodeSetupUri, parseSetupText, type SetupPayload } from "../src/setup-link";
+import { App, type FakeElement, Modal, Notice } from "./obsidian-fake";
 
 // Exporting the payload as a QR only reaches devices that can point a camera at this screen.
 // Desktop-to-desktop therefore had no route at all, and the "copy the setup link" the docs
@@ -58,7 +64,20 @@ function withClipboard(impl: (text: string) => Promise<void>): string[] {
 afterEach(() => {
   vi.unstubAllGlobals();
   Notice.shown.length = 0;
+  Modal.shown.length = 0;
 });
+
+/** The buttons a window rendered, by label. */
+function buttonsOf(content: FakeElement) {
+  const all = content.log.rows.flatMap((r) => r.buttons);
+  return (text: string) => {
+    const found = all.find((b) => b.text === text);
+    if (found === undefined) {
+      throw new Error(`no "${text}" button; got ${all.map((b) => b.text).join(", ")}`);
+    }
+    return found;
+  };
+}
 
 describe("DeviceSetupModal", () => {
   it("offers both exports, with the scannable one as the default", () => {
@@ -202,6 +221,29 @@ describe("DeviceSetupModal", () => {
     expect(Notice.shown.join(" ")).toContain("cannot produce a usable setup link");
   });
 
+  // An export left on screen after the fields changed describes a payload the page no longer
+  // shows — and a QR is scanned by pointing a camera at it, long after any of this.
+  it("discards a rendered export when the device name changes", async () => {
+    withClipboard(async () => {});
+    const { content, button } = open();
+    await button("Copy setup link").click();
+    expect(content.texts().some((t) => t.includes("Anyone who"))).toBe(true);
+
+    content.log.rows[0].texts[0].change("laptop");
+
+    expect(content.texts().some((t) => t.includes("Anyone who"))).toBe(false);
+  });
+
+  it("discards a rendered export when the token changes", async () => {
+    withClipboard(async () => {});
+    const { content, button } = open();
+    await button("Copy setup link").click();
+
+    content.log.rows[1].texts[0].change("other-token");
+
+    expect(content.texts().some((t) => t.includes("Anyone who"))).toBe(false);
+  });
+
   it("drops the token from memory when the window closes", async () => {
     const written = withClipboard(async () => {});
     const { modal, button } = open();
@@ -211,5 +253,104 @@ describe("DeviceSetupModal", () => {
 
     expect(written).toEqual([]);
     expect(Notice.shown.join(" ")).toContain("No token to share");
+  });
+});
+
+const PAYLOAD: SetupPayload = {
+  v: 2,
+  url: "https://vault.example.workers.dev",
+  name: "laptop",
+  token: "access-token",
+  mode: "encrypted",
+  key: KEY,
+  vaultSalt: SALT,
+};
+
+describe("PasteSetupModal", () => {
+  function open(clipboard?: () => Promise<string>) {
+    if (clipboard !== undefined) {
+      vi.stubGlobal("navigator", { clipboard: { readText: clipboard } });
+    }
+    const modal = new PasteSetupModal(new App() as never, fakePlugin() as never);
+    modal.open();
+    const content = modal.contentEl as unknown as FakeElement;
+    return { modal, content, button: buttonsOf(content), field: content.log.rows[0].texts[0] };
+  }
+
+  it("says why a link is unusable in place, and marks it as an error", () => {
+    const { content, button, field } = open();
+    field.change("obsidian://r2do-sync-setup?d=nonsense");
+
+    button("Continue").click();
+
+    // Styled as an error: a page that reads the same whether or not it just refused something
+    // has not told the user anything.
+    const said = content.byClass("r2do-error")[0];
+    expect(said?.text).toContain("Cannot use that link");
+    expect(Modal.shown).toHaveLength(1); // still here — nothing was dismissed
+  });
+
+  it("takes the link straight off the clipboard, which is how it got to this device", async () => {
+    const { button } = open(async () => encodeSetupUri(PAYLOAD));
+
+    await button("Paste from clipboard").click();
+
+    const applied = Modal.shown.at(-1);
+    expect(applied).toBeInstanceOf(ApplySetupModal);
+    expect((applied!.contentEl as unknown as FakeElement).texts().join(" ")).toContain(PAYLOAD.url);
+  });
+
+  it("keeps the field usable when the platform refuses the clipboard", async () => {
+    const { content, button } = open(async () => {
+      throw new Error("denied");
+    });
+
+    await button("Paste from clipboard").click();
+
+    expect(content.byClass("r2do-error")[0]?.text).toContain("Paste into the field instead");
+    expect(Modal.shown).toHaveLength(1);
+  });
+
+  it("shows what it read when the clipboard held something else", async () => {
+    const { content, button, field } = open(async () => "a shopping list");
+
+    await button("Paste from clipboard").click();
+
+    expect(field.getValue()).toBe("a shopping list");
+    expect(content.byClass("r2do-error")[0]?.text).toContain("Cannot use that link");
+  });
+});
+
+describe("ApplySetupModal", () => {
+  function open(over: Partial<Settings> = {}) {
+    const modal = new ApplySetupModal(
+      new App() as never,
+      fakePlugin(over) as never,
+      PAYLOAD
+    );
+    modal.open();
+    return { modal, content: modal.contentEl as unknown as FakeElement };
+  }
+
+  // Repointing a working device at a different vault is the one case where this dialog is
+  // consequential, and the flat sentence read identically on a device that had no server yet.
+  it("names both ends when the link points at a different server", () => {
+    const { content } = open({ serverUrl: "https://old.example.workers.dev" });
+    const said = content.log.paragraphs.join(" ");
+    expect(said).toContain("currently syncs with https://old.example.workers.dev");
+    expect(said).toContain(PAYLOAD.url);
+    expect(said).toContain("different vault");
+  });
+
+  it("says nothing about moving when the link is for the same server", () => {
+    const { content } = open({ serverUrl: `${PAYLOAD.url}/` });
+    const said = content.log.paragraphs.join(" ");
+    expect(said).toContain("replaces the current server, token and key");
+    expect(said).not.toContain("different vault");
+  });
+
+  it("treats a device with no server as a fresh one, not a move", () => {
+    const { content } = open({ serverUrl: "" });
+    expect(content.log.paragraphs.join(" ")).not.toContain("different vault");
   });
 });
