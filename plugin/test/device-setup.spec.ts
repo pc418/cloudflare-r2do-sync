@@ -187,6 +187,24 @@ describe("DeviceSetupModal", () => {
     expect(linkField(content)?.readOnly).toBe(true);
   });
 
+  // The link is ~400 unbroken base64 characters. In a default textarea that is a narrow box
+  // showing a dozen of them, so the first cut of this shipped as an unlabelled mystery field
+  // that appeared to be empty — the opposite of "you can see the link now".
+  it("renders the link legibly and says what it is", async () => {
+    withClipboard(async () => {});
+    const { content, button } = open();
+
+    await button("Copy setup link").click();
+
+    const field = linkField(content);
+    expect(field?.cls).toBe("r2do-secret");
+    // Labelled, and labelled BEFORE the box: an unexplained field full of base64 reads as a
+    // glitch, and this one holds the vault's master key.
+    const row = content.log.settings.find((r) => r.name === "Setup link");
+    expect(row?.desc).toContain("device with no camera");
+    expect(row?.controls).toContain("button");
+  });
+
   // A QR is useless to a second computer, and a phone scanner that opens obsidian:// in a
   // browser drops it — so the code without the link beside it leaves both of them stuck.
   it("shows the link beside the QR code as well", () => {

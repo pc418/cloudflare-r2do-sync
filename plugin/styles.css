@@ -79,3 +79,19 @@
 .r2do-globs {
   font-family: var(--font-monospace);
 }
+
+/*
+ * Secrets shown so they can be read and copied: the master key, and the device setup link.
+ * The link is ~400 characters of base64 with no spaces anywhere in it, so an unstyled box
+ * shows a stub and hides the rest — which made "the link is visible now" ship as an empty
+ * mystery field. Full width, monospace, and allowed to break mid-token.
+ */
+.r2do-secret {
+  width: 100%;
+  resize: vertical;
+  font-family: var(--font-monospace);
+  font-size: var(--font-smaller);
+  line-height: 1.4;
+  word-break: break-all;
+  white-space: pre-wrap;
+}

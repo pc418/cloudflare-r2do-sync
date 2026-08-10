@@ -297,6 +297,13 @@ const REPO_URL = "https://github.com/pc418/cloudflare-r2do-sync#readme";
 const STATUS_REFRESH_MS = 30_000;
 
 /**
+ * How long the "syncing…" notice stays up at minimum. A pass on an up-to-date vault is over in
+ * a few hundred milliseconds, and a notice that appears and vanishes inside that window reads
+ * as no notice at all — the answer to "did my tap register" has to be legible.
+ */
+const MIN_START_NOTICE_MS = 1500;
+
+/**
  * The command a hotkey is worth having. Named once because the hotkey manager keys bindings by
  * the *qualified* id (`<plugin id>:sync-now`), so a rename here would silently orphan a binding.
  */
@@ -944,6 +951,7 @@ export default class LogSyncPlugin extends Plugin {
     // for the whole pass (duration 0) and taken down in the `finally`, so it cannot outlive
     // the work even if the pass throws.
     let started: Notice | null = null;
+    const startedAt = Date.now();
     try {
       if (!(await this.#confirmFirstSync())) return;
       this.#phase = "syncing";
@@ -962,9 +970,27 @@ export default class LogSyncPlugin extends Plugin {
     } catch {
       // reported through onError
     } finally {
-      started?.hide();
+      this.#dismissStartNotice(started, startedAt);
       this.#interactive--;
     }
+  }
+
+  /**
+   * Takes the "syncing…" notice down, but never sooner than it can be read.
+   *
+   * A pass on an up-to-date vault finishes in a few hundred milliseconds, and a notice raised
+   * and hidden inside that window is a flicker nobody sees — which is indistinguishable from
+   * the toast not working at all. Holding it for a moment costs nothing on a slow pass, where
+   * it has already been on screen far longer than this.
+   */
+  #dismissStartNotice(notice: Notice | null, raisedAt: number): void {
+    if (notice === null) return;
+    const shownFor = Date.now() - raisedAt;
+    if (shownFor >= MIN_START_NOTICE_MS) {
+      notice.hide();
+      return;
+    }
+    window.setTimeout(() => notice.hide(), MIN_START_NOTICE_MS - shownFor);
   }
 
   /** Shows what a sync would do, without doing any of it. */
@@ -1830,10 +1856,13 @@ function addReveal(setting: Setting, input: HTMLInputElement): void {
  * dismissed, cannot be selected on a phone, and is what ends up in a screenshot.
  */
 function secretField(parent: HTMLElement, value: string, label: string): HTMLTextAreaElement {
-  const field = parent.createEl("textarea");
+  // The class is what makes it legible: full width, monospace, and breaking mid-token. A
+  // setup link is ~400 unbroken base64 characters, and the default box shows about a dozen
+  // of them — which is how "you can see the link now" shipped as a mystery empty box.
+  const field = parent.createEl("textarea", { cls: "r2do-secret" });
   field.value = value;
   field.readOnly = true;
-  field.rows = 3;
+  field.rows = 4;
   field.setAttr("aria-label", label);
   return field;
 }
@@ -2753,14 +2782,24 @@ export class DeviceSetupModal extends Modal {
    * A secret that only ever exists on the clipboard cannot be checked, cannot be read out,
    * and is gone the moment anything else is copied.
    */
+  /**
+   * The link, under a heading that says what it is.
+   *
+   * Order matters: the row is placed before the box so the box is never an unlabelled
+   * mystery, and the button is attached afterwards so the field it copies already exists.
+   */
   #linkField(out: HTMLElement, uri: string): HTMLTextAreaElement {
-    const field = secretField(out, uri, "Setup link");
-    new Setting(out)
+    const row = new Setting(out)
       .setName("Setup link")
-      .setDesc("Paste it into the other device with \"Apply a setup link\".")
-      .addButton((b) =>
-        b.setButtonText("Copy link").onClick(() => void copySecret(uri, field, "Setup link"))
+      .setDesc(
+        "The same thing the code carries, as text — for a device with no camera, or a scanner " +
+          "that opens the link in a browser instead of Obsidian. Paste it into the other " +
+          "device with \"Apply a setup link\"."
       );
+    const field = secretField(out, uri, "Setup link");
+    row.addButton((b) =>
+      b.setButtonText("Copy link").onClick(() => void copySecret(uri, field, "Setup link"))
+    );
     return field;
   }
 
