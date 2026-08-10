@@ -9,6 +9,12 @@ export interface RenderedSetting {
   name: string;
   desc: string;
   controls: RenderedKind[];
+  /**
+   * The heading this row rendered under, which is the only record of it: `setHeading()` takes
+   * a heading back out of the settings list, so nothing else relates the two. Grouping is
+   * what the page is *for* — a row filed under the wrong part is a row nobody finds.
+   */
+  section: string;
 }
 
 /** Everything a container has rendered, in order. */
@@ -124,6 +130,16 @@ export class FakeElement {
   }
   createDiv(opts?: { text?: string; cls?: string }): FakeElement {
     return this.createEl("div", opts);
+  }
+  /**
+   * The QR code is built as inline SVG through `document.createElementNS` and appended here,
+   * so this records the node without modelling one: "was a code drawn" is the question, and
+   * the modules inside it are the QR library's business.
+   */
+  appendChild(child: { tagName?: string }): FakeElement {
+    const el = new FakeElement(child.tagName ?? "node", "", this.log);
+    this.children.push(el);
+    return el;
   }
   /** Every text in this subtree, in render order. */
   texts(): string[] {
@@ -256,7 +272,7 @@ export class ButtonComponent {
 }
 
 export class Setting {
-  readonly rendered: RenderedSetting = { name: "", desc: "", controls: [] };
+  readonly rendered: RenderedSetting = { name: "", desc: "", controls: [], section: "" };
   readonly texts: TextComponent[] = [];
   readonly toggles: ToggleComponent[] = [];
   readonly dropdowns: DropdownComponent[] = [];
@@ -265,6 +281,9 @@ export class Setting {
   // Registered on construction, so a throw part-way through a chain still shows how far
   // rendering got — that is exactly the failure this fake exists to catch.
   constructor(private readonly container: FakeElement) {
+    // Stamped on construction, before this row knows whether it is itself a heading: a
+    // heading is removed from the list again by `setHeading()`.
+    this.rendered.section = container.log.headings.at(-1) ?? "";
     container.log.settings.push(this.rendered);
     container.log.rows.push(this);
   }

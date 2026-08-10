@@ -40,7 +40,11 @@ export interface SyncApiLike {
   getBlob(hash: string): Promise<Uint8Array>;
   checkBlobs(hashes: string[]): Promise<string[]>;
   putBlob(hash: string, bytes: Uint8Array): Promise<void>;
-  commit(manifest: Manifest, expectedHead: string | null): Promise<string>;
+  commit(
+    manifest: Manifest,
+    expectedHead: string | null,
+    opts?: { reroot?: boolean }
+  ): Promise<string>;
 }
 
 export interface SkippedFile {
@@ -58,6 +62,13 @@ export interface ConflictInfo {
   kept: "ours" | "theirs";
   ours: { mtime: number; size: number };
   theirs: { mtime: number; size: number };
+  /**
+   * True when `copy` names an entry that exists only in the snapshot. Push-only mode never
+   * writes to the vault, so its parked versions are published rather than saved to disk, and
+   * a review window that offered to "keep" one would be pointing at a file that is not there.
+   * Absent on entries written before this existed, which were all real files.
+   */
+  snapshotOnly?: boolean;
 }
 
 /**
@@ -252,6 +263,27 @@ export interface SyncPassOptions {
    * written or removed. Refused in `pull-only` mode, which never commits at all.
    */
   keepLocal?: boolean;
+  /**
+   * Publish this pass as a new ROOT snapshot, discarding every earlier one.
+   *
+   * The commit's parent is null rather than the current head, so the whole existing chain is
+   * orphaned and the server's next GC deletes it along with every blob only it referenced.
+   * That is the only way to make content stop existing remotely — an ordinary commit, forced
+   * or not, layers onto the chain and leaves the old snapshots restorable.
+   *
+   * Implies `keepLocal`: the point is to publish this device's state, not to reconcile.
+   * Unscanned remote paths are still carried, because dropping them would delete other
+   * devices' files rather than their history.
+   */
+  reroot?: {
+    /**
+     * The head the operator was shown before agreeing. If it is no longer the head, the pass
+     * REFUSES rather than rerooting over a snapshot nobody reviewed: an ordinary CAS retry
+     * absorbs a racing commit and merges it, but a reroot would discard that device's work
+     * *and* the history that made it recoverable.
+     */
+    previewedHead: string | null;
+  };
 }
 
 /** What `forcePull` would do, so it can be shown before it is done. */
@@ -283,6 +315,18 @@ export interface ForcePushSummary {
   drop: string[];
   /** Remote paths this device does not scan, carried into the new snapshot unchanged. */
   carried: number;
+}
+
+/** What "Rebuild remote history" would do, so the confirmation can state it before it runs. */
+export interface RerootSummary extends ForcePushSummary {
+  /**
+   * Snapshots that stop being reachable, counted up to the history limit asked for. The
+   * server deletes them on its next collection, not at the click — the confirmation says so,
+   * because "purged" and "unreachable" are not the same promise.
+   */
+  discarded: number;
+  /** True when the chain was longer than the count walked, so `discarded` is a floor. */
+  discardedIsFloor: boolean;
 }
 
 interface ForcePullPlan extends ForcePullSummary {
@@ -385,7 +429,10 @@ export class SyncEngine {
   }
 
   async sync(opts: SyncPassOptions = {}): Promise<SyncResult> {
-    const keepLocal = opts.keepLocal === true;
+    const reroot = opts.reroot ?? null;
+    // Rerooting is a publish, so it carries the same refusal and the same non-merging shape
+    // as a forced push: reconciling first would only be work the operator has overruled.
+    const keepLocal = opts.keepLocal === true || reroot !== null;
     if (keepLocal && this.#mode === "pull-only") {
       throw new Error(
         'sync direction is "pull-only", so this device never commits — it cannot push its ' +
@@ -401,7 +448,7 @@ export class SyncEngine {
     if (this.status.phase === "syncing") throw new Error("sync is already running");
     this.status = { phase: "syncing" };
     try {
-      return await this.#sync(keepLocal);
+      return await this.#sync(keepLocal, reroot);
     } catch (e) {
       if (e instanceof HaltError) return this.#halt(e.message);
       if (this.status.phase === "syncing") {
@@ -430,7 +477,10 @@ export class SyncEngine {
     return this.#result({ status: "halted", reason, ...rest });
   }
 
-  async #sync(forceKeepLocal = false): Promise<SyncResult> {
+  async #sync(
+    forceKeepLocal = false,
+    reroot: { previewedHead: string | null } | null = null
+  ): Promise<SyncResult> {
     const loaded = this.#state ?? (await this.#store.load()) ?? {
       lastSyncedHead: null,
       files: pathMap<FileEntry>(),
@@ -470,6 +520,18 @@ export class SyncEngine {
 
     for (;;) {
       const serverHead = await this.#api.getHead();
+
+      // A reroot is pinned to the snapshot the operator was shown. Every other pass treats a
+      // moved head as something to merge and retry; this one cannot, because what it does to
+      // the snapshot it did not review is delete it and every earlier version with it.
+      if (reroot !== null && serverHead !== reroot.previewedHead) {
+        throw new Error(
+          `another device published ${serverHead ?? "an empty vault"} since this rebuild was ` +
+            "previewed, so nothing was changed. Preview it again to see what rebuilding " +
+            "would now discard."
+        );
+      }
+
       let remoteFiles: Record<string, FileEntry> | null = null;
       let normalizedRemoteCollision = false;
       let remoteSkipped: SkippedFile[] = [];
@@ -517,9 +579,12 @@ export class SyncEngine {
             ...collisionResolution.conflicts,
             ...planned.outcome.conflicts
           );
+          // Nothing in this branch touched the vault, so neither parked version is a file
+          // here. Saying so is what keeps the review window from offering to keep one.
           pushAttemptOutcome.conflictDetails.push(
-            ...collisionResolution.conflictDetails,
-            ...planned.outcome.conflictDetails
+            ...[...collisionResolution.conflictDetails, ...planned.outcome.conflictDetails].map(
+              (info): ConflictInfo => ({ ...info, snapshotOnly: true })
+            )
           );
         } else {
           const plan = this.#planRemote(
@@ -611,7 +676,9 @@ export class SyncEngine {
 
       const finalFiles = mergePathMaps(mergePathMaps(carried, files), pushOnlyConflictFiles);
 
-      if (remoteFiles === null && !keyMigrationPending && sameFiles(finalFiles, baseFiles)) {
+      // A reroot commits even when nothing changed: discarding history IS the change, and
+      // "your files already match" is not an answer to "stop storing the old versions".
+      if (reroot === null && remoteFiles === null && !keyMigrationPending && sameFiles(finalFiles, baseFiles)) {
         this.status = { phase: "idle", lastSyncAt: this.#now() };
         return this.#result({
           status: "unchanged",
@@ -621,6 +688,7 @@ export class SyncEngine {
       }
 
       if (
+        reroot === null &&
         remoteFiles !== null &&
         !normalizedRemoteCollision &&
         !keyMigrationPending &&
@@ -660,9 +728,12 @@ export class SyncEngine {
           this.#onProgress?.({ phase: "upload", done: ++done, total: missing.length });
         });
 
-        const manifest = await this.#buildManifest(serverHead, finalFiles, hashes);
+        // A reroot's parent is null while its CAS token is still the head this pass saw. If
+        // that race is lost, the retry above refuses outright rather than rerooting over the
+        // winner: for this one pass a stale head is not something to merge and try again.
+        const manifest = await this.#buildManifest(reroot !== null ? null : serverHead, finalFiles, hashes);
         try {
-          head = await this.#api.commit(manifest, serverHead);
+          head = await this.#api.commit(manifest, serverHead, { reroot: reroot !== null });
         } catch (e) {
           if (!(e instanceof MissingBlobError)) throw e;
           // Blob vanished between check and commit (GC race). Re-upload exactly once.
@@ -670,7 +741,7 @@ export class SyncEngine {
             await this.#uploadHash(hash, pathByBlob, files);
             uploaded++;
           });
-          head = await this.#api.commit(manifest, serverHead);
+          head = await this.#api.commit(manifest, serverHead, { reroot: reroot !== null });
         }
       } catch (e) {
         if (e instanceof FileChangedError) {
@@ -1549,6 +1620,23 @@ export class SyncEngine {
       .filter((path) => !Object.hasOwn(carried, path) && !Object.hasOwn(local.files, path))
       .sort();
     return summary;
+  }
+
+  /**
+   * What a reroot would publish, and how much history it would orphan.
+   *
+   * Deliberately built from `forcePushSummary`: a reroot publishes exactly what a forced push
+   * would, and differs only in what happens to everything *behind* it. Two summaries that
+   * could disagree about the files would be two chances to describe the wrong action.
+   */
+  async rerootSummary(historyLimit: number): Promise<RerootSummary> {
+    const push = await this.forcePushSummary();
+    const chain = await this.listHistory(historyLimit);
+    return {
+      ...push,
+      discarded: chain.length,
+      discardedIsFloor: chain.length >= historyLimit,
+    };
   }
 
   async #mergeOne(

@@ -169,10 +169,20 @@ export class SyncApi {
     await this.#request("/api/settings", { method: "PUT", body: JSON.stringify(doc) });
   }
 
-  async commit(manifest: Manifest, expectedHead: string | null): Promise<string> {
+  /**
+   * `reroot` publishes a manifest with no parent as the new head, orphaning every earlier
+   * snapshot. It is still compare-and-set on `expectedHead`, so a device committing at the
+   * same moment loses the race instead of its work. The server refuses the combination
+   * unless the flag is explicit, which is what keeps it from happening by accident.
+   */
+  async commit(
+    manifest: Manifest,
+    expectedHead: string | null,
+    opts: { reroot?: boolean } = {}
+  ): Promise<string> {
     const res = await this.#request("/api/commit", {
       method: "POST",
-      body: JSON.stringify({ manifest, expectedHead }),
+      body: JSON.stringify({ manifest, expectedHead, ...(opts.reroot === true ? { reroot: true } : {}) }),
     });
     return ((await res.json()) as { head: string }).head;
   }

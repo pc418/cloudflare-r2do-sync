@@ -114,6 +114,112 @@ describe("POST /api/commit", () => {
     expect(res.status).toBe(422);
   });
 
+  // "Rebuild remote history": publish the current state as a new root and orphan the whole
+  // existing chain, which the next GC then deletes. It is the only sanctioned way to commit a
+  // manifest whose parent is not the head, so every guard around it is worth pinning.
+  describe("reroot", () => {
+    it("commits a new root over an existing head and makes it the head", async () => {
+      const h1 = await putBlob(token, "old");
+      const m1 = makeManifest({ files: { "a.md": { h: h1 } } });
+      expect((await commit(token, m1, null)).status).toBe(200);
+
+      const h2 = await putBlob(token, "new");
+      const root = makeManifest({ id: ulid(Date.now() + 1), parent: null, files: { "a.md": { h: h2 } } });
+      const res = await commit(token, root, m1.id, { reroot: true });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ head: root.id });
+      const headRes = await SELF.fetch(`${BASE}/api/head`, authed(token));
+      expect(await headRes.json()).toEqual({ head: root.id });
+      // The old manifest is merely orphaned, not deleted: GC removes it on its own schedule,
+      // which is why the UI says the purge completes later rather than now.
+      expect(await env.VAULT.get(`manifests/${m1.id}.json`)).not.toBeNull();
+    });
+
+    // Still compare-and-set. Without this a reroot raced against another device's commit
+    // would silently discard that device's work along with the history.
+    it("refuses a reroot whose expectedHead is stale", async () => {
+      const h = await putBlob(token, "old");
+      const m1 = makeManifest({ files: { "a.md": { h } } });
+      expect((await commit(token, m1, null)).status).toBe(200);
+
+      const root = makeManifest({ id: ulid(Date.now() + 1), parent: null, files: { "a.md": { h } } });
+      const res = await commit(token, root, ulid(), { reroot: true });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ error: { code: "stale_head" }, head: m1.id });
+    });
+
+    // The expectedHead here is the REAL head, so the parent/head rule is satisfied and only
+    // the reroot rule can reject it. Asking with a stale expectedHead would have failed for
+    // the wrong reason and left this exact case — "reroot" quietly committing an ordinary
+    // child, reporting success, and discarding nothing — completely untested.
+    it("refuses a reroot that is a valid child rather than committing it as one", async () => {
+      const h = await putBlob(token, "old");
+      const m1 = makeManifest({ files: { "a.md": { h } } });
+      expect((await commit(token, m1, null)).status).toBe(200);
+
+      const child = makeManifest({ id: ulid(Date.now() + 1), parent: m1.id, files: { "a.md": { h } } });
+      const res = await commit(token, child, m1.id, { reroot: true });
+
+      expect(res.status).toBe(422);
+      expect(await res.text()).toContain("parent null");
+      // The head must not have moved: a refused commit changes nothing.
+      const headRes = await SELF.fetch(`${BASE}/api/head`, authed(token));
+      expect(await headRes.json()).toEqual({ head: m1.id });
+    });
+
+    it("refuses a reroot whose parent is some unrelated snapshot", async () => {
+      const h = await putBlob(token, "old");
+      const m1 = makeManifest({ files: { "a.md": { h } } });
+      expect((await commit(token, m1, null)).status).toBe(200);
+
+      const child = makeManifest({ id: ulid(Date.now() + 1), parent: ulid(), files: { "a.md": { h } } });
+      const res = await commit(token, child, m1.id, { reroot: true });
+
+      expect(res.status).toBe(422);
+      expect(await res.text()).toContain("parent null");
+    });
+
+    // Without the flag this is the ordinary "you lost track of the chain" mistake, and it
+    // must stay an error: discarding history cannot be something a client does by accident.
+    it("still refuses a root manifest over a head when the flag is absent", async () => {
+      const h = await putBlob(token, "old");
+      const m1 = makeManifest({ files: { "a.md": { h } } });
+      expect((await commit(token, m1, null)).status).toBe(200);
+
+      const root = makeManifest({ id: ulid(Date.now() + 1), parent: null, files: { "a.md": { h } } });
+      expect((await commit(token, root, m1.id)).status).toBe(422);
+    });
+
+    it("rejects a non-boolean reroot rather than guessing what was meant", async () => {
+      const res = await SELF.fetch(
+        `${BASE}/api/commit`,
+        authed(token, {
+          method: "POST",
+          body: JSON.stringify({ manifest: makeManifest({ files: {} }), expectedHead: null, reroot: "yes" }),
+          headers: { "content-type": "application/json" },
+        })
+      );
+      expect(res.status).toBe(422);
+      expect(await res.text()).toContain("reroot must be a boolean");
+    });
+
+    // A root verifies every blob it names, having no parent to inherit a verified set from.
+    it("still refuses a root that references a blob which is not there", async () => {
+      const h = await putBlob(token, "old");
+      const m1 = makeManifest({ files: { "a.md": { h } } });
+      expect((await commit(token, m1, null)).status).toBe(200);
+
+      const ghost = await sha256hex("never uploaded");
+      const root = makeManifest({ id: ulid(Date.now() + 1), parent: null, files: { "a.md": { h: ghost } } });
+      const res = await commit(token, root, m1.id, { reroot: true });
+
+      expect(res.status).toBe(422);
+      expect(await res.json()).toMatchObject({ error: { code: "missing_blob" } });
+    });
+  });
+
   it("retrying an already-committed manifest repairs a missing head mirror", async () => {
     const h = await putBlob(token, "retry me");
     const m = makeManifest({ files: { "a.md": { h } } });

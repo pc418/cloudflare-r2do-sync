@@ -71,7 +71,7 @@ export class SyncScheduler {
     if (this.#running) {
       // An ordinary request is satisfied by the pass already in flight. A forced direction
       // is not: returning its result would report a force that never happened.
-      if (opts.keepLocal === true) {
+      if (opts.keepLocal === true || opts.reroot !== undefined) {
         throw new Error("a sync is already running — wait for it to finish, then force again");
       }
       return this.#running;

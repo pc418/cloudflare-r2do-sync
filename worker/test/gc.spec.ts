@@ -34,6 +34,31 @@ describe("runGc", () => {
     expect(report.deletedBlobs).toBe(0);
   });
 
+  // What "Rebuild remote history" actually buys: the new root is the whole chain, so every
+  // earlier snapshot is off-chain and the blobs only they referenced stop being live. This is
+  // also why the UI must say the purge completes at the next GC run, not at the click.
+  it("collects the chain a reroot orphaned, keeping blobs the new root still names", async () => {
+    const now = Date.now() + 10 * DAY;
+    const shared = await seedBlob("still in the vault");
+    const secret = await seedBlob("the thing being purged");
+    const old1 = manifest(ulid(now - 5 * DAY), null, now - 5 * DAY, { "a.md": shared, "s.md": secret });
+    const old2 = manifest(ulid(now - 4 * DAY), old1.id, now - 4 * DAY, { "a.md": shared, "s.md": secret });
+    const root = manifest(ulid(now - 3 * DAY), null, now - 3 * DAY, { "a.md": shared });
+    for (const m of [old1, old2, root]) await seedManifest(m);
+    await env.VAULT.put("head.json", JSON.stringify({ head: root.id }));
+
+    const report = await runGc(env, { now, minAgeMs: 0 });
+
+    expect(report.retainedManifests).toBe(1);
+    expect(report.deletedManifests).toBe(2);
+    expect(await env.VAULT.head(`manifests/${old1.id}.json`)).toBeNull();
+    expect(await env.VAULT.head(`manifests/${old2.id}.json`)).toBeNull();
+    expect(await env.VAULT.head(`manifests/${root.id}.json`)).not.toBeNull();
+    // The purged content is gone; content the new root still names survives.
+    expect(await env.VAULT.head(`blobs/${secret}`)).toBeNull();
+    expect(await env.VAULT.head(`blobs/${shared}`)).not.toBeNull();
+  });
+
   it("missing mirrored head manifest aborts without deleting anything", async () => {
     const now = Date.now() + 2 * DAY;
     const danglingHead = ulid(now - DAY);

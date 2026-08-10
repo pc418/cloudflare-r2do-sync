@@ -106,13 +106,14 @@ export function makeManifestV2(opts: {
 export async function commit(
   token: string,
   manifest: Manifest,
-  expectedHead: string | null
+  expectedHead: string | null,
+  opts: { reroot?: boolean } = {}
 ): Promise<Response> {
   return SELF.fetch(
     `${BASE}/api/commit`,
     authed(token, {
       method: "POST",
-      body: JSON.stringify({ manifest, expectedHead }),
+      body: JSON.stringify({ manifest, expectedHead, ...opts }),
       headers: { "content-type": "application/json" },
     })
   );

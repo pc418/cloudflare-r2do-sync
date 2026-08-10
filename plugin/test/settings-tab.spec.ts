@@ -70,6 +70,7 @@ function fakePlugin(over: Partial<Settings> = {}, keyMismatch: string | null = n
     async requestEncryptionTarget() {},
     async forcePull() {},
     async forcePush() {},
+    async rebuildHistory() {},
     openConflictReview() {
       this.reviewed += 1;
     },
@@ -91,16 +92,44 @@ function render(
 describe("settings tab rendering", () => {
   it("renders every section heading", () => {
     const { log } = render();
+    // Grouped by what each part of the plugin does. There is deliberately no "Advanced"
+    // bucket: it grouped settings by how obscure they looked, which split every feature
+    // across two places — the retry count a page away from the schedule, the history depth
+    // a page away from the history browser, the log length a page away from the export.
     expect(log.headings).toEqual([
       "Connection",
       "This device",
       "Encryption",
       "What syncs",
-      "When it syncs",
-      "Safety",
+      "How and when it syncs",
+      "Conflicts",
+      "Safety and recovery",
       "Notices",
-      "Advanced",
+      "Troubleshooting",
     ]);
+  });
+
+  it.each([
+    ["Sync direction", "How and when it syncs"],
+    ["Automatic retries", "How and when it syncs"],
+    ["Parallel lanes", "How and when it syncs"],
+    ["Conflict handling", "Conflicts"],
+    ["Unresolved conflicts", "Conflicts"],
+    ["Rebuild remote history", "Safety and recovery"],
+    ["Snapshots listed in history", "Safety and recovery"],
+    ["Sync log length", "Troubleshooting"],
+    ["Report folder", "Troubleshooting"],
+    ["Sync settings between devices", "This device"],
+  ])("files %s under %s", (row, heading) => {
+    const found = render().log.settings.find((s) => s.name === row);
+    expect(found, row).toBeDefined();
+    expect(found?.section).toBe(heading);
+  });
+
+  it("keeps the sync log export with the knobs that shape it", () => {
+    const { names } = render();
+    expect(names.indexOf("Sync log")).toBeLessThan(names.indexOf("Sync log length"));
+    expect(names.indexOf("Sync log length")).toBeLessThan(names.indexOf("Report folder"));
   });
 
   it("renders the credential fields with the connection test beside them", () => {
@@ -137,19 +166,28 @@ describe("settings tab rendering", () => {
     "Unresolved conflicts",
     "Pull remote over local",
     "Push local over remote",
+    "Rebuild remote history",
     "Sync log",
     "Parallel lanes",
     "Sync log length",
     "Report folder",
     "Snapshots listed in history",
     "Automatic retries",
-    "Notice when a sync finishes",
+    "Notice when a sync runs",
     "Only notice syncs that changed something",
     "List the changed files in the notice",
     "Sync settings between devices",
     "Test connection",
   ])("renders %s", (name) => {
     expect(render().names).toContain(name);
+  });
+
+  it("warns that rebuilding history destroys it, before anything is clicked", () => {
+    const desc = render().log.settings.find((s) => s.name === "Rebuild remote history")?.desc;
+    expect(desc).toContain("DISCARDS every earlier one");
+    expect(desc).toContain("Nothing it removes can be restored");
+    // "Purged" and "unreachable" are different promises, and the difference is a day.
+    expect(desc).toContain("daily collection");
   });
 
   it("gives every rendered setting a name and at least one control", () => {
@@ -180,7 +218,6 @@ describe("settings tab rendering", () => {
   it("renders the plaintext variant without the encryption-only controls", () => {
     const { names } = render({ encryptionMode: "plaintext", masterKey: "", masterKeyBackedUp: true });
     expect(names).toContain("Vault master key");
-    expect(names).not.toContain("Reveal master key");
     expect(names).not.toContain("Turn off encryption");
     // Everything after the encryption block must still render.
     expect(names).toContain("Test connection");
@@ -191,11 +228,14 @@ describe("settings tab rendering", () => {
   it.each([
     ["Pull remote over local", "Pull remote", "pull"],
     ["Push local over remote", "Push local", "push"],
+    // The only control on this page that destroys history rather than moving files.
+    ["Rebuild remote history", "Rebuild", "rebuild"],
   ])("wires %s to the plugin action", (row, button, action) => {
     const called: string[] = [];
     const plugin = fakePlugin();
     plugin.forcePull = async () => void called.push("pull");
     plugin.forcePush = async () => void called.push("push");
+    plugin.rebuildHistory = async () => void called.push("rebuild");
     const tab = newTab(plugin);
     tab.display();
     const log = logOf(tab);
@@ -211,7 +251,7 @@ describe("settings tab rendering", () => {
   // Three toggles that read almost identically. A copy-paste that pointed two of them at one
   // setting would render perfectly and quietly do the wrong thing.
   it.each([
-    ["Notice when a sync finishes", "notifyOnSync", false],
+    ["Notice when a sync runs", "notifyOnSync", false],
     ["Only notice syncs that changed something", "notifyOnlyChanged", true],
     ["List the changed files in the notice", "verboseSyncNotice", true],
     ["Sync on startup", "syncOnStartup", false],
@@ -240,7 +280,7 @@ describe("settings tab rendering", () => {
   it("shows the notice toggles in the order they narrow down", () => {
     const { names } = render();
     const at = (name: string) => names.indexOf(name);
-    expect(at("Notice when a sync finishes")).toBeLessThan(
+    expect(at("Notice when a sync runs")).toBeLessThan(
       at("Only notice syncs that changed something")
     );
     expect(at("Only notice syncs that changed something")).toBeLessThan(
@@ -421,12 +461,19 @@ describe("settings tab rendering", () => {
       expect(setting.desc).toContain("not a backup");
     });
 
-    it.each(["Key backup required", "Reveal master key"])(
-      "hides %s until a key has been generated",
-      (row) => {
-        expect(render({ masterKey: "" }).names).not.toContain(row);
-      }
-    );
+    it("hides Key backup required until a key has been generated", () => {
+      expect(render({ masterKey: "" }).names).not.toContain("Key backup required");
+    });
+
+    // One secret, one place to look at it. The field's own eye toggle shows the same stored
+    // key in place, so a separate "Reveal master key" row was a third way to put it on a
+    // screen and a second window to close.
+    it("offers no separate reveal row beside a field that already reveals", () => {
+      const { log, names } = render({ masterKey: "a".repeat(44), masterKeyBackedUp: true });
+      expect(names).not.toContain("Reveal master key");
+      const key = log.settings.find((s) => s.name === "Vault master key");
+      expect(key?.controls).toContain("extra-button");
+    });
   });
 
   // A fresh install used to land on two bare credential fields. Joining an existing vault was
@@ -784,20 +831,20 @@ describe("settings tab rendering", () => {
     });
   });
 
-  it("shows the master key in a window that can be copied from, not in a notice", async () => {
+  it("reveals the master key in place, and never through a notice", async () => {
     const key = "a".repeat(44);
     const { log, names } = render({ masterKey: key, masterKeyBackedUp: true });
-    const index = names.indexOf("Reveal master key");
+    const row = log.rows[names.indexOf("Vault master key")];
+    const field = row.texts[0].inputEl;
+    expect(field.type).toBe("password");
 
-    log.rows[index].buttons[0].click();
+    row.buttons[0].click();
 
+    expect(field.type).toBe("text");
+    expect(field.value).toBe(key);
     // A Notice cannot be selected on a phone, stays on top of the page until dismissed, and
     // is the part of the screen people photograph.
     expect(Notice.shown.join(" ")).not.toContain(key);
-    const shown = bodyOf(Modal.shown.at(-1)!);
-    const field = shown.children.find((c) => c.tag === "textarea");
-    expect(field?.value).toBe(key);
-    expect(field?.readOnly).toBe(true);
   });
 
   // A row about keystrokes on a device with no keyboard, sending the user to a settings page

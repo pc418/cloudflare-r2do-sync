@@ -219,11 +219,20 @@ app.post("/api/commit", accessAuth, async (c) => {
   } catch {
     return c.json(errJson("bad_json", "request body must be JSON"), 400);
   }
-  const { manifest, expectedHead } = (body ?? {}) as { manifest?: unknown; expectedHead?: unknown };
+  const { manifest, expectedHead, reroot } = (body ?? {}) as {
+    manifest?: unknown;
+    expectedHead?: unknown;
+    reroot?: unknown;
+  };
   if (expectedHead !== null && typeof expectedHead !== "string") {
     return c.json(errJson("invalid_expected_head", "expectedHead must be a string or explicit null"), 422);
   }
-  const result = await vault(c.env).commit(manifest, expectedHead);
+  // Discarding every earlier snapshot is not something a client should be able to ask for by
+  // accident, so it is an explicit boolean rather than an inference from `parent: null`.
+  if (reroot !== undefined && typeof reroot !== "boolean") {
+    return c.json(errJson("invalid_reroot", "reroot must be a boolean"), 422);
+  }
+  const result = await vault(c.env).commit(manifest, expectedHead, { reroot: reroot === true });
   if (result.ok) return c.json({ head: result.head });
   switch (result.code) {
     case "stale_head":

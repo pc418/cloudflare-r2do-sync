@@ -47,6 +47,21 @@ function open(over: Partial<Settings> = {}) {
   return { modal, content, button };
 }
 
+/**
+ * Enough DOM for `renderQr`, which builds the code as inline SVG rather than as markup.
+ * Without it the QR export cannot be rendered in node at all, and the primary button on this
+ * window would have no test that it draws anything.
+ */
+function withSvgDocument(): void {
+  vi.stubGlobal("document", {
+    createElementNS: (_ns: string, tagName: string) => ({
+      tagName,
+      setAttribute() {},
+      appendChild() {},
+    }),
+  });
+}
+
 /** Vitest's stub is used because `navigator` is a non-writable global in Node. */
 function withClipboard(impl: (text: string) => Promise<void>): string[] {
   const written: string[] = [];
@@ -138,6 +153,11 @@ describe("DeviceSetupModal", () => {
     expect(warning).toContain("full access");
   });
 
+  /** The setup link as it appears on screen, wherever in the window it was drawn. */
+  function linkField(content: FakeElement) {
+    return content.children.flatMap((c) => [c, ...c.children]).find((c) => c.tag === "textarea");
+  }
+
   it("leaves the link selectable when the platform refuses the clipboard", async () => {
     // A denied clipboard must not be a dead end: this link is the only route to a device
     // that cannot scan the code, so there has to be something left to select by hand.
@@ -148,11 +168,51 @@ describe("DeviceSetupModal", () => {
 
     await button("Copy setup link").click();
 
-    const field = content.children.flatMap((c) => [c, ...c.children]).find((c) => c.tag === "textarea");
+    const field = linkField(content);
     expect(field?.value).toMatch(/^obsidian:\/\/r2do-sync-setup\?d=/);
     expect(field?.readOnly).toBe(true);
     expect(field?.selected).toBe(true);
-    expect(Notice.shown.join(" ")).toContain("Select and copy it manually");
+    expect(Notice.shown.join(" ")).toContain("Select it manually");
+  });
+
+  // The link only ever existed on the clipboard: nothing on screen, so it could not be read,
+  // checked or read out, and it was gone the moment anything else was copied.
+  it("shows the link itself, not just a promise that it was copied", async () => {
+    withClipboard(async () => {});
+    const { content, button } = open();
+
+    await button("Copy setup link").click();
+
+    expect(linkField(content)?.value).toMatch(/^obsidian:\/\/r2do-sync-setup\?d=/);
+    expect(linkField(content)?.readOnly).toBe(true);
+  });
+
+  // A QR is useless to a second computer, and a phone scanner that opens obsidian:// in a
+  // browser drops it — so the code without the link beside it leaves both of them stuck.
+  it("shows the link beside the QR code as well", () => {
+    withSvgDocument();
+    const { content, button } = open();
+
+    button("Show QR").click();
+
+    // The code itself is drawn, not merely promised.
+    expect(content.children.flatMap((c) => c.children).some((c) => c.tag === "svg")).toBe(true);
+
+    const shown = linkField(content)?.value;
+    expect(shown).toMatch(/^obsidian:\/\/r2do-sync-setup\?d=/);
+    // The same payload both exports carry, proved through the parser the paste side uses.
+    expect(parseSetupText(shown!).mode).toBe("encrypted");
+  });
+
+  it("copies from the shown field on request", async () => {
+    const written = withClipboard(async () => {});
+    withSvgDocument();
+    const { content, button } = open();
+    button("Show QR").click();
+
+    await buttonsOf(content)("Copy link").click();
+
+    expect(parseSetupText(written[0]).token).toBe("access-token");
   });
 
   it.each([

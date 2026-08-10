@@ -83,6 +83,8 @@ export class FakeServer implements SyncApiLike {
   uploads: string[] = [];
   downloads: string[] = [];
   failNextCommitWith: Error | null = null;
+  /** Manifest ids committed as a new root, so a test can prove history was discarded. */
+  readonly reroots: string[] = [];
   /** Queue of errors for consecutive commits, so a test can lose the head race twice. */
   failCommitsWith: Error[] = [];
 
@@ -114,7 +116,11 @@ export class FakeServer implements SyncApiLike {
     return bytes;
   }
 
-  async commit(manifest: Manifest, expectedHead: string | null): Promise<string> {
+  async commit(
+    manifest: Manifest,
+    expectedHead: string | null,
+    opts: { reroot?: boolean } = {}
+  ): Promise<string> {
     const queued = this.failCommitsWith.shift();
     if (queued) throw queued;
     if (this.failNextCommitWith) {
@@ -123,6 +129,14 @@ export class FakeServer implements SyncApiLike {
       throw err;
     }
     if (this.head !== expectedHead) throw new StaleHeadError("head moved", this.head);
+    // The Worker's rule, enforced here so the engine cannot pass a shape the real server
+    // rejects: only an explicit reroot may commit a manifest that is not the head's child,
+    // and only by being a root.
+    const rerooting = opts.reroot === true && manifest.parent === null;
+    if (!rerooting && manifest.parent !== expectedHead) {
+      throw new Error("manifest.parent must equal expectedHead");
+    }
+    if (rerooting) this.reroots.push(manifest.id);
     const refs = manifest.v === 1 ? Object.values(manifest.files).map(blobKey) : manifest.blobs;
     const missing = refs.filter((h) => !this.blobs.has(h));
     if (missing.length > 0) throw new MissingBlobError("missing blobs", [...new Set(missing)]);

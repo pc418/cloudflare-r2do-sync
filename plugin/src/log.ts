@@ -121,6 +121,18 @@ export function announcePass(opts: {
   return !opts.onlyChanged;
 }
 
+/**
+ * Whether a pass says anything as it *begins*.
+ *
+ * Only a pass the user started. A phone has no status bar, so between the tap and the summary
+ * there was nothing at all on screen — and a first sync, or one over a slow link, leaves that
+ * gap open for minutes, which reads exactly like a tap that missed. A timer firing in the
+ * background has nobody to reassure, so it stays quiet and reports only what it did.
+ */
+export function announceStart(opts: { notifyOnSync: boolean; interactive: boolean }): boolean {
+  return opts.notifyOnSync && opts.interactive;
+}
+
 /** Names listed per direction before the rest are summed. A first sync has hundreds. */
 const MAX_NAMES = 10;
 

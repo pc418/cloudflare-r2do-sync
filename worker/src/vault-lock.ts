@@ -100,17 +100,44 @@ export class VaultLock extends DurableObject<Env> {
     return rows[0]?.id ?? null;
   }
 
-  async commit(manifestData: unknown, expectedHead: string | null): Promise<CommitResult> {
-    const run = this.#commitChain.then(() => this.#commitSerialized(manifestData, expectedHead));
+  /**
+   * `reroot` is the one sanctioned way to commit a snapshot whose parent is NOT the current
+   * head: a new root (`parent: null`) that orphans the entire existing chain, which the next
+   * GC then deletes. It stays compare-and-set — `expectedHead` must still name the head this
+   * caller saw — so a device committing concurrently loses the race rather than its work.
+   */
+  async commit(
+    manifestData: unknown,
+    expectedHead: string | null,
+    opts: { reroot?: boolean } = {}
+  ): Promise<CommitResult> {
+    const run = this.#commitChain.then(() =>
+      this.#commitSerialized(manifestData, expectedHead, opts.reroot === true)
+    );
     this.#commitChain = run.catch(() => {});
     return run;
   }
 
-  async #commitSerialized(manifestData: unknown, expectedHead: string | null): Promise<CommitResult> {
+  async #commitSerialized(
+    manifestData: unknown,
+    expectedHead: string | null,
+    reroot: boolean
+  ): Promise<CommitResult> {
     const v = validateManifest(manifestData);
     if (!v.ok) return { ok: false, code: "invalid_manifest", message: v.message };
     const manifest = v.manifest;
-    if (manifest.parent !== expectedHead) {
+    // Checked independently of the parent/head rule, not as an exception to it. Folded
+    // together, a reroot whose parent happened to equal `expectedHead` passed as an ordinary
+    // child: the client was told its commit succeeded while the history it asked to discard
+    // stayed exactly where it was. A request this destructive must never quietly do
+    // something else instead.
+    if (reroot && manifest.parent !== null) {
+      return { ok: false, code: "invalid_manifest", message: "a reroot manifest must have parent null" };
+    }
+    // Otherwise a snapshot is a child of the head its author saw. A reroot is the one
+    // manifest exempt from that, and only by being a root; it stays compare-and-set on
+    // `expectedHead` below.
+    if (!reroot && manifest.parent !== expectedHead) {
       return { ok: false, code: "invalid_manifest", message: "manifest.parent must equal expectedHead" };
     }
 

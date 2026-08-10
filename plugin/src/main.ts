@@ -30,9 +30,12 @@ import {
 } from "./encryption-state";
 import {
   conflictDiff,
+  conflictSides,
   isResolvable,
   latestSide,
   planResolutionOnDisk,
+  pruneResolved,
+  unresolvableReason,
   type ConflictChoice,
 } from "./conflict-resolve";
 import { allHotkeys, assignHotkey, boundHotkeys, openHotkeySettings } from "./hotkey-bridge";
@@ -62,12 +65,13 @@ import {
   formatLogNote,
   relativeTime,
   announcePass,
+  announceStart,
   describePass,
   passChangedSomething,
   type SyncLogEntry,
 } from "./log";
 import { countInScope, parseGlobs, DEFAULT_CONFIG_DIR } from "./paths";
-import { DEFAULT_LANES, MAX_LANES, clampLanes } from "./pool";
+import { DEFAULT_LANES, MAX_LANES, clampLanes, mapPool } from "./pool";
 import { SyncScheduler } from "./queue";
 import {
   SETUP_ACTION,
@@ -438,7 +442,7 @@ export default class LogSyncPlugin extends Plugin {
           new Notice("R2DO Sync: no conflicts recorded");
           return;
         }
-        this.openConflictReview(this.#lastConflicts);
+        void this.openConflictReview();
       },
     });
     this.addCommand({
@@ -935,10 +939,18 @@ export default class LogSyncPlugin extends Plugin {
       return;
     }
     this.#interactive++;
+    // Raised only once the consent gate is past — a "syncing…" toast behind a modal asking
+    // whether to sync at all describes something that has not been agreed to yet. Held open
+    // for the whole pass (duration 0) and taken down in the `finally`, so it cannot outlive
+    // the work even if the pass throws.
+    let started: Notice | null = null;
     try {
       if (!(await this.#confirmFirstSync())) return;
       this.#phase = "syncing";
       this.#renderStatus();
+      if (announceStart({ notifyOnSync: this.settings.notifyOnSync, interactive: true })) {
+        started = new Notice("R2DO Sync: syncing…", 0);
+      }
       try {
         await this.#syncSharedSettings();
       } catch (e) {
@@ -950,6 +962,7 @@ export default class LogSyncPlugin extends Plugin {
     } catch {
       // reported through onError
     } finally {
+      started?.hide();
       this.#interactive--;
     }
   }
@@ -1070,13 +1083,105 @@ export default class LogSyncPlugin extends Plugin {
         this.#interactive++;
         try {
           await scheduler.syncNow({ keepLocal: true });
-        } catch {
-          // reported through onError
+        } catch (e) {
+          await this.#reportUnlessReported(e);
         } finally {
           this.#interactive--;
         }
       },
     }).open();
+  }
+
+  /**
+   * Publishes this device's vault as a NEW ROOT snapshot, discarding all earlier history.
+   *
+   * This is the only action that makes remote content stop existing. Every other publish —
+   * forced or not — commits a child of the current head, so the old versions stay in the
+   * chain and stay restorable. Rerooting orphans the whole chain instead, and the server's
+   * garbage collection deletes it, along with every blob nothing live references any more.
+   *
+   * The deletion is therefore NOT immediate, and the confirmation says so: until GC next
+   * runs, the old snapshots are unreachable but still stored.
+   */
+  async rebuildHistory(): Promise<void> {
+    const engine = this.#engine;
+    const scheduler = this.#scheduler;
+    if (engine === null || scheduler === null) {
+      new Notice("R2DO Sync: set the server URL and access token in settings first");
+      return;
+    }
+    // Publishing is publishing: the same first-sync gate `forcePush` asks, for the same
+    // reason, and asked before the preview so the two windows do not stack.
+    this.#interactive++;
+    let consented: boolean;
+    try {
+      consented = await this.#confirmFirstSync();
+    } finally {
+      this.#interactive--;
+    }
+    if (!consented) return;
+
+    const summary = await this.#summarise(
+      () => engine.rerootSummary(this.settings.historyLimit),
+      "rebuild the remote history"
+    );
+    if (summary === null) return;
+    if (summary.head === null) {
+      new Notice("R2DO Sync: the remote has no snapshot yet, so there is no history to rebuild.");
+      return;
+    }
+
+    const discarded = summary.discardedIsFloor
+      ? `at least ${summary.discarded}`
+      : `${summary.discarded}`;
+    new ConfirmModal(this.app, {
+      title: "Rebuild the remote history?",
+      body: [
+        `${summary.files} file(s) from this device become the only snapshot, replacing ` +
+          `${summary.head}. ${summary.carried} path(s) this device does not sync are carried ` +
+          "unchanged. Local files are not touched.",
+        `${discarded} earlier snapshot(s) are discarded. Every version of every file they ` +
+          "hold — including anything you are trying to purge — stops being restorable, on " +
+          "this device and on every other one. There is no undo, and no other action on this " +
+          "page destroys history.",
+        "The server frees the storage on a later daily collection, not immediately — and it " +
+          "holds back anything uploaded in the past 24 hours, so content synced today can " +
+          "take an extra day to go. Until then the old snapshots are unreachable but stored.",
+      ],
+      phrase: "REBUILD HISTORY",
+      onConfirm: async () => {
+        this.#phase = "syncing";
+        this.#renderStatus();
+        this.#interactive++;
+        try {
+          // Pinned to the head the confirmation just described. A snapshot published
+          // since then has never been reviewed, and this is the one action that would
+          // delete it rather than merge it.
+          await scheduler.syncNow({ reroot: { previewedHead: summary.head } });
+        } catch (e) {
+          await this.#reportUnlessReported(e);
+        } finally {
+          this.#interactive--;
+        }
+      },
+    }).open();
+  }
+
+  /**
+   * Reports a failed forced action that nothing else has reported.
+   *
+   * An engine failure travels through the scheduler's `onError` and has already produced a
+   * notice by the time it is rethrown here, so swallowing it was *almost* right. But a
+   * scheduler retired while the confirmation window stood open — any settings save does that —
+   * rejects before the engine ever runs, and that rejection reaches no handler at all: the
+   * action then failed silently and left the status bar reading "syncing" for good.
+   *
+   * `#report`/`#reportError` both move the phase off "syncing", so a phase still stuck there
+   * is exactly the case nothing handled.
+   */
+  async #reportUnlessReported(e: unknown): Promise<void> {
+    if (this.#phase !== "syncing") return;
+    await this.#reportError(e instanceof Error ? e : new Error(String(e)));
   }
 
   /** Runs a force-action preview behind a notice, turning a refusal into a plain message. */
@@ -1377,15 +1482,21 @@ export default class LogSyncPlugin extends Plugin {
     if (details.length === 0) return;
     this.#lastConflicts = details;
     if (this.#interactive > 0) {
-      this.openConflictReview(details);
+      void this.openConflictReview();
       return;
     }
     const names = details.map((c) => c.path);
     const shown = names.slice(0, 3).join(", ");
     const more = names.length > 3 ? ` +${names.length - 3} more` : "";
+    // "Pick a side" is only true when there are two files here to pick between. Push-only
+    // keeps the other version in the snapshot, and an overwrite mode discarded it outright;
+    // sending the user to a window that can only explain itself should say so first.
+    const advice = details.some((c) => isResolvable(c))
+      ? 'Run "Review and resolve conflicts" to see the differences and pick a side.'
+      : 'Run "Review and resolve conflicts" for what happened to each one.';
     new Notice(
       `R2DO Sync: ${names.length} conflict${names.length === 1 ? "" : "s"} — ${shown}${more}. ` +
-        `Run "Review and resolve conflicts" to see the differences and pick a side.`,
+        advice,
       15_000
     );
   }
@@ -1405,12 +1516,60 @@ export default class LogSyncPlugin extends Plugin {
     return this.manifest.name;
   }
 
-  /** Opens the conflict view, wired so a choice made in it actually resolves the file. */
-  openConflictReview(conflicts: ConflictInfo[]): void {
-    new ConflictReportModal(this.app, conflicts, {
+  /**
+   * Opens the conflict view on the outstanding batch, wired so a choice actually resolves the
+   * file.
+   *
+   * The batch is checked against the disk first. It survives restarts, and every way a pair
+   * can leave — resolved on another device and the deletion pulled here, the note renamed, a
+   * copy deleted by hand — is invisible to a list that is only ever replaced wholesale. The
+   * window used to offer buttons for those, and every click failed with "it was already
+   * resolved", which is true and useless.
+   */
+  async openConflictReview(): Promise<void> {
+    const batch = this.#lastConflicts;
+    // Every caller starts this and walks away, so a rejection here would surface as nothing
+    // at all: no window, no notice, an unhandled promise. Failing to *check* the disk is not
+    // a reason to withhold the list — resolution re-checks each pair at click time anyway.
+    let outstanding = batch;
+    try {
+      outstanding = pruneResolved(batch, await this.#presentPaths(batch));
+    } catch (e) {
+      new Notice(
+        `R2DO Sync could not check which conflicts are still on disk: ${message(e)}. ` +
+          "Showing the recorded list; some entries may already be resolved.",
+        10_000
+      );
+    }
+    const cleared = batch.length - outstanding.length;
+    if (cleared > 0) {
+      this.#lastConflicts = outstanding;
+      await this.#persist();
+      new Notice(
+        `R2DO Sync: ${cleared} conflict${cleared === 1 ? " was" : "s were"} already resolved ` +
+          "elsewhere, so they are no longer listed.",
+        8000
+      );
+    }
+    new ConflictReportModal(this.app, outstanding, {
       readText: (path) => this.#readTextIfPresent(path),
       resolve: (info, choice) => this.resolveConflict(info, choice),
     }).open();
+  }
+
+  /** Which of these paths hold a file right now — one stat each, never a vault walk. */
+  async #presentPaths(conflicts: readonly ConflictInfo[]): Promise<Set<string>> {
+    const vault = new ObsidianVault(this.app);
+    const wanted = new Set<string>();
+    for (const info of conflicts) {
+      wanted.add(info.path);
+      if (info.copy !== null) wanted.add(info.copy);
+    }
+    const present = new Set<string>();
+    await mapPool([...wanted], this.settings.lanes, async (path) => {
+      if (await vault.exists(path)) present.add(path);
+    });
+    return present;
   }
 
   /** A file's text, or null when it is absent or not decodable text. */
@@ -1426,10 +1585,13 @@ export default class LogSyncPlugin extends Plugin {
   /**
    * Carries out the user's choice for one conflict.
    *
-   * Both files are re-read here rather than trusting what the modal was drawn from: a pass may
+   * The disk is re-read here rather than trusting what the modal was drawn from: a pass may
    * have parked this copy minutes ago and the user may have edited or deleted either side since.
    * Overwriting an edit made in that window is precisely the loss this feature exists to
-   * prevent, so a missing or unreadable side stops with a message instead.
+   * prevent, so a missing side stops with a message instead.
+   *
+   * Keeping a side moves bytes; only "combine" writes text. That is what makes the choice work
+   * on an attachment, which is the very kind of file that cannot be merged in the first place.
    *
    * Nothing is committed. The next ordinary pass publishes the outcome, which keeps this off the
    * commit path entirely.
@@ -1439,24 +1601,26 @@ export default class LogSyncPlugin extends Plugin {
       throw new Error("a sync is running — wait for it to finish, then resolve this conflict");
     }
     const vault = new ObsidianVault(this.app);
-    const present = new Set((await vault.list()).map((f) => f.path));
+    const present = await this.#presentPaths([info]);
+    const sides = conflictSides(info);
+    // Only "combine" reads content, and reading a file to decide it is not text is exactly
+    // the check that has to happen before it can refuse.
+    const text = async (path: string): Promise<string | null> =>
+      choice === "combine" && present.has(path) ? await this.#readTextIfPresent(path) : null;
     const ops = planResolutionOnDisk(info, choice, {
       present,
-      mine: present.has(info.path) ? await this.#readTextIfPresent(info.path) : null,
-      theirs:
-        info.copy !== null && present.has(info.copy)
-          ? await this.#readTextIfPresent(info.copy)
-          : null,
+      mine: await text(sides.mine),
+      theirs: await text(sides.theirs),
     });
+
     const encoder = new TextEncoder();
+    for (const move of ops.promotes) await vault.write(move.to, await vault.read(move.from));
     for (const write of ops.writes) await vault.write(write.path, encoder.encode(write.text));
     for (const path of ops.removes) await vault.remove(path);
 
-    // Resolved conflicts leave the review list, so what it shows is what is still outstanding.
-    if (choice !== "keep-both") {
-      this.#lastConflicts = this.#lastConflicts.filter((c) => c.copy !== info.copy);
-      await this.#persist();
-    }
+    // Decided is decided, "keep both" included: what the list shows is what is still open.
+    this.#lastConflicts = this.#lastConflicts.filter((c) => c !== info && c.copy !== info.copy);
+    await this.#persist();
   }
 
   async #reportError(e: Error): Promise<void> {
@@ -2048,15 +2212,21 @@ function fmtBytes(n: number): string {
  * actually has.
  */
 export class ConflictReportModal extends Modal {
+  /** Its own list: resolving one removes it here, and the plugin keeps its own record. */
+  #conflicts: ConflictInfo[];
+  /** One resolution at a time. A second click on a button mid-write resolves nothing twice. */
+  #busy = false;
+
   constructor(
     app: App,
-    private readonly conflicts: ConflictInfo[],
+    conflicts: readonly ConflictInfo[],
     private readonly actions: {
       readText: (path: string) => Promise<string | null>;
       resolve: (info: ConflictInfo, choice: ConflictChoice) => Promise<void>;
     } | null = null
   ) {
     super(app);
+    this.#conflicts = [...conflicts];
   }
 
   onOpen(): void {
@@ -2066,7 +2236,7 @@ export class ConflictReportModal extends Modal {
   #render(): void {
     const { contentEl } = this;
     contentEl.empty();
-    const outstanding = this.conflicts;
+    const outstanding = this.#conflicts;
     contentEl.createEl("h2", {
       text: `${outstanding.length} conflict${outstanding.length === 1 ? "" : "s"}`,
     });
@@ -2079,8 +2249,12 @@ export class ConflictReportModal extends Modal {
     }
     contentEl.createEl("p", {
       text:
-        "Both sides changed these files in ways that could not be merged. Both versions are on " +
-        "disk; pick one, or combine them into a single file to sort out by hand.",
+        outstanding.every((c) => isResolvable(c))
+          ? "Both sides changed these files in ways that could not be merged. Both versions " +
+            "are on disk; pick one, or combine them into a single file to sort out by hand."
+          : "Both sides changed these files in ways that could not be merged. Where both " +
+            "versions are on this device you can pick one, or combine them into a single " +
+            "file; each entry says what it has.",
     });
 
     const now = Date.now();
@@ -2095,16 +2269,16 @@ export class ConflictReportModal extends Modal {
       list.createEl("li", { text: side("This device", c.ours, true) });
       list.createEl("li", { text: side("Other device", c.theirs, false) });
 
-      if (!isResolvable(c)) {
-        list.createEl("li", {
-          text:
-            "The losing version was overwritten by the conflict handling setting, so there is " +
-            "nothing left to choose. The remote side stays in snapshot history; a local-only " +
-            "edit does not.",
-        });
+      const blocked = unresolvableReason(c);
+      if (blocked !== null) {
+        list.createEl("li", { text: blocked });
         continue;
       }
-      list.createEl("li", { text: `Other version saved as: ${c.copy}` });
+      // Which file holds which version, said plainly: an attachment that lost the path keeps
+      // THIS device's version in the copy, and a user about to delete one deserves to know.
+      const sides = conflictSides(c);
+      list.createEl("li", { text: `This device's version is in: ${sides.mine}` });
+      list.createEl("li", { text: `The other device's version is in: ${sides.theirs}` });
       if (this.actions === null) continue;
       this.#renderDiff(box, c);
       this.#renderChoices(box, c, newer);
@@ -2120,8 +2294,12 @@ export class ConflictReportModal extends Modal {
     const holder = box.createDiv({ cls: "r2do-diff" });
     holder.createEl("p", { text: "Loading the difference..." });
     void (async () => {
-      const mine = await this.actions!.readText(c.path);
-      const theirs = await this.actions!.readText(c.copy!);
+      // By side, not by position: the canonical path holds THEIRS whenever an attachment
+      // conflict resolved to last-writer-wins, and a diff drawn the other way round labels
+      // every line with the wrong device.
+      const sides = conflictSides(c);
+      const mine = await this.actions!.readText(sides.mine);
+      const theirs = await this.actions!.readText(sides.theirs);
       holder.empty();
       if (mine === null || theirs === null) {
         holder.createEl("p", {
@@ -2153,13 +2331,19 @@ export class ConflictReportModal extends Modal {
     const button = (text: string, choice: ConflictChoice, cta: boolean) =>
       row.addButton((b) => {
         b.setButtonText(text).onClick(async () => {
+          // A resolution is several file operations; a second click landing between them
+          // resolves an already-resolved pair and reports a failure for work that succeeded.
+          if (this.#busy) return;
+          this.#busy = true;
           try {
             await this.actions!.resolve(c, choice);
             new Notice(`R2DO Sync: ${c.path} resolved`);
-            this.conflicts.splice(this.conflicts.indexOf(c), 1);
+            this.#conflicts = this.#conflicts.filter((other) => other !== c);
             this.#render();
           } catch (e) {
             new Notice(`R2DO Sync could not resolve ${c.path}: ${message(e)}`, 10_000);
+          } finally {
+            this.#busy = false;
           }
         });
         if (cta) b.setCta();
@@ -2300,48 +2484,6 @@ class BackupKeyModal extends Modal {
   onClose(): void {
     // Merely dismissing the window is never equivalent to acknowledging a backup.
     this.opts.onClose();
-    this.contentEl.empty();
-  }
-}
-
-/**
- * Shows the active key so it can be copied to a password manager or another device.
- *
- * Separate from `BackupKeyModal` because it grants nothing and gates nothing: the same key,
- * shown on request. It exists because this used to be a `Notice`, which is the one container
- * a secret must not go in — it cannot be selected on a phone, it stays on top of the page
- * until dismissed, and it is the part of the screen people photograph.
- */
-export class RevealKeyModal extends Modal {
-  constructor(
-    app: App,
-    private readonly key: string
-  ) {
-    super(app);
-  }
-
-  onOpen(): void {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl("h2", { text: "Vault master key" });
-    contentEl.createEl("p", {
-      text:
-        "Every device on this vault needs this exact key, and no snapshot can be read " +
-        "without it. Keep it in a password manager — not in a note in this vault, which is " +
-        "the thing it protects.",
-    });
-    const field = secretField(contentEl, this.key, "Vault master key");
-    new Setting(contentEl)
-      .addButton((b) =>
-        b
-          .setButtonText("Copy key")
-          .setCta()
-          .onClick(() => copySecret(this.key, field, "Vault master key"))
-      )
-      .addButton((b) => b.setButtonText("Close").onClick(() => this.close()));
-  }
-
-  onClose(): void {
     this.contentEl.empty();
   }
 }
@@ -2575,11 +2717,16 @@ export class DeviceSetupModal extends Modal {
     const payload = this.#payload();
     if (payload === null) return;
 
+    const uri = encodeSetupUri(payload);
     this.#warn(out, "QR");
-    renderQr(out, encodeSetupUri(payload));
+    renderQr(out, uri);
     out.createEl("p", {
       text: "On the other device: open the camera app, scan, and confirm when Obsidian opens.",
     });
+    // The same payload in a form a camera is not needed for. A code drawn without the link
+    // beside it left "copy the link" as an invisible second step behind another button — and
+    // a phone scanner that opens obsidian:// in a browser makes the link the only way through.
+    this.#linkField(out, uri);
   }
 
   async #copy(out: HTMLElement): Promise<void> {
@@ -2589,26 +2736,32 @@ export class DeviceSetupModal extends Modal {
 
     const uri = encodeSetupUri(payload);
     this.#warn(out, "link");
-    try {
-      await navigator.clipboard.writeText(uri);
-      new Notice("Setup link copied. Paste it into the new device with \"Apply a setup link\".");
-      out.createEl("p", {
-        text:
-          "Copied. On the other device: Settings → R2DO Sync → Apply a setup link → Paste " +
-          "link. Clear your clipboard afterwards.",
-      });
-    } catch (error) {
-      // A clipboard the platform refuses must not leave the user with no route at all — the
-      // whole point of the link is reaching a device that cannot scan the code.
-      new Notice(`Could not copy the link: ${message(error)}. Select and copy it manually.`, 10_000);
-      const field = out.createEl("textarea");
-      field.value = uri;
-      field.readOnly = true;
-      field.rows = 3;
-      field.setAttr("aria-label", "Setup link");
-      field.focus();
-      field.select();
-    }
+    const field = this.#linkField(out, uri);
+    out.createEl("p", {
+      text:
+        "On the other device: Settings → R2DO Sync → Apply a setup link → Paste link. " +
+        "Clear your clipboard afterwards.",
+    });
+    // The clipboard is a convenience over the field, not the only route: a platform that
+    // refuses it leaves the link on screen to select by hand.
+    await copySecret(uri, field, "Setup link");
+  }
+
+  /**
+   * The link itself, on screen and selectable, with a button for the ordinary case.
+   *
+   * A secret that only ever exists on the clipboard cannot be checked, cannot be read out,
+   * and is gone the moment anything else is copied.
+   */
+  #linkField(out: HTMLElement, uri: string): HTMLTextAreaElement {
+    const field = secretField(out, uri, "Setup link");
+    new Setting(out)
+      .setName("Setup link")
+      .setDesc("Paste it into the other device with \"Apply a setup link\".")
+      .addButton((b) =>
+        b.setButtonText("Copy link").onClick(() => void copySecret(uri, field, "Setup link"))
+      );
+    return field;
   }
 
   onClose(): void {
@@ -3142,6 +3295,23 @@ export class LogSyncSettingTab extends PluginSettingTab {
       .addButton((b) =>
         b.setButtonText("Paste link").onClick(() => new PasteSetupModal(this.app, this.plugin).open())
       );
+
+    // Here rather than in a catch-all section: it is this device's relationship with the
+    // others, which is what the rest of this section is about.
+    new Setting(containerEl)
+      .setName("Sync settings between devices")
+      .setDesc(
+        "Shares the vault-wide settings — excludes, safety threshold, debounce and sync " +
+          "intervals, log/history/retry knobs, report folder, notices — through the server, " +
+          "encrypted like your notes. The most recent change on any device wins. Always " +
+          "per-device: credentials, device name, and parallel lanes."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.syncSettings).onChange(async (v) => {
+          this.plugin.settings.syncSettings = v;
+          await this.plugin.saveSettings();
+        })
+      );
   }
 
   #renderEncryption(containerEl: HTMLElement): void {
@@ -3244,18 +3414,10 @@ export class LogSyncSettingTab extends PluginSettingTab {
         ));
     }
 
+    // No separate "Reveal master key" row: the field above has the eye toggle, which shows
+    // the same key in place, and handing it to another device is "Set up another device".
+    // Three ways to look at one secret is two more places for it to end up on a screen.
     if (this.plugin.encryptionEnabled && hasKey) {
-      new Setting(containerEl)
-        .setName("Reveal master key")
-        .setDesc("Shows the key so you can back it up or copy it to another device.")
-        .addButton((b) =>
-          // A window, not a notice: a secret has to be selectable and copyable, and a notice
-          // is neither on a phone. It also floats over the page until it is dismissed.
-          b.setButtonText("Reveal").onClick(() =>
-            new RevealKeyModal(this.app, this.plugin.settings.masterKey).open()
-          )
-        );
-
       new Setting(containerEl)
         .setName("Turn off encryption")
         .setDesc("Transforms the complete remote snapshot to plaintext. This is not recommended.")
@@ -3392,6 +3554,15 @@ export class LogSyncSettingTab extends PluginSettingTab {
           }).open();
         })
       );
+  }
+
+  /**
+   * How a pass runs and when it starts — direction, timing, and the two knobs that decide how
+   * hard it works. They used to sit in an "Advanced" bucket at the far end of the page, which
+   * grouped them by how obscure they are rather than by what they do.
+   */
+  #renderHowItSyncs(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "How and when it syncs");
 
     new Setting(containerEl)
       .setName("Sync direction")
@@ -3407,10 +3578,6 @@ export class LogSyncSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
       );
-  }
-
-  #renderSchedule(containerEl: HTMLElement): void {
-    this.#heading(containerEl, "When it syncs");
 
     this.#number(containerEl, {
       name: "Debounce (seconds)",
@@ -3451,42 +3618,38 @@ export class LogSyncSettingTab extends PluginSettingTab {
     // A row about keystrokes on a device with no keyboard is noise: mobile Obsidian has no
     // Hotkeys page to send anyone to either.
     if (!Platform.isMobile) this.#hotkeyRow(containerEl);
-  }
-
-  #renderSafety(containerEl: HTMLElement): void {
-    this.#heading(containerEl, "Safety");
 
     this.#number(containerEl, {
-      name: "Ask before large changes (%)",
+      name: "Parallel lanes",
       desc:
-        "If a pull would delete or overwrite MORE than this share of the files this device " +
-        "syncs, sync pauses and asks which side to keep. At or below it, changes merge " +
-        "automatically — anything that cannot be merged is still kept as a .conflict-… " +
-        "copy, so nothing is lost by not asking. 100 turns the check off.",
-      value: this.plugin.settings.protectPercent,
-      range: "whole numbers 0–100",
-      accept: (n) => n >= 0 && n <= 100,
+        `How many files are read, encrypted, uploaded or downloaded at once (1–${MAX_LANES}). ` +
+        "Higher finishes a large vault sooner but uses more memory and can overwhelm a " +
+        "phone or a slow link. 1 restores the old one-at-a-time behaviour.",
+      value: this.plugin.settings.lanes,
+      range: `1–${MAX_LANES}`,
+      accept: (n) => n >= 1 && n <= MAX_LANES,
       apply: (n) => {
-        this.plugin.settings.protectPercent = n;
+        this.plugin.settings.lanes = clampLanes(n);
       },
-      // 100 is not a threshold, it is the off switch — worth a second look.
-      confirm: (n) =>
-        n !== 100
-          ? Promise.resolve(true)
-          : new Promise<boolean>((resolve) => {
-              new ConfirmModal(this.app, {
-                title: "Turn off the mass-change guard?",
-                body:
-                  "At 100 a pull may delete or replace every file on this device without " +
-                  "asking. The guard exists for the day a mistaken or malicious remote " +
-                  "snapshot arrives; snapshots stay restorable, but only if you notice.",
-                confirmText: "Turn it off",
-                cancelText: "Keep the guard",
-                onConfirm: () => resolve(true),
-                onCancel: () => resolve(false),
-              }).open();
-            }),
     });
+
+    this.#number(containerEl, {
+      name: "Automatic retries",
+      desc:
+        `Retries after a failed pass before it is reported and left alone (0–${MAX_RETRY_ATTEMPTS}), ` +
+        "backing off 1s, 4s, 15s, 1m, 5m. A halted sync is never retried — it needs a person.",
+      value: this.plugin.settings.retryAttempts,
+      range: `0–${MAX_RETRY_ATTEMPTS}`,
+      accept: (n) => n >= 0 && n <= MAX_RETRY_ATTEMPTS,
+      apply: (n) => {
+        this.plugin.settings.retryAttempts = n;
+      },
+    });
+  }
+
+  /** What happens when two devices changed the same file, and what is still outstanding. */
+  #renderConflicts(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "Conflicts");
 
     new Setting(containerEl)
       .setName("Conflict handling")
@@ -3529,21 +3692,11 @@ export class LogSyncSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Preview sync")
-      .setDesc("Shows what a sync would change, without changing anything.")
-      .addButton((b) => b.setButtonText("Preview").onClick(() => void this.plugin.previewSync()));
-
-    new Setting(containerEl)
-      .setName("Snapshot history")
-      .setDesc("Browse past snapshots and restore a file or the whole vault.")
-      .addButton((b) => b.setButtonText("Browse").onClick(() => void this.plugin.openHistory()));
-
-    new Setting(containerEl)
       .setName("Unresolved conflicts")
       .setDesc(
-        "Files two devices changed in ways that could not be merged. Both versions are on " +
-          "disk; this shows the difference and lets you keep one, keep both, or combine them " +
-          "into a single file."
+        "Files two devices changed in ways that could not be merged. Where both versions are " +
+          "on this device, this shows the difference and lets you keep one, keep both, or " +
+          "combine them into a single file."
       )
       .addButton((b) =>
         b
@@ -3553,8 +3706,57 @@ export class LogSyncSettingTab extends PluginSettingTab {
               : "None"
           )
           .setDisabled(this.plugin.lastConflicts.length === 0)
-          .onClick(() => this.plugin.openConflictReview(this.plugin.lastConflicts))
+          .onClick(() => {
+            void this.plugin.openConflictReview();
+          })
       );
+  }
+
+  /** The guard against a destructive pull, and every way back from one. */
+  #renderRecovery(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "Safety and recovery");
+
+    this.#number(containerEl, {
+      name: "Ask before large changes (%)",
+      desc:
+        "If a pull would delete or overwrite MORE than this share of the files this device " +
+        "syncs, sync pauses and asks which side to keep. At or below it, changes merge " +
+        "automatically — anything that cannot be merged is still kept as a .conflict-… " +
+        "copy, so nothing is lost by not asking. 100 turns the check off.",
+      value: this.plugin.settings.protectPercent,
+      range: "whole numbers 0–100",
+      accept: (n) => n >= 0 && n <= 100,
+      apply: (n) => {
+        this.plugin.settings.protectPercent = n;
+      },
+      // 100 is not a threshold, it is the off switch — worth a second look.
+      confirm: (n) =>
+        n !== 100
+          ? Promise.resolve(true)
+          : new Promise<boolean>((resolve) => {
+              new ConfirmModal(this.app, {
+                title: "Turn off the mass-change guard?",
+                body:
+                  "At 100 a pull may delete or replace every file on this device without " +
+                  "asking. The guard exists for the day a mistaken or malicious remote " +
+                  "snapshot arrives; snapshots stay restorable, but only if you notice.",
+                confirmText: "Turn it off",
+                cancelText: "Keep the guard",
+                onConfirm: () => resolve(true),
+                onCancel: () => resolve(false),
+              }).open();
+            }),
+    });
+
+    new Setting(containerEl)
+      .setName("Preview sync")
+      .setDesc("Shows what a sync would change, without changing anything.")
+      .addButton((b) => b.setButtonText("Preview").onClick(() => void this.plugin.previewSync()));
+
+    new Setting(containerEl)
+      .setName("Snapshot history")
+      .setDesc("Browse past snapshots and restore a file or the whole vault.")
+      .addButton((b) => b.setButtonText("Browse").onClick(() => void this.plugin.openHistory()));
 
     new Setting(containerEl)
       .setName("Pull remote over local")
@@ -3578,23 +3780,47 @@ export class LogSyncSettingTab extends PluginSettingTab {
         b.setButtonText("Push local").setWarning().onClick(() => void this.plugin.forcePush())
       );
 
+    // Last, and warned about hardest: every other action on this page can be undone from
+    // Snapshot history, and this is the one that empties it.
     new Setting(containerEl)
-      .setName("Sync log")
-      .setDesc("Writes the recent sync passes to a note in this vault, for troubleshooting.")
-      .addButton((b) => b.setButtonText("Export").onClick(() => void this.plugin.exportLog()));
+      .setName("Rebuild remote history")
+      .setDesc(
+        "Publishes this device's files as the only snapshot and DISCARDS every earlier one. " +
+          "Use it to stop storing something the history still holds, or to start the chain " +
+          "over. Nothing it removes can be restored, on any device. The server frees the " +
+          "space at a later daily collection, and holds back anything uploaded in the past " +
+          "24 hours."
+      )
+      .addButton((b) =>
+        b.setButtonText("Rebuild").setWarning().onClick(() => void this.plugin.rebuildHistory())
+      );
+
+    this.#number(containerEl, {
+      name: "Snapshots listed in history",
+      desc: "How far back the history browser walks (1–200). Each one is a request.",
+      value: this.plugin.settings.historyLimit,
+      range: "1–200",
+      accept: (n) => n >= 1 && n <= 200,
+      apply: (n) => {
+        this.plugin.settings.historyLimit = n;
+      },
+    });
   }
 
   #renderNotices(containerEl: HTMLElement): void {
     this.#heading(containerEl, "Notices");
 
     new Setting(containerEl)
-      .setName("Notice when a sync finishes")
+      // Both ends of a pass, so the name cannot promise only one of them: a sync you start
+      // says "syncing…" as it begins and what it did when it ends.
+      .setName("Notice when a sync runs")
       .setDesc(
         Platform.isMobile
-          ? "Every pass, background ones included. Recommended on mobile: there is no status " +
-            "bar, so this is the only confirmation that a tap on the ribbon actually ran."
+          ? "Every pass, background ones included, and a \"syncing…\" notice while a sync you " +
+            "started is running. Recommended on mobile: there is no status bar, so this is " +
+            "the only confirmation that a tap on the ribbon did anything."
           : "Every pass, background ones included: how many files moved each way and the net " +
-            "change in lines."
+            "change in lines. A sync you start also says so while it runs."
       )
       .addToggle((t) =>
         t.setValue(this.plugin.settings.notifyOnSync).onChange(async (v) => {
@@ -3631,27 +3857,14 @@ export class LogSyncSettingTab extends PluginSettingTab {
       );
   }
 
-  #renderAdvanced(containerEl: HTMLElement): void {
-    this.#heading(containerEl, "Advanced");
-    containerEl.createEl("p", {
-      text:
-        "Defaults suit a typical vault. These are the knobs that were previously fixed in " +
-        "code; each says what it costs, because every one of them trades something.",
-    });
+  /** The exported log and the two knobs that shape it. */
+  #renderTroubleshooting(containerEl: HTMLElement): void {
+    this.#heading(containerEl, "Troubleshooting");
 
-    this.#number(containerEl, {
-      name: "Parallel lanes",
-      desc:
-        `How many files are read, encrypted, uploaded or downloaded at once (1–${MAX_LANES}). ` +
-        "Higher finishes a large vault sooner but uses more memory and can overwhelm a " +
-        "phone or a slow link. 1 restores the old one-at-a-time behaviour.",
-      value: this.plugin.settings.lanes,
-      range: `1–${MAX_LANES}`,
-      accept: (n) => n >= 1 && n <= MAX_LANES,
-      apply: (n) => {
-        this.plugin.settings.lanes = clampLanes(n);
-      },
-    });
+    new Setting(containerEl)
+      .setName("Sync log")
+      .setDesc("Writes the recent sync passes to a note in this vault, for troubleshooting.")
+      .addButton((b) => b.setButtonText("Export").onClick(() => void this.plugin.exportLog()));
 
     this.#number(containerEl, {
       name: "Sync log length",
@@ -3685,45 +3898,6 @@ export class LogSyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         });
       });
-
-    this.#number(containerEl, {
-      name: "Snapshots listed in history",
-      desc: "How far back the history browser walks (1–200). Each one is a request.",
-      value: this.plugin.settings.historyLimit,
-      range: "1–200",
-      accept: (n) => n >= 1 && n <= 200,
-      apply: (n) => {
-        this.plugin.settings.historyLimit = n;
-      },
-    });
-
-    this.#number(containerEl, {
-      name: "Automatic retries",
-      desc:
-        `Retries after a failed pass before it is reported and left alone (0–${MAX_RETRY_ATTEMPTS}), ` +
-        "backing off 1s, 4s, 15s, 1m, 5m. A halted sync is never retried — it needs a person.",
-      value: this.plugin.settings.retryAttempts,
-      range: `0–${MAX_RETRY_ATTEMPTS}`,
-      accept: (n) => n >= 0 && n <= MAX_RETRY_ATTEMPTS,
-      apply: (n) => {
-        this.plugin.settings.retryAttempts = n;
-      },
-    });
-
-    new Setting(containerEl)
-      .setName("Sync settings between devices")
-      .setDesc(
-        "Shares the vault-wide settings — excludes, safety threshold, debounce and sync " +
-          "intervals, log/history/retry knobs, report folder, notices — through the server, " +
-          "encrypted like your notes. The most recent change on any device wins. Always " +
-          "per-device: credentials, device name, and parallel lanes."
-      )
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.syncSettings).onChange(async (v) => {
-          this.plugin.settings.syncSettings = v;
-          await this.plugin.saveSettings();
-        })
-      );
   }
 
   display(): void {
@@ -3766,14 +3940,19 @@ export class LogSyncSettingTab extends PluginSettingTab {
       return;
     }
 
+    // Grouped by what each part of the plugin does, so a knob sits with the thing it tunes:
+    // the retry count beside the schedule, the history depth beside the history browser, the
+    // log length beside the export. The old "Advanced" section grouped by how obscure a
+    // setting looked instead, which split every feature across two places on the page.
     this.#renderOverview(containerEl);
     this.#renderConnection(containerEl);
     this.#renderThisDevice(containerEl);
     this.#renderEncryption(containerEl);
     this.#renderScope(containerEl);
-    this.#renderSchedule(containerEl);
-    this.#renderSafety(containerEl);
+    this.#renderHowItSyncs(containerEl);
+    this.#renderConflicts(containerEl);
+    this.#renderRecovery(containerEl);
     this.#renderNotices(containerEl);
-    this.#renderAdvanced(containerEl);
+    this.#renderTroubleshooting(containerEl);
   }
 }

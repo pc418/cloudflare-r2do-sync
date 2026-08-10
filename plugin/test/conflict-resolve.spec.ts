@@ -3,10 +3,13 @@ import { diffLines, ELISION } from "../src/merge";
 import {
   combineText,
   conflictDiff,
+  conflictSides,
   isResolvable,
   latestSide,
   planResolution,
   planResolutionOnDisk,
+  pruneResolved,
+  unresolvableReason,
 } from "../src/conflict-resolve";
 import type { ConflictInfo } from "../src/sync";
 
@@ -96,27 +99,113 @@ describe("isResolvable", () => {
     expect(isResolvable(info())).toBe(true);
     expect(isResolvable(info({ copy: null }))).toBe(false);
   });
+
+  // Push-only mode never writes to the vault, so its "parked" version is a manifest entry and
+  // nothing else. Offering to keep it pointed every button at a file that is not there.
+  it("is false for a version that was only ever published, never written here", () => {
+    expect(isResolvable(info({ snapshotOnly: true }))).toBe(false);
+    expect(unresolvableReason(info({ snapshotOnly: true }))).toContain("Push-only");
+  });
+
+  it("says nothing is wrong with a resolvable pair", () => {
+    expect(unresolvableReason(info())).toBeNull();
+  });
+});
+
+describe("conflictSides", () => {
+  it("puts ours at the note and theirs in the copy, the ordinary layout", () => {
+    expect(conflictSides(info())).toEqual({
+      mine: "note.md",
+      theirs: "note.conflict-phone-260807-1200.md",
+    });
+  });
+
+  // An attachment that lost the path to a newer remote version is the exact mirror: THEIRS
+  // holds the note's own name and OURS was parked beside it. Reading that layout backwards
+  // made "keep this device" delete this device's only copy.
+  it("mirrors the layout when theirs won the canonical path", () => {
+    expect(conflictSides(info({ kept: "theirs" }))).toEqual({
+      mine: "note.conflict-phone-260807-1200.md",
+      theirs: "note.md",
+    });
+  });
+});
+
+describe("pruneResolved", () => {
+  const copy = "note.conflict-phone-260807-1200.md";
+
+  it("keeps a pair whose copy is still on disk", () => {
+    expect(pruneResolved([info()], new Set(["note.md", copy]))).toEqual([info()]);
+  });
+
+  // The outstanding list survives restarts, so it long outlives the files it names: resolved
+  // on another device and the deletion pulled here, renamed, deleted by hand. Every one of
+  // those used to leave a row whose every button failed with "it was already resolved".
+  it("drops a pair whose copy has since left the vault", () => {
+    expect(pruneResolved([info()], new Set(["note.md"]))).toEqual([]);
+  });
+
+  it("keeps a record that never had a copy to lose", () => {
+    const overwritten = info({ copy: null });
+    const published = info({ snapshotOnly: true });
+    expect(pruneResolved([overwritten, published], new Set())).toEqual([overwritten, published]);
+  });
 });
 
 describe("planResolution", () => {
   const texts = { mine: lines("a", "mine"), theirs: lines("a", "theirs") };
 
-  it("keeping mine deletes the parked copy and writes nothing", () => {
+  it("keeping mine deletes the parked copy and touches nothing else", () => {
     expect(planResolution(info(), texts, "keep-mine")).toEqual({
+      promotes: [],
       writes: [],
       removes: ["note.conflict-phone-260807-1200.md"],
     });
   });
 
-  it("keeping theirs puts their text at the canonical path and deletes the copy", () => {
+  // A move, not a re-write of the text it happens to hold: that is what makes the same button
+  // work on a PNG, which is exactly the kind of file that could not be merged in the first
+  // place. "Keep the other version" of an attachment used to fail with "is not text".
+  it("keeping theirs promotes the parked copy onto the path and deletes it", () => {
     expect(planResolution(info(), texts, "keep-theirs")).toEqual({
-      writes: [{ path: "note.md", text: texts.theirs }],
+      promotes: [{ from: "note.conflict-phone-260807-1200.md", to: "note.md" }],
+      writes: [],
       removes: ["note.conflict-phone-260807-1200.md"],
     });
   });
 
+  it("plans a side by content, not by position, when theirs holds the canonical path", () => {
+    const attachment = info({ kept: "theirs" });
+    // Theirs already sits at the path, so keeping it only drops the copy...
+    expect(planResolution(attachment, texts, "keep-theirs")).toEqual({
+      promotes: [],
+      writes: [],
+      removes: ["note.conflict-phone-260807-1200.md"],
+    });
+    // ...and keeping ours restores it from the copy it was parked in.
+    expect(planResolution(attachment, texts, "keep-mine")).toEqual({
+      promotes: [{ from: "note.conflict-phone-260807-1200.md", to: "note.md" }],
+      writes: [],
+      removes: ["note.conflict-phone-260807-1200.md"],
+    });
+  });
+
+  it("takes either side of a binary pair, which has no text to read", () => {
+    const binary = { mine: null, theirs: null };
+    expect(planResolution(info(), binary, "keep-theirs").promotes).toEqual([
+      { from: "note.conflict-phone-260807-1200.md", to: "note.md" },
+    ]);
+    expect(planResolution(info(), binary, "keep-mine").removes).toEqual([
+      "note.conflict-phone-260807-1200.md",
+    ]);
+  });
+
   it("keeping both is a no-op, which is what the pass already did", () => {
-    expect(planResolution(info(), texts, "keep-both")).toEqual({ writes: [], removes: [] });
+    expect(planResolution(info(), texts, "keep-both")).toEqual({
+      promotes: [],
+      writes: [],
+      removes: [],
+    });
   });
 
   it("combining writes one marked file and deletes the copy", () => {
@@ -130,15 +219,17 @@ describe("planResolution", () => {
   it("refuses every choice when there is no second version left", () => {
     for (const choice of ["keep-mine", "keep-theirs", "combine"] as const) {
       expect(() => planResolution(info({ copy: null }), texts, choice)).toThrow(
-        /no second version/
+        /nothing left to choose/
       );
     }
   });
 
-  it("refuses to take a side it cannot read as text, instead of writing nothing", () => {
-    expect(() => planResolution(info(), { mine: texts.mine, theirs: null }, "keep-theirs")).toThrow(
-      /not text/
-    );
+  it("refuses every choice for a version that was published but never written here", () => {
+    for (const choice of ["keep-mine", "keep-theirs", "combine"] as const) {
+      expect(() => planResolution(info({ snapshotOnly: true }), texts, choice)).toThrow(
+        /Push-only/
+      );
+    }
   });
 
   it("refuses to combine a binary pair and names the alternatives", () => {
@@ -202,7 +293,8 @@ describe("planResolutionOnDisk", () => {
   it("plans normally when both sides are still where the pass left them", () => {
     const ops = planResolutionOnDisk(info(), "keep-theirs", { present: both, ...texts });
     expect(ops).toEqual({
-      writes: [{ path: "note.md", text: texts.theirs }],
+      promotes: [{ from: "note.conflict-phone-260807-1200.md", to: "note.md" }],
+      writes: [],
       removes: ["note.conflict-phone-260807-1200.md"],
     });
   });
@@ -214,9 +306,9 @@ describe("planResolutionOnDisk", () => {
     ).toThrow(/is gone - it was already resolved/);
   });
 
-  it("stops when the canonical file is gone rather than resurrecting it silently", () => {
+  it("stops when the side being kept is gone rather than resurrecting it silently", () => {
     expect(() =>
-      planResolutionOnDisk(info(), "keep-theirs", {
+      planResolutionOnDisk(info(), "keep-mine", {
         present: new Set(["note.conflict-phone-260807-1200.md"]),
         mine: null,
         theirs: texts.theirs,
@@ -224,18 +316,58 @@ describe("planResolutionOnDisk", () => {
     ).toThrow(/note\.md is gone/);
   });
 
-  it("still allows keep-both when only the copy remains: it asks for no writes at all", () => {
-    const ops = planResolutionOnDisk(info(), "keep-both", {
+  // Only the files a choice actually reads have to be there. Promoting the parked copy onto a
+  // note that has since been deleted restores it, which is the point of the button.
+  it("still promotes the copy when the note it lost to has been deleted", () => {
+    const ops = planResolutionOnDisk(info(), "keep-theirs", {
       present: new Set(["note.conflict-phone-260807-1200.md"]),
       mine: null,
       theirs: texts.theirs,
     });
-    expect(ops).toEqual({ writes: [], removes: [] });
+    expect(ops.promotes).toEqual([
+      { from: "note.conflict-phone-260807-1200.md", to: "note.md" },
+    ]);
+  });
+
+  it("refuses to combine when one side is missing, because it must read both", () => {
+    expect(() =>
+      planResolutionOnDisk(info(), "combine", {
+        present: new Set(["note.conflict-phone-260807-1200.md"]),
+        mine: null,
+        theirs: texts.theirs,
+      })
+    ).toThrow(/note\.md is gone/);
+  });
+
+  // Doing nothing is only "keeping both" when there are both. Reporting success here dropped
+  // the conflict from the outstanding list while one of the two versions was already gone.
+  it("refuses keep-both when only one side is left, rather than reporting success", () => {
+    expect(() =>
+      planResolutionOnDisk(info(), "keep-both", {
+        present: new Set(["note.conflict-phone-260807-1200.md"]),
+        mine: null,
+        theirs: texts.theirs,
+      })
+    ).toThrow(/note\.md is gone/);
+  });
+
+  it("asks for no operations at all when both sides really are there", () => {
+    expect(planResolutionOnDisk(info(), "keep-both", { present: both, ...texts })).toEqual({
+      promotes: [],
+      writes: [],
+      removes: [],
+    });
   });
 
   it("refuses a conflict an overwrite mode already settled", () => {
     expect(() =>
       planResolutionOnDisk(info({ copy: null }), "keep-mine", { present: both, ...texts })
-    ).toThrow(/no second version/);
+    ).toThrow(/nothing left to choose/);
+  });
+
+  it("refuses a conflict whose copy exists only in the snapshot", () => {
+    expect(() =>
+      planResolutionOnDisk(info({ snapshotOnly: true }), "keep-mine", { present: both, ...texts })
+    ).toThrow(/Push-only/);
   });
 });

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { SyncEngine, type SyncResult } from "../src/sync";
 import { FakeServer, FakeStore, FakeVault } from "./fakes";
+import { StaleHeadError } from "../src/api";
 import { VaultCrypto } from "../src/crypto";
 import type { ManifestV1 } from "../src/types";
 
@@ -283,6 +284,165 @@ describe("forced push (sync with keepLocal)", () => {
     const result = await makeEngine({ crypto }).sync({ keepLocal: true });
 
     expect(result.status).toBe("halted");
+  });
+});
+
+// "Rebuild remote history": the only action that makes remote content stop existing. Every
+// other publish, forced or not, commits a child of the head and leaves the old versions in
+// the chain. This one commits a new ROOT, orphaning everything behind it for the server's GC
+// to delete — so what it publishes must be exactly what a forced push would, and what it
+// discards must be everything else.
+describe("reroot (rebuild remote history)", () => {
+  it("commits a root manifest and makes it the head", async () => {
+    const engine = makeEngine();
+    await divergedRemote(engine);
+
+    const result = await engine.sync({ reroot: { previewedHead: server.head } });
+
+    expect(result.status).toBe("committed");
+    expect(server.manifests.get(server.head!)!.parent).toBeNull();
+    expect(server.reroots).toEqual([server.head]);
+    expect(committedFiles()).toEqual(["a.md", "b.md"]);
+  });
+
+  // The whole point can be to stop storing something while the files themselves are already
+  // correct. "Your vault already matches the remote" is not an answer to that.
+  it("commits even when nothing about the files changed", async () => {
+    const engine = makeEngine();
+    vault.set("a.md", "one");
+    await engine.sync();
+    const firstHead = server.head;
+
+    const result = await engine.sync({ reroot: { previewedHead: firstHead } });
+
+    expect(result.status).toBe("committed");
+    expect(server.head).not.toBe(firstHead);
+    expect(server.manifests.get(server.head!)!.parent).toBeNull();
+    expect(committedFiles()).toEqual(["a.md"]);
+  });
+
+  it("never writes or removes a local file", async () => {
+    const engine = makeEngine();
+    await divergedRemote(engine);
+    vault.writes = [];
+    vault.removes = [];
+
+    await engine.sync({ reroot: { previewedHead: server.head } });
+
+    expect(vault.writes).toEqual([]);
+    expect(vault.removes).toEqual([]);
+  });
+
+  // Carrying is about other devices' *files*, not their history: dropping an excluded path
+  // would delete a file this device was never entitled to speak for.
+  it("still carries remote paths this device does not scan", async () => {
+    const engine = makeEngine({ excludes: ["private/**"] });
+    vault.set("a.md", "one");
+    await engine.sync();
+    await server.seedRemoteCommit({ "private/theirs.md": "not ours", "c.md": "remote-c" });
+
+    await engine.sync({ reroot: { previewedHead: server.head } });
+
+    expect(committedFiles()).toEqual(["a.md", "private/theirs.md"]);
+  });
+
+  it("refuses when the sync direction forbids committing", async () => {
+    const engine = makeEngine({ mode: "pull-only" });
+    vault.set("a.md", "one");
+
+    await expect(engine.sync({ reroot: { previewedHead: null } })).rejects.toThrow(/pull-only/);
+    expect(server.head).toBeNull();
+  });
+
+  it("still halts when the remote is unreadable with this device's key", async () => {
+    const crypto = await VaultCrypto.fromText(btoa("k".repeat(32)));
+    server.seedRemoteEncryptedCommit({ keyId: "someone-elses-key" });
+    vault.set("a.md", "one");
+
+    const result = await makeEngine({ crypto }).sync({ reroot: { previewedHead: server.head } });
+
+    expect(result.status).toBe("halted");
+  });
+
+  // The confirmation names one head and describes what discarding everything behind it costs.
+  // Without pinning, a snapshot published between the preview and the click — or between a
+  // lost CAS race and its retry — would be rerooted over too: deleted outright, along with
+  // the history that made it recoverable. Every other pass merges a moved head and retries;
+  // this is the one where that would destroy the thing it absorbed.
+  it("refuses when the head moved after the preview, and changes nothing", async () => {
+    const engine = makeEngine();
+    vault.set("a.md", "one");
+    await engine.sync();
+    const previewed = server.head;
+    const theirs = await server.seedRemoteCommit({ "a.md": "one", "theirs.md": "unreviewed" });
+
+    await expect(engine.sync({ reroot: { previewedHead: previewed } })).rejects.toThrow(
+      /published .* since this rebuild was previewed/
+    );
+    expect(server.head).toBe(theirs);
+    expect(server.reroots).toEqual([]);
+  });
+
+  it("refuses when another device commits during the pass, rather than retrying over it", async () => {
+    const engine = makeEngine();
+    vault.set("a.md", "one");
+    await engine.sync();
+    const previewed = server.head;
+
+    // The head is still the previewed one when the pass starts, and moves exactly when this
+    // commit races another device — the case a CAS retry exists for. An ordinary pass would
+    // absorb the winner and try again; this one must not, because absorbing means deleting.
+    const realCommit = server.commit.bind(server);
+    let raced = false;
+    server.commit = async (manifest, expectedHead, opts) => {
+      if (!raced) {
+        raced = true;
+        server.head = await server.seedRemoteCommit({ "a.md": "one", "theirs.md": "unreviewed" });
+        throw new StaleHeadError("head moved", server.head);
+      }
+      return realCommit(manifest, expectedHead, opts);
+    };
+
+    await expect(engine.sync({ reroot: { previewedHead: previewed } })).rejects.toThrow(
+      /published .* since this rebuild was previewed/
+    );
+    expect(raced).toBe(true);
+    expect(server.reroots).toEqual([]);
+    expect(server.manifests.get(server.head!)!.parent).not.toBeNull();
+  });
+
+  describe("rerootSummary", () => {
+    it("reports what would be published and how much history goes with it", async () => {
+      const engine = makeEngine();
+      vault.set("a.md", "one");
+      await engine.sync();
+      vault.set("b.md", "two");
+      await engine.sync();
+
+      const summary = await engine.rerootSummary(40);
+
+      expect(summary.head).toBe(server.head);
+      expect(summary.files).toBe(2);
+      expect(summary.discarded).toBe(2);
+      expect(summary.discardedIsFloor).toBe(false);
+    });
+
+    // A count that stopped at the limit is a floor, and saying "2 snapshots" when the chain
+    // holds hundreds would understate exactly the thing being destroyed.
+    it("marks the count as a floor when the chain is longer than it walked", async () => {
+      const engine = makeEngine();
+      vault.set("a.md", "one");
+      await engine.sync();
+      vault.set("b.md", "two");
+      await engine.sync();
+
+      expect((await engine.rerootSummary(1)).discardedIsFloor).toBe(true);
+    });
+
+    it("says there is nothing to rebuild on a vault with no snapshot", async () => {
+      vault.set("a.md", "one");
+      expect((await makeEngine().rerootSummary(40)).head).toBeNull();
+    });
   });
 });
 

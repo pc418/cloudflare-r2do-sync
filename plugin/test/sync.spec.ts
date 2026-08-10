@@ -6,6 +6,7 @@ import type { FileEntry, Manifest, ManifestV1, ManifestV2 } from "../src/types";
 import { VaultCrypto } from "../src/crypto";
 import { sha256Hex } from "../src/hash";
 import { conflictPath } from "../src/merge";
+import { isResolvable } from "../src/conflict-resolve";
 
 let vault: FakeVault;
 let server: FakeServer;
@@ -386,6 +387,37 @@ describe("SyncEngine.sync — direction modes", () => {
     expect(conflict).toBeDefined();
     expect(server.blobs.get(files[conflict!].h)).toEqual(new TextEncoder().encode("remote edit"));
     expect(res.conflicts).toContain(conflict);
+  });
+
+  // Push-only never writes to the vault, so its parked version is a manifest entry and not a
+  // file here. Reported without that mark, the review window offered "keep the other version"
+  // for something that was never on this disk, and every button could only fail.
+  it("marks a push-only conflict as living in the snapshot rather than on disk", async () => {
+    vault.set("a.md", "base");
+    const pushOnly = makeEngine({ mode: "push-only" });
+    await pushOnly.sync();
+    await server.seedRemoteCommit({ "a.md": "remote edit" });
+    vault.set("a.md", "local edit", now + 1);
+
+    const res = await pushOnly.sync();
+
+    expect(res.conflictDetails).toHaveLength(1);
+    expect(res.conflictDetails[0].snapshotOnly).toBe(true);
+    expect(isResolvable(res.conflictDetails[0])).toBe(false);
+  });
+
+  it("leaves an ordinary two-way conflict resolvable, because both versions are real files", async () => {
+    vault.set("a.md", "base");
+    const engine = makeEngine();
+    await engine.sync();
+    await server.seedRemoteCommit({ "a.md": "remote edit" });
+    vault.set("a.md", "local edit", now + 1);
+
+    const res = await engine.sync();
+
+    expect(res.conflictDetails).toHaveLength(1);
+    expect(res.conflictDetails[0].snapshotOnly).toBeUndefined();
+    expect(isResolvable(res.conflictDetails[0])).toBe(true);
   });
 
   it("push-only keeps a manifest-only conflict copy on the next unchanged pass", async () => {

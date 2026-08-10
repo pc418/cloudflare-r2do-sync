@@ -30,6 +30,14 @@ export class ObsidianVault implements VaultAdapter {
     }
   }
 
+  /**
+   * Whether a file is at this path right now. A stat per path, deliberately: checking a
+   * handful of conflict copies must not cost a recursive walk of the whole vault.
+   */
+  async exists(path: string): Promise<boolean> {
+    return (await this.app.vault.adapter.stat(path))?.type === "file";
+  }
+
   async read(path: string): Promise<Uint8Array> {
     const stat = await this.app.vault.adapter.stat(path);
     if (stat?.type !== "file") throw new Error(`not a file: ${path}`);

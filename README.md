@@ -84,6 +84,9 @@ server URL, the token and the master key — two ways, and nothing is ever typed
 - **Copy setup link**, for anything that cannot scan a code — a second computer, most
   obviously. Paste it into the new device with **Apply a setup link**.
 
+Either button also puts the link itself on screen, selectable, with its own **Copy link**
+button — so you can read it, check it, or copy it again without redrawing the export.
+
 **Set the new device up before its first sync.** Without the master key it cannot read the
 vault, and it will stop rather than guess — that halt is the safety net working.
 
@@ -162,8 +165,9 @@ can be two different accounts, so the script never silently switches between the
 - **Your data stays your responsibility.** Nothing here is a service: there is no operator
   and no support channel that can read your notes back to you or restore them on your
   behalf. Your own backups and your own master key are part of running this, and the plugin
-  is provided as-is under the MIT license, without warranty. The first-run panel and the
-  first-sync prompt both say so, and the prompt has to be answered before anything uploads.
+  is provided as-is under the PolyForm Small Business 1.0.0 license, without warranty. The
+  first-run panel and the first-sync prompt both say so, and the prompt has to be answered
+  before anything uploads.
 
 ## Tokens
 
@@ -212,20 +216,20 @@ commands then ask for it with hidden input.)
   one file** with the disagreements marked for you to edit. The newer edit is labelled
   `LATEST` and its button is the default. Nothing is decided for you and nothing is decided
   during a background sync: the copy is parked first, so the choice waits as long as you like.
-  **Review and resolve conflicts** (command palette, or **Safety → Unresolved conflicts**)
+  **Review and resolve conflicts** (command palette, or **Conflicts → Unresolved conflicts**)
   reopens the latest batch any time.
 - **Combining is the only thing that writes markers into a note**, and only for the file you
   asked. Lines the two versions agree on appear once; each disagreement is wrapped in
   `<<<<<<< this device` / `=======` / `>>>>>>> other device`, with `(newer)` on whichever side
   was edited last. Ordinary sync never writes a marker.
-- **Optional: let conflicts overwrite.** **Conflict handling** (under Safety) can switch
+- **Optional: let conflicts overwrite.** **Conflict handling** (under Conflicts) can switch
   from "Keep both" to *newest wins* or *largest wins*: every device picks the same winner
   and the loser is discarded instead of parked. Changing it asks for a second
   confirmation, because a losing local edit that was never synced is gone for good — the
   remote side always remains in snapshot history.
 - **Edits beat deletes** in both directions — a deletion is easy to redo, an edit is not.
 - **A keystroke can start a sync.** R2DO Sync claims no key of its own — plugins that do
-  collide with yours — so **Sync hotkey** (under **When it syncs**, desktop only) shows what
+  collide with yours — so **Sync hotkey** (under **How and when it syncs**, desktop only) shows what
   "Sync now" is bound to and offers `⇧⌘S` (`Ctrl+Shift+S` off macOS) in one click, but only
   when nothing else uses it. Otherwise **Choose** opens Obsidian's Hotkeys page filtered to
   this plugin, where every R2DO Sync action — preview, history, conflict review — can take a
@@ -247,7 +251,8 @@ commands then ask for it with hidden input.)
 - **History and restore** are in the plugin: **Preview sync** shows what a sync would
   change without changing anything, **Snapshot history** browses past snapshots and
   restores a file or the whole vault, and **Sync log** exports recent passes to a note.
-- **Forcing a direction, when one side is simply wrong.** Two actions under Safety skip the
+- **Forcing a direction, when one side is simply wrong.** Two actions under **Safety and
+  recovery** skip the
   merge. **Pull remote over local** makes this vault match the current remote snapshot;
   changes this device never published are kept as `.conflict-…` copies, so nothing you
   authored is destroyed. **Push local over remote** publishes this device's files as the new
@@ -266,25 +271,26 @@ commands then ask for it with hidden input.)
   and transforms the complete remote snapshot in one compare-and-set commit; ordinary
   sync halts on a key/mode mismatch instead of mixing ciphertext and plaintext.
 
-### Tuning (Advanced settings)
+### Tuning
 
-The defaults suit a typical vault; the **Advanced** section exposes the knobs that used to
-be fixed in code, each stating what it trades:
+The defaults suit a typical vault. Each knob sits in the section for the part of the plugin
+it tunes, and each states what it trades:
 
 | Setting | Default | What it costs |
 |---|---|---|
-| **Parallel lanes** | 4 | Files read, encrypted, uploaded and downloaded at once. Higher finishes a large vault sooner but uses more memory and can overwhelm a phone or a slow link; 1 is the old one-at-a-time behaviour. |
-| **Sync log length** | 50 | Passes kept for troubleshooting. They live in the plugin's data file. |
-| **Report folder** | vault root | Where **Export** writes its note. Created if missing; it syncs like any other note unless excluded. |
-| **Snapshots listed in history** | 40 | How far back the history browser walks. Each one is a request. |
-| **Automatic retries** | 3 | Retries after a failed pass (1s, 4s, 15s, 1m, 5m). A *halted* sync is never retried — it needs a person. |
-| **Sync settings between devices** | on | Shares the vault-wide settings above through the server, encrypted like your notes. The most recent change on any device wins. |
+| **Parallel lanes** (How and when it syncs) | 4 | Files read, encrypted, uploaded and downloaded at once. Higher finishes a large vault sooner but uses more memory and can overwhelm a phone or a slow link; 1 is the old one-at-a-time behaviour. |
+| **Sync log length** (Troubleshooting) | 50 | Passes kept for troubleshooting. They live in the plugin's data file. |
+| **Report folder** (Troubleshooting) | vault root | Where **Export** writes its note. Created if missing; it syncs like any other note unless excluded. |
+| **Snapshots listed in history** (Safety and recovery) | 40 | How far back the history browser walks. Each one is a request. |
+| **Automatic retries** (How and when it syncs) | 3 | Retries after a failed pass (1s, 4s, 15s, 1m, 5m). A *halted* sync is never retried — it needs a person. |
+| **Sync settings between devices** (This device) | on | Shares the vault-wide settings above through the server, encrypted like your notes. The most recent change on any device wins. |
 
-The three toggles in **Notices** decide what a finished pass says: **Notice when a sync
-finishes** (on — a summary of files moved each way and the net line change, and the only
-confirmation a phone gets), **Only notice syncs that changed something** (off — a sync you
-start yourself still always answers), and **List the changed files in the notice** (off —
-each file by name with its line change and the snapshot id).
+The three toggles in **Notices** decide what a pass says: **Notice when a sync runs** (on —
+"syncing…" while a sync you started is working, then a summary of files moved each way and
+the net line change; on a phone it is the only confirmation you get), **Only notice syncs
+that changed something** (off — a sync you start yourself still always answers), and **List
+the changed files in the notice** (off — each file by name with its line change and the
+snapshot id).
 
 Numbers are stored when you leave the field or press Enter, not while you type: a value the
 setting cannot use is refused out loud and the field goes back to what is stored, rather than
@@ -335,15 +341,28 @@ two byte-compatible — so a bug in the plugin cannot make your backups unreadab
 # All commands are run from the repository root.
 npm --prefix worker install && npm --prefix plugin install
 
-npm --prefix worker test             # 84 tests, real workerd via vitest-pool-workers
-npm --prefix plugin test             # 585 tests, incl. rendered settings-tab/modal coverage
+npm --prefix worker test             # 92 tests, real workerd via vitest-pool-workers
+npm --prefix plugin test             # 712 tests, incl. rendered settings-tab/modal coverage
 node --test scripts/*.test.mjs       # 42 tests: deploy/setup/release/token helpers
+npm --prefix plugin run lint         # typed lint; the baseline is zero, so any finding is new
+npm --prefix worker run lint
 
 npm --prefix plugin run build        # -> plugin/dist/{main.js,manifest.json,styles.css}
-node scripts/release-validate.mjs 0.1.8   # release layout check; must run from the root
+node scripts/release-validate.mjs 0.3.0   # release layout check; must run from the root
 ```
 
 `worker/wrangler.jsonc` is the single source of deployment metadata for both deploy paths.
 A release is cut by pushing a tag equal to the `manifest.json` version:
 `.github/workflows/release.yml` runs the suites, builds, attests the assets and publishes
 `main.js`, `manifest.json` and `styles.css` on the GitHub release.
+
+## License
+
+[PolyForm Small Business 1.0.0](https://polyformproject.org/licenses/small-business/1.0.0) —
+see [LICENSE](LICENSE). The source is public and you may read, run, modify and redistribute
+it; use *for the benefit of a company* is permitted only for small businesses, as the license
+defines them (fewer than 100 people, under 1,000,000 USD prior-year revenue). Personal use is
+unrestricted. This is a source-available license, not an OSI open-source one.
+
+Releases up to and including 0.2.1 were published under the MIT license and stay MIT — that
+grant cannot be withdrawn. The PolyForm terms apply from 0.3.0 onward.

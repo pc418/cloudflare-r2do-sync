@@ -6,6 +6,7 @@ import {
   entryFromError,
   entryFromResult,
   announcePass,
+  announceStart,
   describePass,
   formatLogNote,
   passChangedSomething,
@@ -271,6 +272,25 @@ describe("announcePass", () => {
     expect(
       announcePass({ notifyOnSync: true, onlyChanged: false, interactive: true, result: halted })
     ).toBe(false);
+  });
+});
+
+describe("announceStart", () => {
+  // Between the tap and the summary there was nothing on screen at all, and on a phone there
+  // is no status bar to fall back on — a first sync leaves that gap open for minutes, which
+  // reads exactly like a tap that missed.
+  it("answers a sync the user started", () => {
+    expect(announceStart({ notifyOnSync: true, interactive: true })).toBe(true);
+  });
+
+  it("stays quiet for a timer, which has nobody to reassure", () => {
+    expect(announceStart({ notifyOnSync: true, interactive: false })).toBe(false);
+  });
+
+  it("says nothing at all when notices are switched off", () => {
+    // One switch governs both ends of a pass, which is why the row says "runs", not
+    // "finishes": a toggle that silenced the summary but not the opener would be a lie.
+    expect(announceStart({ notifyOnSync: false, interactive: true })).toBe(false);
   });
 });
 
