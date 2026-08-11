@@ -1,14 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./index";
 import { manifestHashes, validateManifest, type Manifest } from "./manifest";
+import { missingBlobs } from "./blobs";
 
 export type CommitResult =
   | { ok: true; head: string }
   | { ok: false; code: "stale_head"; head: string | null }
   | { ok: false; code: "missing_blob"; hashes: string[] }
   | { ok: false; code: "invalid_manifest"; message: string };
-
-const HEAD_BATCH = 50;
 
 async function sha256hex(s: string): Promise<string> {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -161,15 +160,11 @@ export class VaultLock extends DurableObject<Env> {
       const parent: Manifest = await obj.json();
       parentHashes = new Set(manifestHashes(parent));
     }
+    // Normally a handful, so this normally heads them individually — but a first sync and a
+    // reroot both parent onto nothing and verify the whole snapshot, which is the shape that
+    // exceeded the Worker CPU limit on /api/blobs/check. Same policy, one implementation.
     const newHashes = [...new Set(manifestHashes(manifest))].filter((h) => !parentHashes.has(h));
-    const missing: string[] = [];
-    for (let i = 0; i < newHashes.length; i += HEAD_BATCH) {
-      const batch = newHashes.slice(i, i + HEAD_BATCH);
-      const results = await Promise.all(batch.map((h) => this.env.VAULT.head(`blobs/${h}`)));
-      results.forEach((r, j) => {
-        if (r === null) missing.push(batch[j]);
-      });
-    }
+    const missing = await missingBlobs(this.env, newHashes);
     if (missing.length > 0) return { ok: false, code: "missing_blob", hashes: missing };
 
     await this.env.VAULT.put(`manifests/${manifest.id}.json`, JSON.stringify(manifest), {

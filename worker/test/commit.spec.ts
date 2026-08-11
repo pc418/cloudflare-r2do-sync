@@ -1,4 +1,4 @@
-import { SELF, env } from "cloudflare:test";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, beforeEach } from "vitest";
 import {
   BASE,
@@ -11,6 +11,9 @@ import {
   sha256hex,
   ulid,
 } from "./helpers";
+import { LIST_THRESHOLD } from "../src/blobs";
+import type { Env } from "../src/index";
+import type { VaultLock } from "../src/vault-lock";
 
 let token: string;
 
@@ -319,5 +322,112 @@ describe("POST /api/commit — encrypted (v2) snapshots", () => {
     const c = await putBlob(token, "dupe ciphertext");
     const res = await commit(token, makeManifestV2({ blobs: [c, c] }), null);
     expect(res.status).toBe(422);
+  });
+});
+
+/**
+ * A commit verifies the blobs it adds to its parent, so the count is normally small — but a
+ * first sync and a reroot both parent onto nothing and verify the entire snapshot. That is
+ * the shape that took the vault down through `/api/blobs/check` on 2026-08-10, so the same
+ * threshold policy applies here. These cases sit either side of `LIST_THRESHOLD` (64).
+ */
+describe("POST /api/commit — verifying many new blobs at once", () => {
+  /** Enough blobs to cross the listing threshold, uploaded for real. */
+  async function uploadMany(count: number, tag: string): Promise<string[]> {
+    const hashes: string[] = [];
+    for (let i = 0; i < count; i++) hashes.push(await putBlob(token, `${tag}-${i}`));
+    return hashes;
+  }
+
+  it("a first sync past the threshold verifies every blob and commits", async () => {
+    const blobs = await uploadMany(LIST_THRESHOLD + 6, "first-sync");
+    const m = makeManifestV2({ blobs });
+
+    expect((await commit(token, m, null)).status).toBe(200);
+    const headRes = await SELF.fetch(`${BASE}/api/head`, authed(token));
+    expect(await headRes.json()).toEqual({ head: m.id });
+  });
+
+  it("names exactly the absent blobs among many present ones, and does not move head", async () => {
+    const present = await uploadMany(LIST_THRESHOLD + 4, "mixed");
+    const ghostA = await sha256hex("absent one");
+    const ghostB = await sha256hex("absent two");
+    const m = makeManifestV2({ blobs: [...present, ghostA, ghostB] });
+
+    const res = await commit(token, m, null);
+    expect(res.status).toBe(422);
+    const body = await res.json<{ error: { code: string }; hashes: string[] }>();
+    expect(body.error.code).toBe("missing_blob");
+    expect(body.hashes.sort()).toEqual([ghostA, ghostB].sort());
+
+    const headRes = await SELF.fetch(`${BASE}/api/head`, authed(token));
+    expect(await headRes.json()).toEqual({ head: null });
+  });
+
+  it("a reroot past the threshold re-verifies the whole snapshot it re-roots", async () => {
+    const blobs = await uploadMany(LIST_THRESHOLD + 2, "reroot");
+    const first = makeManifestV2({ blobs });
+    expect((await commit(token, first, null)).status).toBe(200);
+
+    const rerooted = makeManifestV2({ id: ulid(Date.now() + 1), parent: null, blobs });
+    expect((await commit(token, rerooted, first.id, { reroot: true })).status).toBe(200);
+
+    const headRes = await SELF.fetch(`${BASE}/api/head`, authed(token));
+    expect(await headRes.json()).toEqual({ head: rerooted.id });
+  });
+
+  /**
+   * The cases above pass against the old per-hash loop too — they assert the answer, and the
+   * answer never changed. This one asserts the *cost*, by driving the Durable Object with a
+   * bucket that counts binding calls, so reverting the commit path to a head() per hash
+   * cannot slip through green.
+   */
+  it("verifies a large snapshot by listing, not by one head() per new blob", async () => {
+    const blobs = await uploadMany(LIST_THRESHOLD + 3, "counted");
+    const m = makeManifestV2({ blobs });
+    const counts = { head: 0, list: 0 };
+    const real = env.VAULT;
+    const counting = {
+      head: (key: string) => {
+        counts.head++;
+        return real.head(key);
+      },
+      list: (options?: R2ListOptions) => {
+        counts.list++;
+        return real.list(options);
+      },
+      get: (key: string) => real.get(key),
+      put: (key: string, value: ReadableStream | ArrayBuffer | string, options?: R2PutOptions) =>
+        real.put(key, value, options),
+      delete: (keys: string | string[]) => real.delete(keys),
+    };
+
+    const stub = env.VAULT_LOCK.getByName("default");
+    const result = await runInDurableObject(stub, async (instance: VaultLock) => {
+      const swappable = instance as unknown as { env: Env };
+      const original = swappable.env;
+      swappable.env = { ...original, VAULT: counting as unknown as R2Bucket };
+      try {
+        return await instance.commit(m, null);
+      } finally {
+        swappable.env = original;
+      }
+    });
+
+    expect(result).toEqual({ ok: true, head: m.id });
+    expect(counts.head).toBe(0);
+    expect(counts.list).toBeGreaterThan(0);
+  });
+
+  it("a small reroot still verifies correctly, without scanning for two blobs", async () => {
+    const kept = await putBlob(token, "small reroot blob");
+    const first = makeManifestV2({ blobs: [kept] });
+    expect((await commit(token, first, null)).status).toBe(200);
+
+    const ghost = await sha256hex("small reroot ghost");
+    const bad = makeManifestV2({ id: ulid(Date.now() + 1), parent: null, blobs: [kept, ghost] });
+    const res = await commit(token, bad, first.id, { reroot: true });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({ error: { code: "missing_blob" }, hashes: [ghost] });
   });
 });

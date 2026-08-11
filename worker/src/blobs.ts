@@ -70,7 +70,7 @@ export async function getBlob(env: Env, hash: string): Promise<R2ObjectBody | nu
 
 export type CheckResult = { ok: true; missing: string[] } | { ok: false; message: string };
 
-export interface CheckOptions {
+export interface MissingBlobsOptions {
   /** Test seam: force the listing path without storing thousands of blobs. */
   listThreshold?: number;
   /** Test seam: force pagination. R2 caps a page at 1000 objects. */
@@ -103,10 +103,41 @@ async function missingByListing(env: Env, hashes: string[], limit: number): Prom
   return hashes.filter((h) => !present.has(h));
 }
 
+/**
+ * Which of `hashes` are not stored, in input order.
+ *
+ * The single place that decides how to answer that, because both callers can be handed a
+ * whole snapshot at once: `/api/blobs/check` before uploading, and the Durable Object when
+ * a commit parents onto nothing (a first sync, or a reroot). Both paths answer identically
+ * and differ only in cost, and neither is cheaper everywhere — head() is one binding call
+ * per *requested hash*, list() one per *1000 stored blobs*. Asking about a whole snapshot
+ * the head() way is what exceeded the CPU limit at 820 files; asking about three hashes the
+ * list() way would walk the entire bucket to answer three questions. So: pick by request
+ * size. Daily GC keeps the stored set proportional to the vault, which is what keeps the
+ * listing path bounded.
+ *
+ * Listing is safe against a blob written moments earlier: R2 list operations are strongly
+ * consistent, so an upload that has resolved is visible. (The relaxed model applies only to
+ * cached custom-domain reads, not to bindings.)
+ *
+ * Callers must pass already-validated hashes; `checkBlobs` validates untrusted input first.
+ */
+export async function missingBlobs(
+  env: Env,
+  hashes: string[],
+  opts: MissingBlobsOptions = {}
+): Promise<string[]> {
+  const unique = [...new Set(hashes)];
+  if (unique.length === 0) return [];
+  return unique.length > (opts.listThreshold ?? LIST_THRESHOLD)
+    ? missingByListing(env, unique, opts.listPageLimit ?? LIST_PAGE_LIMIT)
+    : missingByHead(env, unique);
+}
+
 export async function checkBlobs(
   env: Env,
   hashes: unknown,
-  opts: CheckOptions = {}
+  opts: MissingBlobsOptions = {}
 ): Promise<CheckResult> {
   if (!Array.isArray(hashes)) return { ok: false, message: "hashes must be an array" };
   if (hashes.length > MAX_CHECK_HASHES)
@@ -115,21 +146,7 @@ export async function checkBlobs(
     if (typeof h !== "string" || !HASH_RE.test(h))
       return { ok: false, message: `invalid hash: ${String(h).slice(0, 80)}` };
   }
-  const unique = [...new Set(hashes as string[])];
-  if (unique.length === 0) return { ok: true, missing: [] };
-
-  // Both paths answer identically; they differ only in what they cost, and neither is
-  // cheaper everywhere. head() is one binding call per *requested* hash; list() is one per
-  // 1000 *stored* blobs. Asking about a whole snapshot the head() way is what exceeded the
-  // CPU limit at 820 files. Asking about three hashes the list() way would walk the entire
-  // bucket to answer three questions. So: pick by request size. Daily GC keeps the stored
-  // set proportional to the vault, which is what keeps the listing path bounded.
-  const missing =
-    unique.length > (opts.listThreshold ?? LIST_THRESHOLD)
-      ? await missingByListing(env, unique, opts.listPageLimit ?? LIST_PAGE_LIMIT)
-      : await missingByHead(env, unique);
-
-  // Input order, both paths: the caller uploads in this order and the plugin's reporting is
+  // Input order: the caller uploads in this order and the plugin's reporting is
   // user-facing, so the answer must not depend on storage or completion order.
-  return { ok: true, missing };
+  return { ok: true, missing: await missingBlobs(env, hashes as string[], opts) };
 }
