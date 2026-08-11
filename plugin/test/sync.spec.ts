@@ -167,6 +167,61 @@ describe("SyncEngine.sync — happy paths", () => {
   });
 });
 
+describe("SyncEngine.sync — what a pass asks the server about", () => {
+  it("asks only about the blobs the commit adds to its parent", async () => {
+    vault.set("a.md", "one");
+    vault.set("b.md", "two");
+    await engine.sync();
+    server.checked.length = 0;
+
+    vault.set("b.md", "two changed", now + 1);
+    const res = await engine.sync();
+
+    expect(res.status).toBe("committed");
+    expect(server.checked).toEqual([[await hex("two changed")]]);
+  });
+
+  it("asks about nothing at all when only deletions are published", async () => {
+    vault.set("a.md", "one");
+    vault.set("b.md", "two");
+    await engine.sync();
+    server.checked.length = 0;
+
+    vault.delete("b.md");
+    const res = await engine.sync();
+
+    expect(res.status).toBe("committed");
+    expect(server.checked).toEqual([[]]);
+  });
+
+  it("asks about every blob on a first push, which has no parent to inherit from", async () => {
+    vault.set("a.md", "one");
+    vault.set("b.md", "two");
+
+    await engine.sync();
+
+    expect(server.checked).toEqual([[await hex("one"), await hex("two")]]);
+  });
+
+  it("re-uploads a carried blob the server lost, because commit still verifies", async () => {
+    vault.set("a.md", "one");
+    vault.set("b.md", "two");
+    await engine.sync();
+    // The pre-check no longer covers carried blobs, so this is the only thing standing
+    // between a lost blob and a manifest that references nothing.
+    server.blobs.delete(await hex("one"));
+    server.checked.length = 0;
+
+    vault.set("b.md", "two changed", now + 1);
+    const res = await engine.sync();
+
+    expect(res.status).toBe("committed");
+    expect(server.checked).toEqual([[await hex("two changed")]]);
+    expect(server.uploads).toContain(await hex("one"));
+    expect(server.blobs.has(await hex("one"))).toBe(true);
+  });
+});
+
 describe("SyncEngine.sync — filtering and limits", () => {
   it("excludes configured globs", async () => {
     vault.set("a.md", "keep");

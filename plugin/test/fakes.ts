@@ -98,7 +98,15 @@ export class FakeServer implements SyncApiLike {
     return m;
   }
 
+  /**
+   * What each pass asked about, so a test can assert the *size* of the question and not
+   * only the answer. Asking about every blob in the vault once per pass is what exceeded
+   * the Worker's CPU limit in production.
+   */
+  readonly checked: string[][] = [];
+
   async checkBlobs(hashes: string[]): Promise<string[]> {
+    this.checked.push([...hashes]);
     return [...new Set(hashes)].filter((h) => !this.blobs.has(h));
   }
 

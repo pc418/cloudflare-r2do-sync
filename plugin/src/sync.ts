@@ -507,6 +507,13 @@ export class SyncEngine {
     // base that preceded both remotes.
     let baseFiles = state.files;
     let baseHead = state.lastSyncedHead;
+    /**
+     * The blobs the base snapshot already put on the server, so a pass can ask about the
+     * ones it is *adding* rather than about its whole vault. Deliberately not derived from
+     * `baseFiles`: case-collision resolution can place a local entry in that map, and a
+     * local entry is exactly the case where the blob may not be uploaded yet.
+     */
+    let baseBlobs = new Set(Object.values(state.files).map(blobKey));
     /** Line counts for the snapshot this pass starts from; the baseline for every net figure. */
     const baseLines = state.lines;
 
@@ -549,6 +556,9 @@ export class SyncEngine {
         const mismatch = this.#modeError(remote, serverHead);
         if (mismatch !== null) return this.#halt(mismatch, outcome);
         remoteFiles = await this.#remoteFiles(remote);
+        // Captured before collision resolution can mix local entries in: these, and only
+        // these, are the blobs the manifest we are about to parent onto references.
+        const remoteBlobs = new Set(Object.values(remoteFiles).map(blobKey));
 
         const local = await this.#buildSnapshot();
         remoteSkipped = local.skipped;
@@ -635,6 +645,7 @@ export class SyncEngine {
         // against R1 before attempting to parent onto R2.
         baseFiles = remoteFiles;
         baseHead = serverHead;
+        baseBlobs = remoteBlobs;
       }
 
       if (this.#mode === "pull-only") {
@@ -712,7 +723,15 @@ export class SyncEngine {
       }
 
       const hashes = [...new Set(Object.values(finalFiles).map(blobKey))];
-      const missing = await this.#api.checkBlobs(hashes);
+      // Ask only about the blobs this commit ADDS, which is the same rule the Durable
+      // Object applies when it verifies the commit (`newHashes = manifest − parent`).
+      // Anything the parent already references is on the server: the parent is the head, so
+      // GC retains its blobs — and a reference inherited from the parent is not something
+      // this pass could repair anyway, since a carried remote-only path has no local bytes
+      // to re-upload. Commit still checks, and still fails loud, either way. A reroot
+      // parents onto nothing and an empty remote has nothing, so both ask about everything.
+      const onParent = reroot === null && serverHead !== null ? baseBlobs : new Set<string>();
+      const missing = await this.#api.checkBlobs(hashes.filter((h) => !onParent.has(h)));
       // One pass over the snapshot instead of a scan per upload: at a few thousand files
       // the old find-per-hash was the slowest part of a first sync, not the network.
       // Only freshly scanned paths can be re-read. A carried remote-only entry may share
