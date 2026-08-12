@@ -81,6 +81,19 @@ describe("SyncEngine.listHistory", () => {
     expect(history.map((h) => h.id)).toEqual([heads[2], heads[1]]);
   });
 
+  it("stops on a chain that loops instead of listing the same snapshots to the limit", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    // The server now refuses to re-issue a manifest id, so this is corruption that predates
+    // the rule; the walk must still terminate on what it can read.
+    const root = server.manifests.get(heads[0])!;
+    server.manifests.set(heads[0], { ...root, parent: heads[2] });
+
+    const history = await engine.listHistory(10);
+
+    expect(history.map((h) => h.id)).toEqual([heads[2], heads[1], heads[0]]);
+  });
+
   it("marks snapshots it cannot decrypt instead of throwing", async () => {
     const engine = makeEngine();
     vault.set("a.md", "one");

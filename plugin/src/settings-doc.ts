@@ -118,10 +118,12 @@ export function applySharedSettings(
   return changed;
 }
 
-/** Who wrote a settings document, for last-writer-wins comparison. */
+/** Who wrote a settings document, and where it sits in the server's ordering. */
 export interface SettingsRev {
   updatedAt: number;
   device: string;
+  /** Server-assigned, monotonic. Absent on documents written before it existed. */
+  rev?: number;
 }
 
 export interface SaltReconciliation {
@@ -152,11 +154,22 @@ export function reconcileVaultSalt(local: string, remote: string | undefined): S
 }
 
 /**
- * Last writer wins on device wall clocks, device name as the deterministic tiebreak.
- * Clock skew between two phones is real but harmless here: the loser's next edit wins.
+ * Which of two documents is the later one.
+ *
+ * The server's revision decides it whenever both sides have one: it is monotonic and
+ * assigned on write, so no device clock can claim the future and freeze the policy. Device
+ * wall clocks remain the fallback for documents written before revisions existed, with the
+ * device name as a deterministic tiebreak.
  */
 export function isNewerRev(a: SettingsRev, b: SettingsRev | null): boolean {
   if (b === null) return true;
+  if (a.rev !== undefined && b.rev !== undefined) return a.rev > b.rev;
+  // Mixed state, which every vault passes through exactly once on upgrade. A revisioned
+  // document is server-ordered and always supersedes a revisionless one, whatever the clocks
+  // say: otherwise a cached pre-upgrade document with a far-future `updatedAt` — the very
+  // capture revisions exist to end — would reject every revisioned document forever.
+  if (a.rev !== undefined) return true;
+  if (b.rev !== undefined) return false;
   if (a.updatedAt !== b.updatedAt) return a.updatedAt > b.updatedAt;
   return a.device > b.device;
 }
@@ -175,13 +188,25 @@ export interface SettingsDocV2 extends SettingsRev {
   enc: EncPayload;
 }
 
-export type SettingsDoc = SettingsDocV1 | SettingsDocV2;
+/**
+ * Same shape as v2, but `enc` also authenticates the envelope — see `settingsAad`. Without
+ * it the revision, device, keyId and salt sit outside the ciphertext, so a token holder can
+ * re-post a captured payload under a revision of their choosing.
+ */
+export interface SettingsDocV3 extends Omit<SettingsDocV2, "v"> {
+  v: 3;
+}
+
+export type SettingsDoc = SettingsDocV1 | SettingsDocV2 | SettingsDocV3;
 
 /** Shape check for a fetched document. The server validates writes; trust but verify. */
 export function isSettingsDoc(value: unknown): value is SettingsDoc {
   if (typeof value !== "object" || value === null) return false;
   const doc = value as Record<string, unknown>;
   if (typeof doc.updatedAt !== "number" || typeof doc.device !== "string") return false;
+  if (doc.rev !== undefined && (typeof doc.rev !== "number" || !Number.isInteger(doc.rev))) {
+    return false;
+  }
   if (doc.vaultSalt !== undefined) {
     if (typeof doc.vaultSalt !== "string") return false;
     try {
@@ -191,6 +216,8 @@ export function isSettingsDoc(value: unknown): value is SettingsDoc {
     }
   }
   if (doc.v === 1) return typeof doc.plain === "object" && doc.plain !== null;
-  if (doc.v === 2) return typeof doc.keyId === "string" && typeof doc.enc === "object" && doc.enc !== null;
+  if (doc.v === 2 || doc.v === 3) {
+    return typeof doc.keyId === "string" && typeof doc.enc === "object" && doc.enc !== null;
+  }
   return false;
 }

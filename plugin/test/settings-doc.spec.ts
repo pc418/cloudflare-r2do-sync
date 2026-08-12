@@ -221,3 +221,27 @@ describe("reconcileVaultSalt", () => {
     expect(reconcileVaultSalt("", "")).toEqual({ salt: "", changed: false, replaced: null });
   });
 });
+
+describe("revision ordering across the upgrade", () => {
+  // Every vault passes through mixed state exactly once. A cached pre-upgrade document with
+  // a far-future clock — the very capture server revisions exist to end — must not be able to
+  // reject every revisioned document that follows it.
+  it("a revisioned document supersedes a revisionless one whatever the clocks say", () => {
+    const legacy = { updatedAt: 4_000_000_000_000, device: "skewed-phone" };
+    const incoming = { updatedAt: 1, device: "laptop", rev: 1 };
+
+    expect(isNewerRev(incoming, legacy)).toBe(true);
+    // ...and not the other way round: once ordering is server-assigned it does not regress.
+    expect(isNewerRev(legacy, incoming)).toBe(false);
+  });
+
+  it("compares revisions once both sides have them, ignoring the clocks entirely", () => {
+    expect(isNewerRev({ updatedAt: 1, device: "a", rev: 5 }, { updatedAt: 9e12, device: "b", rev: 4 })).toBe(true);
+    expect(isNewerRev({ updatedAt: 9e12, device: "a", rev: 4 }, { updatedAt: 1, device: "b", rev: 5 })).toBe(false);
+  });
+
+  it("still falls back to the clock when neither side has a revision", () => {
+    expect(isNewerRev({ updatedAt: 2, device: "a" }, { updatedAt: 1, device: "b" })).toBe(true);
+    expect(isNewerRev({ updatedAt: 1, device: "b" }, { updatedAt: 1, device: "a" })).toBe(true);
+  });
+});

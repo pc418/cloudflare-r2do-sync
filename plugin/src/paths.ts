@@ -33,6 +33,39 @@ export function selfDirs(configDir: string = DEFAULT_CONFIG_DIR): string[] {
   return bases.flatMap((base) => [`${base}/${SELF_FOLDER}`, `${base}/${LEGACY_SELF_FOLDER}`]);
 }
 
+/**
+ * Configuration sub-directories whose contents Obsidian loads as code, or that decide which
+ * code it loads: `plugins/` holds every community plugin's `main.js`, `themes/` and
+ * `snippets/` hold CSS the app injects. `plugins/<id>/data.json` lives here too, and that is
+ * where OTHER plugins keep their own credentials.
+ */
+const CONFIG_CODE_DIRS = new Set(["plugins", "themes", "snippets"]);
+
+/** Top-level configuration files that decide which third-party code is enabled. */
+const CONFIG_ENABLEMENT_FILES = new Set(["community-plugins.json"]);
+
+/**
+ * Whether a path inside a configuration directory carries executable or enablement state.
+ *
+ * Syncing the configuration directory is opt-in, but the opt-in used to include this: any
+ * writer — a plaintext vault's server, or any device holding the master key — could place a
+ * `main.js` that Obsidian executes on the next reload. That turns "my settings follow me
+ * between devices" into "every writer to this vault can run code on all of them", which is a
+ * much larger promise than the toggle makes. These paths are therefore excluded no matter
+ * what the user's globs or the config toggle say, leaving the toggle to mean what it says:
+ * Obsidian's own settings JSON.
+ *
+ * Checked against the active *and* default directory, for the same reason `selfDirs` is: a
+ * renamed config folder leaves the old one on disk, and it holds the same executables.
+ */
+export function isConfigCodePath(path: string, configDir: string = DEFAULT_CONFIG_DIR): boolean {
+  const segments = path.split("/");
+  if (segments.length < 2) return false;
+  if (segments[0] !== configDir && segments[0] !== DEFAULT_CONFIG_DIR) return false;
+  if (segments.length >= 3 && CONFIG_CODE_DIRS.has(segments[1])) return true;
+  return segments.length === 2 && CONFIG_ENABLEMENT_FILES.has(segments[1]);
+}
+
 /** Files that are noise on every platform, matched by exact segment name. */
 const JUNK_NAMES = new Set([
   ".DS_Store",
@@ -71,6 +104,9 @@ export function alwaysSkip(path: string, configDir: string = DEFAULT_CONFIG_DIR)
   for (const selfDir of selfDirs(configDir)) {
     if (path === selfDir || path.startsWith(`${selfDir}/`)) return true;
   }
+  // Third-party code and the files that enable it: see `isConfigCodePath`. Here rather than
+  // behind the config toggle, because the toggle is a settings choice and this is not.
+  if (isConfigCodePath(path, configDir)) return true;
 
   const segments = path.split("/");
   if (

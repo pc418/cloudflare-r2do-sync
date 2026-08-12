@@ -518,3 +518,57 @@ describe("SyncEngine.forcePushSummary", () => {
     );
   });
 });
+
+describe("forced actions are pinned to the head they previewed", () => {
+  let engine: SyncEngine;
+  beforeEach(() => {
+    engine = makeEngine();
+  });
+
+  // The typed confirmation names a snapshot and counts its files. Between the preview and
+  // the click another device can publish; acting on that instead means the destructive thing
+  // that happened is not the destructive thing that was agreed to. Rebuild-history already
+  // refused a moved head for this reason — these two did not.
+  it("forcePull refuses when the remote moved after the preview", async () => {
+    vault.set("a.md", "local");
+    await engine.sync();
+    const summary = await engine.forcePullSummary();
+
+    await server.seedRemoteCommit({ "b.md": "someone else's newer snapshot" });
+
+    await expect(engine.forcePull(summary.head)).rejects.toThrow(/since this pull was previewed/);
+    // Nothing was written over the vault.
+    expect(vault.text("a.md")).toBe("local");
+  });
+
+  it("forcePull still runs when the head is the one that was previewed", async () => {
+    vault.set("a.md", "local");
+    await engine.sync();
+    await server.seedRemoteCommit({ "remote.md": "theirs" });
+    const summary = await engine.forcePullSummary();
+
+    await expect(engine.forcePull(summary.head)).resolves.toMatchObject({ head: summary.head });
+  });
+
+  it("forcePush refuses when the remote moved after the preview", async () => {
+    vault.set("a.md", "local");
+    await engine.sync();
+    const summary = await engine.forcePushSummary();
+
+    await server.seedRemoteCommit({ "b.md": "published in the meantime" });
+
+    await expect(
+      engine.sync({ keepLocal: true, previewedHead: summary.head })
+    ).rejects.toThrow(/since this push was previewed/);
+  });
+
+  it("forcePush publishes when the head has not moved", async () => {
+    vault.set("a.md", "local");
+    await engine.sync();
+    vault.set("a.md", "edited since the last pass", 1_754_000_100_000);
+    const summary = await engine.forcePushSummary();
+
+    const res = await engine.sync({ keepLocal: true, previewedHead: summary.head });
+    expect(res.status).toBe("committed");
+  });
+});

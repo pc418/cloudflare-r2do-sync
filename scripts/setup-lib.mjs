@@ -3,7 +3,7 @@
 // Everything here is either pure or takes its `fetch` as an argument, so the parts that
 // decide *what* setup does (which credentials, which words the user is told) are unit
 // tested without touching a Cloudflare account.
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -53,6 +53,10 @@ export function upsertEnvFile(root, values) {
   for (const [key, value] of pending) updated.push(`${key}=${value}`);
 
   writeFileSync(file, `${updated.join("\n")}\n`, { mode: 0o600 });
+  // `mode:` only applies when the file is CREATED. An .env that already existed keeps
+  // whatever permissions it had — commonly 0644 from an editor or a `cp .env.example` — and
+  // this function has just written an admin token and a vault-wide access token into it.
+  chmodSync(file, 0o600);
   return file;
 }
 
@@ -90,6 +94,9 @@ export const SETUP_USAGE = `usage: node scripts/setup.mjs [options]
   --wrangler         deploy with the wrangler CLI (its own login decides the account)
   --token            deploy with the Cloudflare REST API (CLOUDFLARE_TOKEN + CLOUDFLARE_ACCOUNT_ID)
   --name <label>     label for the access token (default: vault)
+  --out <file>       write the access token to a 0600 JSON file instead of printing it
+  --print-token      print the token even when stdout is not a terminal
+  --adopt-bucket     use an existing R2 bucket of the configured name (REST path)
   --yes              do not prompt for confirmation (the target account is still printed)
   --help
 
@@ -103,6 +110,9 @@ export function parseSetupArgs(argv) {
     tokenName: "vault",
     assumeYes: false,
     help: false,
+    out: null,
+    printToken: false,
+    adoptBucket: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -116,6 +126,14 @@ export function parseSetupArgs(argv) {
       const value = argv[++i];
       if (!value || value.startsWith("--")) throw new Error("--name needs a value");
       opts.tokenName = value;
+    } else if (arg === "--out") {
+      const value = argv[++i];
+      if (!value || value.startsWith("--")) throw new Error("--out needs a file path");
+      opts.out = value;
+    } else if (arg === "--print-token") {
+      opts.printToken = true;
+    } else if (arg === "--adopt-bucket") {
+      opts.adoptBucket = true;
     } else if (arg === "--yes" || arg === "-y") {
       opts.assumeYes = true;
     } else if (arg === "--help" || arg === "-h") {
@@ -181,7 +199,7 @@ export function resolveAuthPath({ requested, hasToken, hasAccountId, wranglerAcc
     path: "wrangler",
     needsLogin: true,
     conflict: false,
-    reason: "nothing is configured yet — log in with `npx wrangler login`, or set CLOUDFLARE_TOKEN",
+    reason: "nothing is configured yet — log in with `./worker/node_modules/.bin/wrangler login`, or set CLOUDFLARE_TOKEN",
   };
 }
 
@@ -210,8 +228,8 @@ export function renderAccountCheck({ account, scriptName, bucket, conflict = fal
       ? "  Wrong account? Switch it yourself, then re-run setup:"
       : "  Log in first, then re-run setup:",
     account
-      ? "      npx wrangler logout && npx wrangler login"
-      : "      npx wrangler login",
+      ? "      ./worker/node_modules/.bin/wrangler logout && ./worker/node_modules/.bin/wrangler login"
+      : "      ./worker/node_modules/.bin/wrangler login",
     ""
   );
   if (conflict) {
@@ -351,6 +369,61 @@ export async function waitForHealth({
     if (i < attempts - 1) await sleep(delayMs);
   }
   return false;
+}
+
+/**
+ * The REST path's equivalent of the wrangler account check: name the account, script and
+ * bucket before anything is provisioned. Only the first 8 characters of the account id are
+ * shown — enough to tell two accounts apart on sight, without writing the whole identifier
+ * into a terminal transcript.
+ */
+export function renderRestDeployCheck({ accountId, scriptName, bucket, bucketOwned }) {
+  return [
+    "",
+    THIN,
+    "  DEPLOY TARGET (Cloudflare REST API)",
+    THIN,
+    `  Account    ${String(accountId).slice(0, 8)}… (from CLOUDFLARE_ACCOUNT_ID)`,
+    `  Worker     ${scriptName}`,
+    `  R2 bucket  ${bucket}${bucketOwned ? " (created by this checkout)" : ""}`,
+    "",
+    bucketOwned
+      ? "  This is a redeploy onto storage this checkout provisioned."
+      : "  If that bucket already exists on this account, setup will stop rather than adopt it.",
+    "",
+  ].join("\n");
+}
+
+// --- token handoff ------------------------------------------------------------
+
+/**
+ * Where a freshly minted access token may be written.
+ *
+ * A token is returned exactly once, so this has to be decided BEFORE minting: refusing
+ * afterwards would throw away a credential that can no longer be recovered. On a terminal,
+ * printing is what the user asked for. Without one — a CI job, a pipe into a log file, an
+ * agent capturing stdout — a vault-wide bearer token would be written somewhere nobody
+ * chose, and it authenticates read, write and history destruction for the whole vault. So
+ * that case must say so explicitly, either with `--print-token` or by naming a 0600 file.
+ */
+export function tokenOutputPlan({ isTty, out = null, printToken = false }) {
+  if (out) return { kind: "file", file: out };
+  if (printToken) return { kind: "stdout" };
+  if (isTty) return { kind: "stdout" };
+  return {
+    kind: "refuse",
+    reason:
+      "refusing to print a vault-wide access token to a non-terminal: it would land in a log\n" +
+      "or CI transcript. Re-run with --out <file> to write it to a 0600 file, or\n" +
+      "--print-token if stdout really is where you want it.",
+  };
+}
+
+/** Writes the handoff a non-interactive caller asked for, readable only by its owner. */
+export function writeTokenHandoff(file, payload) {
+  writeFileSync(file, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(file, 0o600); // `mode:` only applies on creation; the file may already exist
+  return file;
 }
 
 // --- final output ------------------------------------------------------------

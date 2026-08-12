@@ -153,6 +153,11 @@ export class FakeElement {
     this.text = value;
     this.#rerecord();
   }
+  /** The status bar item is clickable; the plugin wires a sync to it during onload(). */
+  onClickEvent(handler: () => unknown): void {
+    this.clickHandler = handler;
+  }
+  clickHandler: (() => unknown) | null = null;
   addClass(): void {}
   removeClass(): void {}
   setAttribute(): void {}
@@ -354,28 +359,147 @@ export class Setting {
   }
 }
 
+/**
+ * Deliberately empty. The settings page must render no match count at all when there is no
+ * file index to consult — "cannot tell" and "nothing matches" are different answers — so the
+ * default app has no `vault`. Tests that need one pass their own object, or `LifecycleApp`.
+ */
 export class App {}
 
+export interface RecordedEvent {
+  target: string;
+  name: string;
+  handler: (...args: unknown[]) => unknown;
+}
+
+/** The slice of `Vault` the plugin's lifecycle touches, with its registrations recorded. */
+export class AppVault {
+  configDir = ".obsidian";
+  readonly events: RecordedEvent[] = [];
+  files: string[] = [];
+  /**
+   * `ObsidianVault` is constructed eagerly with the app but only touches the adapter when a
+   * pass actually runs, so these throw rather than pretending to be an empty vault: a
+   * lifecycle test that reaches the filesystem has escaped its own scope.
+   */
+  adapter = {
+    list: (): never => {
+      throw new Error("adapter.list: lifecycle tests must not run a real pass");
+    },
+    stat: (): never => {
+      throw new Error("adapter.stat: lifecycle tests must not run a real pass");
+    },
+  };
+  on(name: string, handler: (...args: unknown[]) => unknown): RecordedEvent {
+    const event = { target: "vault", name, handler };
+    this.events.push(event);
+    return event;
+  }
+  off(): void {}
+  getFiles(): { path: string }[] {
+    return this.files.map((path) => ({ path }));
+  }
+  /** Test helper: fire what the plugin registered, the way the app would. */
+  fire(name: string, ...args: unknown[]): void {
+    for (const event of this.events.filter((e) => e.name === name)) event.handler(...args);
+  }
+}
+
+export class AppWorkspace {
+  /** Recorded rather than run: whether work waits for layout is the thing under test. */
+  readonly layoutReady: (() => unknown)[] = [];
+  readonly events: RecordedEvent[] = [];
+  onLayoutReady(cb: () => unknown): void {
+    this.layoutReady.push(cb);
+  }
+  on(name: string, handler: (...args: unknown[]) => unknown): RecordedEvent {
+    const event = { target: "workspace", name, handler };
+    this.events.push(event);
+    return event;
+  }
+  off(): void {}
+  fireLayoutReady(): void {
+    for (const cb of [...this.layoutReady]) cb();
+  }
+}
+
+/** An `App` with the surfaces `onload()` needs. Separate from `App` on purpose — see above. */
+export class LifecycleApp extends App {
+  readonly vault = new AppVault();
+  readonly workspace = new AppWorkspace();
+}
+
+export interface RecordedCommand {
+  id: string;
+  name: string;
+  callback?: () => unknown;
+  checkCallback?: (checking: boolean) => boolean | void;
+}
+
 export class Plugin {
+  readonly commands: RecordedCommand[] = [];
+  readonly settingTabs: unknown[] = [];
+  readonly ribbonIcons: { icon: string; title: string; onClick: () => unknown }[] = [];
+  readonly statusBarItems: FakeElement[] = [];
+  readonly intervals: unknown[] = [];
+  readonly registeredEvents: unknown[] = [];
+  readonly domEvents: { type: string; handler: (...args: unknown[]) => unknown }[] = [];
+  readonly protocolHandlers = new Map<string, (params: Record<string, string>) => unknown>();
+  /** What `loadData()` returns: a device's persisted `data.json`, controlled per test. */
+  persisted: unknown = null;
+  /** Every `saveData()` payload, deep-copied — the plugin keeps mutating the live object. */
+  readonly saves: unknown[] = [];
+
   constructor(
     readonly app: App,
     readonly manifest: unknown = {}
   ) {}
-  addRibbonIcon(): FakeElement {
+  addRibbonIcon(icon: string, title: string, onClick: () => unknown): FakeElement {
+    this.ribbonIcons.push({ icon, title, onClick });
     return fakeContainer();
   }
-  addCommand(): void {}
-  addSettingTab(): void {}
+  addCommand(command: RecordedCommand): RecordedCommand {
+    this.commands.push(command);
+    return command;
+  }
+  addSettingTab(tab: unknown): void {
+    this.settingTabs.push(tab);
+  }
   addStatusBarItem(): FakeElement {
-    return fakeContainer();
+    const el = fakeContainer();
+    this.statusBarItems.push(el);
+    return el;
   }
-  registerEvent(): void {}
-  registerDomEvent(): void {}
-  registerInterval(): void {}
+  registerEvent(event: unknown): void {
+    this.registeredEvents.push(event);
+  }
+  registerDomEvent(_el: unknown, type: string, handler: (...args: unknown[]) => unknown): void {
+    this.domEvents.push({ type, handler });
+  }
+  registerInterval(id: unknown): unknown {
+    this.intervals.push(id);
+    return id;
+  }
+  registerObsidianProtocolHandler(
+    action: string,
+    handler: (params: Record<string, string>) => unknown
+  ): void {
+    this.protocolHandlers.set(action, handler);
+  }
   async loadData(): Promise<unknown> {
-    return null;
+    return this.persisted;
   }
-  async saveData(): Promise<void> {}
+  async saveData(data: unknown): Promise<void> {
+    this.persisted = data;
+    this.saves.push(JSON.parse(JSON.stringify(data)) as unknown);
+  }
+  /** Test helper: drive a command the way the command palette does. */
+  runCommand(id: string): unknown {
+    const command = this.commands.find((c) => c.id === id || c.id.endsWith(`:${id}`));
+    if (command === undefined) throw new Error(`no command registered with id ${id}`);
+    if (command.callback !== undefined) return command.callback();
+    return command.checkCallback?.(false);
+  }
 }
 
 export class PluginSettingTab {
@@ -432,8 +556,21 @@ export const Platform = {
   isAndroidApp: false,
 };
 
-export async function requestUrl(): Promise<unknown> {
-  throw new Error("requestUrl is not available in the fake obsidian module");
+/**
+ * Unset by default, so a test that reaches the network without meaning to fails loudly
+ * instead of silently getting a stub answer.
+ */
+export const requestUrlMock: {
+  impl: ((req: unknown) => Promise<unknown>) | null;
+  calls: unknown[];
+} = { impl: null, calls: [] };
+
+export async function requestUrl(req?: unknown): Promise<unknown> {
+  requestUrlMock.calls.push(req);
+  if (requestUrlMock.impl === null) {
+    throw new Error("requestUrl is not available in the fake obsidian module");
+  }
+  return requestUrlMock.impl(req);
 }
 
 export function setIcon(): void {}

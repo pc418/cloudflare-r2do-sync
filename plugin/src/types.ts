@@ -36,10 +36,91 @@ export interface ManifestV2 {
   enc: EncPayload;
 }
 
-export type Manifest = ManifestV1 | ManifestV2;
+/**
+ * Identical on the wire to v2, but `enc` additionally authenticates the envelope around it
+ * (see `manifestAad`). v2 left `id`, `parent`, `device`, `createdAt`, `keyId` and `blobs`
+ * unauthenticated, so anyone holding an access token could move a valid encrypted path map
+ * under a header of their choosing. Reading v2 stays supported forever — existing history is
+ * v2 — so the protection is prospective: it covers every snapshot written from now on.
+ */
+export interface ManifestV3 extends Omit<ManifestV2, "v"> {
+  v: 3;
+}
+
+export type Manifest = ManifestV1 | ManifestV2 | ManifestV3;
+
+/** True for the encrypted versions, whose payload is an opaque `enc` blob. */
+export function isEncryptedManifest(m: Manifest): m is ManifestV2 | ManifestV3 {
+  return m.v === 2 || m.v === 3;
+}
 
 export function isEmptyManifest(m: Manifest): boolean {
   return m.v === 1 ? Object.keys(m.files).length === 0 : m.blobs.length === 0;
+}
+
+const HASH_RE = /^[0-9a-f]{64}$/;
+
+function isFileEntry(value: unknown): value is FileEntry {
+  if (typeof value !== "object" || value === null) return false;
+  const e = value as Record<string, unknown>;
+  return (
+    typeof e.h === "string" &&
+    typeof e.size === "number" &&
+    Number.isFinite(e.size) &&
+    typeof e.mtime === "number" &&
+    Number.isFinite(e.mtime) &&
+    (e.c === undefined || (typeof e.c === "string" && HASH_RE.test(e.c)))
+  );
+}
+
+/**
+ * Validates a manifest fetched from the server before anything plans writes from it.
+ *
+ * `SyncApi` used to cast the parsed JSON, so a malformed or corrupted document reached the
+ * merge as a half-typed object. A pull mutates the vault as concurrent fetches complete, so
+ * "it threw eventually" is not the same as "nothing happened": some files can already have
+ * been written by the time a later entry turns out to be nonsense.
+ */
+export function parseManifest(value: unknown): Manifest {
+  const fail = (why: string): never => {
+    throw new Error(`invalid manifest from server: ${why}`);
+  };
+  if (typeof value !== "object" || value === null) return fail("not an object");
+  const m = value as Record<string, unknown>;
+  if (typeof m.id !== "string" || m.id === "") return fail("id is missing");
+  if (m.parent !== null && typeof m.parent !== "string") return fail("parent must be a string or null");
+  if (typeof m.device !== "string") return fail("device is missing");
+  if (typeof m.createdAt !== "string") return fail("createdAt is missing");
+
+  if (m.v === 1) {
+    if (typeof m.files !== "object" || m.files === null) return fail("files is missing");
+    for (const [path, entry] of Object.entries(m.files as Record<string, unknown>)) {
+      if (!isFileEntry(entry)) return fail(`entry "${path}" is malformed`);
+    }
+    return m as unknown as ManifestV1;
+  }
+  if (m.v === 2 || m.v === 3) {
+    if (typeof m.keyId !== "string") return fail("keyId is missing");
+    if (!Array.isArray(m.blobs) || m.blobs.some((h) => typeof h !== "string" || !HASH_RE.test(h))) {
+      return fail("blobs must be an array of sha256 hex digests");
+    }
+    const enc = m.enc as Record<string, unknown> | undefined;
+    if (typeof enc !== "object" || enc === null) return fail("enc is missing");
+    if (typeof enc.iv !== "string" || typeof enc.data !== "string") return fail("enc is malformed");
+    return m as unknown as ManifestV2 | ManifestV3;
+  }
+  return fail(`unsupported version ${String(m.v)}`);
+}
+
+/** Validates a decrypted path map, which arrives as opaque JSON from inside the ciphertext. */
+export function parseFileEntries(value: unknown): Record<string, FileEntry> {
+  if (typeof value !== "object" || value === null) {
+    throw new Error("decrypted snapshot is not a path map");
+  }
+  for (const [path, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (!isFileEntry(entry)) throw new Error(`decrypted snapshot entry "${path}" is malformed`);
+  }
+  return value as Record<string, FileEntry>;
 }
 
 export interface VaultFile {

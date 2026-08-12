@@ -3,6 +3,7 @@ import {
   alwaysSkip,
   countInScope,
   globToRegExp,
+  isConfigCodePath,
   isConfigPath,
   makeExcluder,
   makeScopeFilter,
@@ -120,10 +121,14 @@ describe("alwaysSkip — hard self-excludes", () => {
     expect(alwaysSkip(".obsidian/workspace-mobile.json")).toBe(true);
   });
 
-  it("still allows other plugins and config files, which config-dir sync may want", () => {
-    expect(alwaysSkip(".obsidian/plugins/dataview/data.json")).toBe(false);
-    expect(alwaysSkip(".obsidian/themes/mytheme/theme.css")).toBe(false);
+  // Other plugins' folders and themes used to be allowed here, on the grounds that
+  // config-dir sync might want them. They are now hard-excluded: Obsidian executes that
+  // content, so syncing it hands every writer to this vault code execution on every device
+  // (and `plugins/<id>/data.json` is where other plugins keep their own credentials).
+  // Obsidian's own settings JSON — the thing the toggle is actually for — still syncs.
+  it("allows Obsidian's own settings files", () => {
     expect(alwaysSkip(".obsidian/hotkeys.json")).toBe(false);
+    expect(alwaysSkip(".obsidian/app.json")).toBe(false);
   });
 });
 
@@ -248,5 +253,55 @@ describe("makeScopeFilter", () => {
   it("counts what it keeps", () => {
     expect(countInScope(VAULT, { excludes: [".trash/**"], onlyPaths: [], syncConfigDir: false })).toBe(3);
     expect(countInScope([], { excludes: [], onlyPaths: [], syncConfigDir: false })).toBe(0);
+  });
+});
+
+describe("configuration-directory code is never synced", () => {
+  // Syncing `.obsidian` is opt-in, but the opt-in must not include code Obsidian executes:
+  // otherwise any writer to the vault — a plaintext server, or a device holding the master
+  // key — can drop a main.js that runs on every other device at the next reload.
+  it("hard-excludes plugins, themes and snippets whatever the toggle says", () => {
+    for (const path of [
+      ".obsidian/plugins/dataview/main.js",
+      ".obsidian/plugins/dataview/manifest.json",
+      ".obsidian/plugins/dataview/data.json",
+      ".obsidian/themes/Minimal/theme.css",
+      ".obsidian/snippets/tweaks.css",
+      ".obsidian/community-plugins.json",
+    ]) {
+      expect(alwaysSkip(path)).toBe(true);
+      expect(isConfigCodePath(path)).toBe(true);
+    }
+  });
+
+  it("still syncs Obsidian's own settings files", () => {
+    for (const path of [
+      ".obsidian/app.json",
+      ".obsidian/appearance.json",
+      ".obsidian/hotkeys.json",
+      ".obsidian/core-plugins.json",
+    ]) {
+      expect(alwaysSkip(path)).toBe(false);
+      expect(isConfigCodePath(path)).toBe(false);
+    }
+  });
+
+  it("covers a renamed config directory and the default one it left behind", () => {
+    expect(alwaysSkip(".config/plugins/x/main.js", ".config")).toBe(true);
+    expect(alwaysSkip(".obsidian/plugins/x/main.js", ".config")).toBe(true);
+    // A vault folder that merely happens to be called "plugins" is ordinary content.
+    expect(alwaysSkip("plugins/x/main.js", ".obsidian")).toBe(false);
+    expect(alwaysSkip("notes/themes/a.css", ".obsidian")).toBe(false);
+  });
+
+  it("keeps them out of scope even with syncConfigDir on and a matching allow-list", () => {
+    const inScope = makeScopeFilter({
+      excludes: [],
+      onlyPaths: [".obsidian/**"],
+      syncConfigDir: true,
+      configDir: ".obsidian",
+    });
+    expect(inScope(".obsidian/plugins/dataview/main.js")).toBe(false);
+    expect(inScope(".obsidian/app.json")).toBe(true);
   });
 });

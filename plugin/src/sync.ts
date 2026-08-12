@@ -1,5 +1,5 @@
 import { MissingBlobError, StaleHeadError } from "./api";
-import type { VaultCrypto } from "./crypto";
+import { manifestAad, type VaultCrypto } from "./crypto";
 import { sha256Hex } from "./hash";
 import {
   conflictPath,
@@ -32,6 +32,8 @@ import {
   type SyncState,
   type VaultAdapter,
   type VaultFile,
+  parseFileEntries,
+  isEncryptedManifest,
 } from "./types";
 
 export interface SyncApiLike {
@@ -284,6 +286,13 @@ export interface SyncPassOptions {
      */
     previewedHead: string | null;
   };
+  /**
+   * The head a forced push was previewed against. Same reasoning as `reroot.previewedHead`,
+   * for the same reason: the typed confirmation names how many remote files this pass leaves
+   * out, and a snapshot published since was never in that count. Absent means "not previewed"
+   * — an ordinary `keepLocal` pass, which merges nothing but also promised nothing.
+   */
+  previewedHead?: string | null;
 }
 
 /** What `forcePull` would do, so it can be shown before it is done. */
@@ -430,6 +439,7 @@ export class SyncEngine {
 
   async sync(opts: SyncPassOptions = {}): Promise<SyncResult> {
     const reroot = opts.reroot ?? null;
+    const previewedHead = opts.previewedHead;
     // Rerooting is a publish, so it carries the same refusal and the same non-merging shape
     // as a forced push: reconciling first would only be work the operator has overruled.
     const keepLocal = opts.keepLocal === true || reroot !== null;
@@ -448,7 +458,7 @@ export class SyncEngine {
     if (this.status.phase === "syncing") throw new Error("sync is already running");
     this.status = { phase: "syncing" };
     try {
-      return await this.#sync(keepLocal, reroot);
+      return await this.#sync(keepLocal, reroot, previewedHead);
     } catch (e) {
       if (e instanceof HaltError) return this.#halt(e.message);
       if (this.status.phase === "syncing") {
@@ -479,7 +489,8 @@ export class SyncEngine {
 
   async #sync(
     forceKeepLocal = false,
-    reroot: { previewedHead: string | null } | null = null
+    reroot: { previewedHead: string | null } | null = null,
+    previewedHead?: string | null
   ): Promise<SyncResult> {
     const loaded = this.#state ?? (await this.#store.load()) ?? {
       lastSyncedHead: null,
@@ -536,6 +547,15 @@ export class SyncEngine {
           `another device published ${serverHead ?? "an empty vault"} since this rebuild was ` +
             "previewed, so nothing was changed. Preview it again to see what rebuilding " +
             "would now discard."
+        );
+      }
+      // A forced push is pinned the same way. Only on the FIRST attempt: a CAS retry is this
+      // pass losing a race it should re-read, not the operator's preview going stale.
+      if (previewedHead !== undefined && casAttempt === 1 && serverHead !== previewedHead) {
+        throw new Error(
+          `another device published ${serverHead ?? "an empty vault"} since this push was ` +
+            "previewed, so nothing was published. Preview it again to see what it would now " +
+            "leave out."
         );
       }
 
@@ -970,13 +990,17 @@ export class SyncEngine {
   #modeError(remote: Manifest, head: string): string | null {
     if (isEmptyManifest(remote)) return null;
 
-    if (remote.v === 2 && this.#crypto === null) {
+    // Every encrypted version, not just v2. Missing this for v3 turned a wrong-key or
+    // no-key head into a generic AES failure deep in `#remoteFiles` instead of the sticky
+    // halt that names the problem and points at the setup link — and an unrecognised failure
+    // is retried automatically, forever.
+    if (isEncryptedManifest(remote) && this.#crypto === null) {
       return `remote snapshot at ${head} is encrypted, but no vault master key is set on this device. Add the key in settings before syncing.`;
     }
     if (remote.v === 1 && this.#crypto !== null) {
       return `remote snapshot at ${head} is unencrypted, but this device has encryption enabled. Committing would mix modes; reset the remote or clear the master key first.`;
     }
-    if (remote.v === 2 && this.#crypto !== null && remote.keyId !== this.#crypto.keyId) {
+    if (isEncryptedManifest(remote) && this.#crypto !== null && remote.keyId !== this.#crypto.keyId) {
       return `remote snapshot at ${head} was encrypted with a different master key (remote ${remote.keyId}, ours ${this.#crypto.keyId}). Sync would be unreadable; check the key before continuing.`;
     }
     return null;
@@ -985,7 +1009,26 @@ export class SyncEngine {
   async #remoteFiles(remote: Manifest): Promise<Record<string, FileEntry>> {
     if (remote.v === 1) return copyPathMap(remote.files);
     if (this.#crypto === null) throw new HaltError("remote is encrypted and no master key is set");
-    return copyPathMap(await this.#crypto.decryptJson<Record<string, FileEntry>>(remote.enc));
+    // v2 authenticates only the ciphertext; v3 authenticates the header it arrived in, so a
+    // spliced envelope fails here rather than being planned as ordinary remote edits.
+    const files = copyPathMap(
+      parseFileEntries(
+        await this.#crypto.decryptJson(remote.enc, remote.v === 3 ? manifestAad(remote) : undefined)
+      )
+    );
+    if (remote.v === 3) {
+      // The outer list is what the server verifies at commit and what GC treats as live.
+      // If it disagrees with what the entries actually reference, the two views of this
+      // snapshot are not the same snapshot.
+      const inner = new Set(Object.values(files).map(blobKey));
+      const outer = new Set(remote.blobs);
+      if (inner.size !== outer.size || [...inner].some((hash) => !outer.has(hash))) {
+        throw new HaltError(
+          `snapshot ${remote.id} lists ${outer.size} blob(s) but its entries reference ${inner.size}`
+        );
+      }
+    }
+    return files;
   }
 
   /**
@@ -1407,9 +1450,15 @@ export class SyncEngine {
    */
   async listHistory(limit: number): Promise<SnapshotInfo[]> {
     const out: SnapshotInfo[] = [];
+    const seen = new Set<string>();
     let id = await this.#api.getHead();
 
     while (id !== null && out.length < limit) {
+      // The server refuses to reuse a manifest id, so a repeat means history was corrupted
+      // around that rule. Stopping shows the readable prefix rather than listing the same
+      // snapshots over and over until the limit is reached.
+      if (seen.has(id)) break;
+      seen.add(id);
       let manifest: Manifest;
       try {
         manifest = await this.#api.getManifest(id);
@@ -1534,9 +1583,9 @@ export class SyncEngine {
    * *not* copied: by construction it holds no authored work, exactly the reasoning that lets
    * the merge's `take-theirs` overwrite silently.
    */
-  async forcePull(): Promise<ForcePullResult> {
+  async forcePull(previewedHead?: string): Promise<ForcePullResult> {
     return await this.#exclusive(async () => {
-      const plan = await this.#forcePullPlan();
+      const plan = await this.#forcePullPlan(previewedHead);
       // Sequential, not pooled: each candidate name is checked against the vault as it
       // stands, so a copy written by the previous iteration is already occupying its path.
       const parked: string[] = [];
@@ -1556,7 +1605,7 @@ export class SyncEngine {
     return { head, write, remove, park };
   }
 
-  async #forcePullPlan(): Promise<ForcePullPlan> {
+  async #forcePullPlan(previewedHead?: string): Promise<ForcePullPlan> {
     if (this.#mode === "push-only") {
       throw new Error(
         'sync direction is "push-only", so this device never writes local files — it cannot ' +
@@ -1566,6 +1615,14 @@ export class SyncEngine {
     const head = await this.#api.getHead();
     if (head === null) {
       throw new Error("the remote vault has no snapshot yet, so there is nothing to pull");
+    }
+    // The typed confirmation named a snapshot and counted its files. Writing a different one
+    // over this vault would be a destructive action nobody agreed to.
+    if (previewedHead !== undefined && head !== previewedHead) {
+      throw new Error(
+        `another device published ${head} since this pull was previewed, so nothing was ` +
+          "changed. Preview it again to see what it would now write over this vault."
+      );
     }
     const manifest = await this.#api.getManifest(head);
     const mismatch = this.#modeError(manifest, head);
@@ -1817,13 +1874,9 @@ export class SyncEngine {
       createdAt: new Date(this.#now()).toISOString(),
     };
     if (crypto === null) return { v: 1, ...common, files };
-    return {
-      v: 2,
-      ...common,
-      keyId: crypto.keyId,
-      blobs,
-      enc: await crypto.encryptJson(files),
-    };
+    // The envelope has to exist before the ciphertext can authenticate it.
+    const envelope = { v: 3 as const, ...common, keyId: crypto.keyId, blobs };
+    return { ...envelope, enc: await crypto.encryptJson(files, manifestAad(envelope)) };
   }
 
   async #uploadHash(

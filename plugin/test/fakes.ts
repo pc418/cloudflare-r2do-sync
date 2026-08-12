@@ -1,5 +1,5 @@
 import { sha256Hex } from "../src/hash";
-import { blobKey, type Manifest, type ManifestV1, type ManifestV2 } from "../src/types";
+import { blobKey, type Manifest, type ManifestV1, type ManifestV2, type ManifestV3 } from "../src/types";
 import type { StateStore, SyncState, VaultAdapter, VaultFile } from "../src/types";
 import { MissingBlobError, StaleHeadError } from "../src/api";
 import type { SyncApiLike } from "../src/sync";
@@ -181,12 +181,12 @@ export class FakeServer implements SyncApiLike {
   }
 
   /** Simulate another device committing an encrypted snapshot. */
-  seedRemoteEncryptedCommit(opts: { keyId: string; blobs?: string[] }): string {
+  seedRemoteEncryptedCommit(opts: { keyId: string; blobs?: string[]; v?: 2 | 3 }): string {
     const blobs = opts.blobs ?? ["c".repeat(64)];
     for (const b of blobs) this.blobs.set(b, new Uint8Array());
     const id = this.#nextId();
-    const m: ManifestV2 = {
-      v: 2,
+    const m: ManifestV2 | ManifestV3 = {
+      v: opts.v ?? 2,
       id,
       parent: this.head,
       device: "other-device",

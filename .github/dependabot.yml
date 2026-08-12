@@ -1,0 +1,22 @@
+version: 2
+
+# Actions are pinned to commit SHAs in the workflows, not tags: a tag is mutable, and both
+# workflows run with write permissions (release.yml also attests the published assets), so a
+# retagged third-party action would be running inside the job that signs this plugin.
+# Pinning without automated updates is how a build ends up years behind, so Dependabot keeps
+# the SHAs current and the trailing `# v7` comments readable.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: npm
+    directory: /plugin
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: npm
+    directory: /worker
+    schedule:
+      interval: weekly

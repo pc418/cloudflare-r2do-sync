@@ -61,25 +61,54 @@ export const encPayloadSchema = z
  * verify existence at commit and to trace liveness in GC) and an opaque ciphertext holding
  * the path→entry map. Paths, file contents, and plaintext hashes never reach the server.
  */
-export const manifestV2Schema = z
-  .object({
-    v: z.literal(2),
-    ...common,
-    keyId: z.string().regex(KEY_ID_RE, "keyId must be 16 lowercase hex chars"),
-    blobs: z.array(z.string().regex(HASH_RE, "blob must be a sha256 hex digest")).max(MAX_FILES),
-    enc: encPayloadSchema,
-  })
-  .strict();
+const encryptedShape = {
+  ...common,
+  keyId: z.string().regex(KEY_ID_RE, "keyId must be 16 lowercase hex chars"),
+  blobs: z.array(z.string().regex(HASH_RE, "blob must be a sha256 hex digest")).max(MAX_FILES),
+  enc: encPayloadSchema,
+};
 
-export const manifestSchema = z.discriminatedUnion("v", [manifestV1Schema, manifestV2Schema]);
+export const manifestV2Schema = z.object({ v: z.literal(2), ...encryptedShape }).strict();
+
+/**
+ * v3 is v2 on the wire. The difference is invisible here and deliberately so: the client
+ * additionally authenticates this envelope as AES-GCM associated data, so the fields the
+ * server reads (id, parent, device, createdAt, keyId, blobs) can no longer be swapped around
+ * a valid ciphertext by whoever holds an access token. The server cannot check that — it has
+ * no key — which is exactly why the version exists: a client must know to verify it.
+ */
+export const manifestV3Schema = z.object({ v: z.literal(3), ...encryptedShape }).strict();
+
+export const manifestSchema = z.discriminatedUnion("v", [
+  manifestV1Schema,
+  manifestV2Schema,
+  manifestV3Schema,
+]);
 
 export type ManifestV1 = z.infer<typeof manifestV1Schema>;
 export type ManifestV2 = z.infer<typeof manifestV2Schema>;
-export type Manifest = ManifestV1 | ManifestV2;
+export type ManifestV3 = z.infer<typeof manifestV3Schema>;
+export type Manifest = ManifestV1 | ManifestV2 | ManifestV3;
 
 /** R2 blob keys referenced by a snapshot, whichever version it is. */
 export function manifestHashes(m: Manifest): string[] {
   return m.v === 1 ? Object.values(m.files).map((f) => f.h) : m.blobs;
+}
+
+/**
+ * Deterministic serialization, used to decide whether re-committing the current head is a
+ * genuine retry or a different snapshot wearing an ID that is already taken. Object keys are
+ * sorted so a client that reorders its JSON still compares equal; array order is data (the
+ * blob list) and is preserved.
+ */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const obj = value as Record<string, unknown>;
+  return `{${Object.keys(obj)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`)
+    .join(",")}}`;
 }
 
 /** True when the snapshot holds no files — the only remote state a fresh device may adopt. */
@@ -120,7 +149,7 @@ export function validateManifest(data: unknown): ManifestValidation {
     m = { ...m, files };
   }
 
-  if (m.v === 2) {
+  if (m.v === 2 || m.v === 3) {
     // Duplicates would still work (callers dedupe), but they signal a broken client and
     // inflate the commit body, so reject rather than paper over.
     if (new Set(m.blobs).size !== m.blobs.length) {

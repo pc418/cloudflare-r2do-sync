@@ -32,8 +32,8 @@ export async function deployViaWrangler({
   // would also silently replace whatever session was already there.
   if (!account) {
     throw new SetupError(
-      "wrangler is not logged in. Run `npx wrangler login` yourself (or\n" +
-        "`npx wrangler logout && npx wrangler login` to switch accounts), then re-run setup."
+      "wrangler is not logged in. Run `./worker/node_modules/.bin/wrangler login` yourself (or\n" +
+        "`./worker/node_modules/.bin/wrangler logout && ./worker/node_modules/.bin/wrangler login` to switch accounts), then re-run setup."
     );
   }
 
@@ -42,7 +42,7 @@ export async function deployViaWrangler({
   log(renderAccountCheck({ account, scriptName: config.scriptName, bucket: config.bucket, conflict }));
   if (!assumeYes && !(await confirm("Deploy to this account?"))) {
     throw new SetupError(
-      "cancelled — switch accounts with `npx wrangler logout && npx wrangler login`, then re-run"
+      "cancelled — switch accounts with `./worker/node_modules/.bin/wrangler logout && ./worker/node_modules/.bin/wrangler login`, then re-run"
     );
   }
 

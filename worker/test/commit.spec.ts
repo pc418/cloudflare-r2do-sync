@@ -22,6 +22,25 @@ beforeEach(async () => {
 });
 
 describe("POST /api/commit", () => {
+  it("accepts a v3 snapshot, whose envelope the client authenticates", async () => {
+    // The server cannot verify the binding — it has no key. It accepts the version so that
+    // clients know to verify it; that is the whole point of a separate version number.
+    const h = await putBlob(token, "encrypted content");
+    const m = { ...makeManifestV2({ blobs: [h] }), v: 3 as const };
+    const res = await commit(token, m as never, null);
+    expect(res.status).toBe(200);
+
+    const stored = await env.VAULT.get(`manifests/${m.id}.json`);
+    const back: { v: number } = await stored!.json();
+    expect(back.v).toBe(3);
+  });
+
+  it("rejects a version it does not know", async () => {
+    const m = { ...makeManifestV2({ blobs: [] }), v: 4 };
+    const res = await commit(token, m as never, null);
+    expect(res.status).toBe(422);
+  });
+
   it("first commit on empty vault advances head, persists manifest, mirrors head.json", async () => {
     const h = await putBlob(token, "first note");
     const m = makeManifest({ files: { "a.md": { h } } });

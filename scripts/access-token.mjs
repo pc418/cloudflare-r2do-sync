@@ -8,6 +8,8 @@
 //   node scripts/access-token.mjs --rotate        issue a fresh one and revoke ALL others
 //   node scripts/access-token.mjs --revoke <id>   revoke one token
 //   node scripts/access-token.mjs --name phone    a separately revocable extra token
+//   node scripts/access-token.mjs --out tok.json  write the token to a 0600 file instead
+//   node scripts/access-token.mjs --print-token   print it even without a terminal
 //
 // There is nothing to manage per device: one access token authenticates the vault, and
 // every device can share it (that is what the setup QR does). Names are just labels.
@@ -25,13 +27,15 @@ import {
   renderSetupSummary,
   revokeAccessToken,
   rotateAccessToken,
+  tokenOutputPlan,
+  writeTokenHandoff,
 } from "./setup-lib.mjs";
 
 export { normalizeWorkerUrl };
 
-const USAGE = `usage: node scripts/access-token.mjs [--name <label>]
+const USAGE = `usage: node scripts/access-token.mjs [--name <label>] [--out <file>] [--print-token]
        node scripts/access-token.mjs --list
-       node scripts/access-token.mjs --rotate [--name <label>]
+       node scripts/access-token.mjs --rotate [--name <label>] [--out <file>]
        node scripts/access-token.mjs --revoke <token-id>`;
 
 /** WORKER_URL from the environment, else from `.env`. No default: guessing the wrong host
@@ -73,7 +77,7 @@ function summary(workerUrl, accessToken, name) {
 
 /** Pure argument parsing, so the CLI's shape is testable without a server. */
 export function parseAccessTokenArgs(argv) {
-  const opts = { mode: "issue", name: "vault", id: null };
+  const opts = { mode: "issue", name: "vault", id: null, out: null, printToken: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--list") opts.mode = "list";
@@ -85,6 +89,12 @@ export function parseAccessTokenArgs(argv) {
       const value = argv[++i];
       if (!value || value.startsWith("--")) throw new Error("--name needs a value");
       opts.name = value;
+    } else if (arg === "--out") {
+      const value = argv[++i];
+      if (!value || value.startsWith("--")) throw new Error("--out needs a file path");
+      opts.out = value;
+    } else if (arg === "--print-token") {
+      opts.printToken = true;
     } else {
       throw new Error(`unknown option "${arg}"`);
     }
@@ -101,6 +111,17 @@ async function main() {
     opts = parseAccessTokenArgs(process.argv.slice(2));
   } catch (error) {
     console.error(`${error.message}\n\n${USAGE}`);
+    process.exit(2);
+  }
+
+  // Decided before anything is minted: a token is returned exactly once, so refusing to
+  // hand it over afterwards would destroy a credential rather than protect it.
+  const output =
+    opts.mode === "list" || opts.mode === "revoke"
+      ? { kind: "stdout" }
+      : tokenOutputPlan({ isTty: Boolean(process.stdout.isTTY), out: opts.out, printToken: opts.printToken });
+  if (output.kind === "refuse") {
+    console.error(output.reason);
     process.exit(2);
   }
 
@@ -138,6 +159,16 @@ async function main() {
   if (revoked.length > 0) {
     console.log(`replaced ${revoked.length} active token(s): ${revoked.map((t) => t.name).join(", ")}`);
     console.log("Any device still holding an old token now fails to sync until it gets this one.");
+  }
+  if (output.kind === "file") {
+    const file = writeTokenHandoff(output.file, {
+      workerUrl: WORKER_URL,
+      accessToken: minted.token,
+      tokenId: minted.id,
+      tokenName: opts.name,
+    });
+    console.log(`access token written to ${file} (mode 0600). It is not printed here.`);
+    return;
   }
   console.log(summary(WORKER_URL, minted.token, opts.name));
 }

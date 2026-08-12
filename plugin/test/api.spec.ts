@@ -188,4 +188,103 @@ describe("SyncApi", () => {
     expect(calls[0].method).toBe("PUT");
     expect(JSON.parse(calls[0].body as string)).toEqual(doc);
   });
+
+  describe("fetched manifests are validated, not cast", () => {
+    const good = {
+      v: 1,
+      id: "01ABC",
+      parent: null,
+      device: "laptop",
+      createdAt: "2026-08-11T00:00:00.000Z",
+      files: { "a.md": { h: "a".repeat(64), size: 1, mtime: 2 } },
+    };
+
+    it("refuses a snapshot that is not the one that was asked for", async () => {
+      // The id is the only thing tying the answer to the request; without the check a
+      // server can serve an older snapshot for any id and the client plans it as current.
+      const { client } = fakeHttp(() => ({ status: 200, body: { ...good, id: "01OTHER" } }));
+      await expect(api(client).getManifest("01ABC")).rejects.toThrow(/01OTHER.*01ABC/);
+    });
+
+    it("refuses malformed documents before anything can plan writes from them", async () => {
+      for (const body of [
+        null,
+        { ...good, id: undefined },
+        { ...good, createdAt: undefined },
+        { ...good, parent: 7 },
+        { ...good, files: { "a.md": { h: "x", size: "big", mtime: 2 } } },
+        { ...good, v: 9 },
+        { v: 3, id: "01ABC", parent: null, device: "d", createdAt: "x", keyId: "k", blobs: ["nope"], enc: {} },
+      ]) {
+        const { client } = fakeHttp(() => ({ status: 200, body }));
+        await expect(api(client).getManifest("01ABC")).rejects.toThrow(/invalid manifest/);
+      }
+    });
+
+    it("accepts both encrypted versions", async () => {
+      const enc = { alg: "AES-GCM", iv: "AAAAAAAAAAAAAAAA", data: "ZmFrZQ==" };
+      for (const v of [2, 3]) {
+        const body = {
+          v,
+          id: "01ABC",
+          parent: null,
+          device: "laptop",
+          createdAt: "2026-08-11T00:00:00.000Z",
+          keyId: "0011223344556677",
+          blobs: ["b".repeat(64)],
+          enc,
+        };
+        const { client } = fakeHttp(() => ({ status: 200, body }));
+        expect((await api(client).getManifest("01ABC")).v).toBe(v);
+      }
+    });
+  });
+
+  describe("gc_busy", () => {
+    const busy = { status: 503, body: { error: { code: "gc_busy", message: "gc is running" } } };
+    const manifest = { v: 1 as const, id: "01ABC", parent: null, device: "d", createdAt: "", files: {} };
+    const retrying = (client: HttpClient, slept: number[]) =>
+      new SyncApi({
+        baseUrl: "https://vault.example/",
+        token: "dev-token",
+        http: client,
+        sleep: async (ms) => {
+          slept.push(ms);
+        },
+      });
+
+    it("retries the identical body until the sweep finishes", async () => {
+      let n = 0;
+      const slept: number[] = [];
+      const { client, calls } = fakeHttp(() =>
+        ++n < 3 ? busy : { status: 200, body: { head: "01ABC" } }
+      );
+      expect(await retrying(client, slept).commit(manifest, null)).toBe("01ABC");
+      expect(calls).toHaveLength(3);
+      // Rebuilding the snapshot would be wasted work: nothing about it was rejected.
+      expect(new Set(calls.map((c) => c.body as string)).size).toBe(1);
+      expect(slept).toEqual([2000, 2000]);
+    });
+
+    it("gives up loudly rather than waiting out an unbounded sweep", async () => {
+      const slept: number[] = [];
+      const { client, calls } = fakeHttp(() => busy);
+      await expect(retrying(client, slept).commit(manifest, null)).rejects.toMatchObject({
+        code: "gc_busy",
+      });
+      expect(calls).toHaveLength(4);
+    });
+
+    it("does not retry a duplicate id — that is history, not congestion", async () => {
+      const { client, calls } = fakeHttp(() => ({
+        status: 409,
+        body: { error: { code: "duplicate_manifest_id", message: "id already used" } },
+      }));
+      await expect(api(client).commit(manifest, null)).rejects.toMatchObject({
+        code: "duplicate_manifest_id",
+        status: 409,
+      });
+      expect(calls).toHaveLength(1);
+    });
+  });
 });

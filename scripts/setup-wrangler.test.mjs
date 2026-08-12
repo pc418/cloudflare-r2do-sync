@@ -170,7 +170,7 @@ test("a logged-out CLI stops with instructions instead of logging you in", async
 
   await assert.rejects(
     deployViaWrangler({ ...base({ account: null }), run: w.run }),
-    (error) => error instanceof SetupError && /npx wrangler login/.test(error.message)
+    (error) => error instanceof SetupError && /node_modules\/\.bin\/wrangler login/.test(error.message)
   );
   assert.deepEqual(w.commands(), []);
 });

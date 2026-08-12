@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
-import { VaultLock } from "./vault-lock";
+import { ALL_SCOPES, VaultLock, isTokenScope, type TokenScope } from "./vault-lock";
 import { checkBlobs, getBlob, putBlob } from "./blobs";
 import { runGc } from "./gc";
 import { ULID_RE } from "./manifest";
@@ -19,7 +19,7 @@ export interface Env {
   ADMIN_TOKEN: string;
 }
 
-type AppEnv = { Bindings: Env; Variables: { tokenId: string } };
+type AppEnv = { Bindings: Env; Variables: { tokenId: string; scopes: TokenScope[] } };
 
 const app = new Hono<AppEnv>();
 
@@ -45,8 +45,9 @@ const vault = (env: Env) => env.VAULT_LOCK.getByName("default");
 const SETTINGS_PUT_ATTEMPTS = 5;
 
 type SettingsPutResult =
-  | { ok: true }
-  | { ok: false; code: "vault_salt_conflict" | "write_contended" };
+  | { ok: true; rev: number }
+  | { ok: false; code: "vault_salt_conflict" | "write_contended" }
+  | { ok: false; code: "stale_revision"; rev: number };
 
 /**
  * Keep ordinary settings last-writer-wins while making vaultSalt write-once.
@@ -70,10 +71,22 @@ async function putSettings(env: Env, incoming: SettingsDoc): Promise<SettingsPut
       return { ok: false, code: "vault_salt_conflict" };
     }
 
-    const next =
-      existing?.vaultSalt !== undefined && incoming.vaultSalt === undefined
-        ? { ...incoming, vaultSalt: existing.vaultSalt }
-        : incoming;
+    // Compare-and-set on the revision. A client that sends one is saying which document it
+    // is replacing, so a replayed or stale payload is refused instead of overwriting a
+    // newer policy. A client that sends none predates the rule and is stamped in sequence.
+    const currentRev = existing?.rev ?? 0;
+    if (incoming.rev !== undefined && incoming.rev !== currentRev + 1) {
+      return { ok: false, code: "stale_revision", rev: currentRev };
+    }
+    const rev = currentRev + 1;
+
+    const next = {
+      ...incoming,
+      rev,
+      ...(existing?.vaultSalt !== undefined && incoming.vaultSalt === undefined
+        ? { vaultSalt: existing.vaultSalt }
+        : {}),
+    };
     const written = await env.VAULT.put(SETTINGS_KEY, JSON.stringify(next), {
       httpMetadata: { contentType: "application/json" },
       onlyIf:
@@ -81,7 +94,7 @@ async function putSettings(env: Env, incoming: SettingsDoc): Promise<SettingsPut
           ? { etagDoesNotMatch: "*" }
           : { etagMatches: existingObj.etag },
     });
-    if (written !== null) return { ok: true };
+    if (written !== null) return { ok: true, rev };
   }
   return { ok: false, code: "write_contended" };
 }
@@ -95,8 +108,8 @@ const adminAuth = async (c: Context<AppEnv>, next: () => Promise<void>) => {
   if (token === null) return c.json(errJson("unauthorized", "missing bearer token"), 401);
   if (!timingSafeEqualStr(token, c.env.ADMIN_TOKEN)) {
     // A valid *access* token on an admin route is a role violation, not a bad login.
-    const tokenId = await vault(c.env).verifyToken(token);
-    if (tokenId !== null) return c.json(errJson("forbidden", "access tokens cannot administer tokens"), 403);
+    const verified = await vault(c.env).verifyToken(token);
+    if (verified !== null) return c.json(errJson("forbidden", "access tokens cannot administer tokens"), 403);
     return c.json(errJson("unauthorized", "invalid token"), 401);
   }
   await next();
@@ -113,11 +126,34 @@ app.post("/api/tokens", adminAuth, async (c) => {
   } catch {
     return c.json(errJson("bad_json", "request body must be JSON"), 400);
   }
-  const name = (body as { name?: unknown })?.name;
+  const { name, scopes, expiresAt } = (body ?? {}) as {
+    name?: unknown;
+    scopes?: unknown;
+    expiresAt?: unknown;
+  };
   if (typeof name !== "string" || name.length === 0 || name.length > 64) {
     return c.json(errJson("invalid_name", "name must be a 1-64 char string"), 422);
   }
-  const token = await vault(c.env).mintToken(name);
+  if (scopes !== undefined) {
+    if (!Array.isArray(scopes) || !scopes.every(isTokenScope)) {
+      return c.json(
+        errJson("invalid_scopes", `scopes must be an array drawn from ${ALL_SCOPES.join(", ")}`),
+        422
+      );
+    }
+    // An empty array reads as "no authority" and used to be silently upgraded to full. A
+    // token that cannot sync cannot do anything, so refuse rather than mint a useless or
+    // surprisingly powerful credential.
+    if (!scopes.includes("sync")) {
+      return c.json(errJson("invalid_scopes", 'scopes must include "sync"'), 422);
+    }
+  }
+  if (expiresAt !== undefined && expiresAt !== null) {
+    if (typeof expiresAt !== "string" || Number.isNaN(Date.parse(expiresAt))) {
+      return c.json(errJson("invalid_expiry", "expiresAt must be an ISO date string or null"), 422);
+    }
+  }
+  const token = await vault(c.env).mintToken(name, { scopes, expiresAt: expiresAt ?? null });
   return c.json(token, 201);
 });
 
@@ -132,9 +168,18 @@ app.delete("/api/tokens/:id", adminAuth, async (c) => {
 const accessAuth = async (c: Context<AppEnv>, next: () => Promise<void>) => {
   const token = bearer(c);
   if (token === null) return c.json(errJson("unauthorized", "missing bearer token"), 401);
-  const tokenId = await vault(c.env).verifyToken(token);
-  if (tokenId === null) return c.json(errJson("unauthorized", "invalid or revoked token"), 401);
-  c.set("tokenId", tokenId);
+  const verified = await vault(c.env).verifyToken(token);
+  if (verified === null) {
+    return c.json(errJson("unauthorized", "invalid, revoked, or expired token"), 401);
+  }
+  // Every vault route needs `sync`. Without this the scope split was decorative: a token
+  // issued for something else still read and wrote the whole vault, because only the reroot
+  // branch ever looked at scopes.
+  if (!verified.scopes.includes("sync")) {
+    return c.json(errJson("forbidden", "this access token may not read or write the vault"), 403);
+  }
+  c.set("tokenId", verified.id);
+  c.set("scopes", verified.scopes);
   await next();
 };
 
@@ -180,9 +225,15 @@ app.put("/api/settings", accessAuth, async (c) => {
         409
       );
     }
+    if (result.code === "stale_revision") {
+      return c.json(
+        errJson("stale_revision", "settings moved; re-read them and write again", { rev: result.rev }),
+        409
+      );
+    }
     return c.json(errJson("write_contended", "settings changed repeatedly; retry the request"), 503);
   }
-  return c.json({ ok: true });
+  return c.json({ ok: true, rev: result.rev });
 });
 
 app.post("/api/blobs/check", accessAuth, async (c) => {
@@ -232,6 +283,14 @@ app.post("/api/commit", accessAuth, async (c) => {
   if (reroot !== undefined && typeof reroot !== "boolean") {
     return c.json(errJson("invalid_reroot", "reroot must be a boolean"), 422);
   }
+  // Rerooting is the only operation that makes remote content stop existing, so it is the
+  // one thing a token can be issued without. Checked before the DO is asked to do anything.
+  if (reroot === true && !c.get("scopes").includes("reroot")) {
+    return c.json(
+      errJson("forbidden", "this access token may sync but not rebuild remote history"),
+      403
+    );
+  }
   const result = await vault(c.env).commit(manifest, expectedHead, { reroot: reroot === true });
   if (result.ok) return c.json({ head: result.head });
   switch (result.code) {
@@ -239,6 +298,13 @@ app.post("/api/commit", accessAuth, async (c) => {
       return c.json(errJson("stale_head", "head moved; pull, merge, and re-commit", { head: result.head }), 409);
     case "missing_blob":
       return c.json(errJson("missing_blob", "upload missing blobs first", { hashes: result.hashes }), 422);
+    case "duplicate_manifest_id":
+      // 409, not 422: the body is well-formed, it collides with history that already exists.
+      return c.json(errJson("duplicate_manifest_id", result.message), 409);
+    case "gc_busy":
+      // Transient and entirely the server's doing, so it is advertised as retryable rather
+      // than surfaced to the user as a failed sync.
+      return c.json(errJson("gc_busy", result.message), 503, { "retry-after": "5" });
     case "invalid_manifest":
       return c.json(errJson("invalid_manifest", result.message), 422);
   }

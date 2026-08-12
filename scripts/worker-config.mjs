@@ -65,11 +65,39 @@ export function loadWorkerDeployConfig(
   return parseWorkerDeployConfig(readFileSync(configPath, "utf8"));
 }
 
-/** GET distinguishes an existing bucket from authorization/server failures before POST. */
-export async function ensureR2Bucket(cf, bucket) {
+/**
+ * Identifies "the bucket this deployment created" for one account. The bucket name is a
+ * static string in `wrangler.jsonc`, so on any account that happens to already have a bucket
+ * by that name, the old preflight silently adopted it — pointing this Worker's vault, GC
+ * included, at storage it never provisioned. The claim is recorded per account because the
+ * same name on a different account is a different bucket.
+ */
+export function bucketOwnershipClaim(accountId, bucket) {
+  return `${accountId}:${bucket}`;
+}
+
+/**
+ * GET distinguishes an existing bucket from authorization/server failures before POST.
+ *
+ * An absent bucket is created and claimed. An existing one is used only when this repo's
+ * `.env` already claims it (an ordinary redeploy) or the operator adopts it explicitly —
+ * never merely because the name matched.
+ */
+export async function ensureR2Bucket(cf, bucket, { accountId = null, owned = null, adopt = false } = {}) {
+  const claim = accountId === null ? null : bucketOwnershipClaim(accountId, bucket);
   const pathName = `/r2/buckets/${encodeURIComponent(bucket)}`;
   const found = await cf(pathName);
-  if (found.status === 200) return "existing";
+  if (found.status === 200) {
+    // `accountId === null` keeps the old unconditional behaviour for callers that have not
+    // opted into ownership tracking, so this cannot silently break an embedding script.
+    if (claim === null || adopt || owned === claim) return { status: "existing", claim };
+    throw new Error(
+      `R2 bucket "${bucket}" already exists on this account and this checkout has no record of\n` +
+        "creating it. Deploying would point the vault at storage it did not provision — and GC\n" +
+        "deletes objects in it. If it really is yours, re-run with --adopt-bucket; otherwise\n" +
+        'change "bucket_name" in worker/wrangler.jsonc.'
+    );
+  }
   if (found.status !== 404) {
     throw new Error(`bucket preflight failed with HTTP ${found.status}: ${JSON.stringify(found.body)}`);
   }
@@ -82,5 +110,5 @@ export async function ensureR2Bucket(cf, bucket) {
   if (created.status !== 200) {
     throw new Error(`bucket create failed with HTTP ${created.status}: ${JSON.stringify(created.body)}`);
   }
-  return "created";
+  return { status: "created", claim };
 }

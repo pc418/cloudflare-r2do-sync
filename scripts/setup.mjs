@@ -25,6 +25,8 @@ import {
   mintOrReplaceAccessToken,
   normalizeWorkerUrl,
   parseSetupArgs,
+  tokenOutputPlan,
+  writeTokenHandoff,
   parseWranglerAccount,
   renderSetupSummary,
   resolveAuthPath,
@@ -47,8 +49,19 @@ const LOCAL_WRANGLER = path.join(WORKER_DIR, "node_modules", ".bin", "wrangler")
 
 /** Runs wrangler and returns its output. `check: false` lets a caller inspect a failure. */
 function wrangler(args, { input, check = true, quiet = false } = {}) {
-  const local = existsSync(LOCAL_WRANGLER);
-  const res = spawnSync(local ? LOCAL_WRANGLER : "npx", local ? args : ["--yes", "wrangler@4", ...args], {
+  // Fails closed rather than falling back to `npx --yes wrangler@4`. That fallback would
+  // download and execute whatever the registry currently serves for a mutable major-version
+  // range — code handed the user's Cloudflare session, on the machine that deploys this
+  // Worker — and it did it silently, so nobody could tell which wrangler had run.
+  if (!existsSync(LOCAL_WRANGLER)) {
+    die(
+      "wrangler is not installed. Run `npm ci --prefix worker` and try again.\n" +
+        "  Setup deliberately will not fetch it on the fly: the pinned devDependency is the\n" +
+        "  only version this repo has been tested against, and it is the one that gets your\n" +
+        "  Cloudflare credentials."
+    );
+  }
+  const res = spawnSync(LOCAL_WRANGLER, args, {
     cwd: WORKER_DIR,
     input,
     encoding: "utf8",
@@ -104,11 +117,37 @@ try {
 }
 console.log(`\nDeploy path: ${auth.path} — ${auth.reason}\n`);
 
+// Decided here, before the deploy and before any token is minted or replaced. Issuing runs
+// through `mintOrReplaceAccessToken`, which REVOKES the previous token of that name — so
+// discovering afterwards that stdout is unsafe would have destroyed a working credential and
+// created a replacement the caller never receives. A token is returned exactly once.
+const output = tokenOutputPlan({
+  isTty: Boolean(process.stdout.isTTY),
+  out: opts.out,
+  printToken: opts.printToken,
+});
+if (output.kind === "refuse") {
+  die(
+    `${output.reason}\n` +
+      "  Nothing was deployed and no token was changed."
+  );
+}
+
 let deployment;
 try {
   if (auth.path === "token") {
     const { deployViaRest } = await import("./deploy.mjs");
-    deployment = await deployViaRest();
+    // The same courtesy the wrangler path has always had: say which account, worker and
+    // bucket are about to be provisioned, and let the user stop.
+    deployment = await deployViaRest({
+      adoptBucket: opts.adoptBucket,
+      confirm: opts.assumeYes
+        ? null
+        : async (text) => {
+            console.log(text);
+            return confirm("Deploy to this target?");
+          },
+    });
   } else {
     deployment = await deployViaWrangler({
       config,
@@ -136,7 +175,14 @@ console.log(`worker live at ${workerUrl}`);
 
 // The admin credential is script-plumbing, not something the user stores: keep it in
 // ./.env (gitignored) so access-token.mjs and the next setup run work with no copying.
-upsertEnvFile(ROOT, { WORKER_URL: workerUrl, ADMIN_TOKEN: deployment.adminToken });
+// The bucket claim records that this checkout provisioned that storage. Without it the next
+// REST run finds an existing, unclaimed bucket of the configured name and refuses to
+// continue — the adoption guard firing on the very deploy that created it.
+upsertEnvFile(ROOT, {
+  WORKER_URL: workerUrl,
+  ADMIN_TOKEN: deployment.adminToken,
+  ...(deployment.bucketClaim ? { VAULT_BUCKET_OWNED: deployment.bucketClaim } : {}),
+});
 console.log(
   deployment.adminTokenKept
     ? "admin credential unchanged — ./.env refreshed (WORKER_URL, ADMIN_TOKEN)"
@@ -165,10 +211,20 @@ for (let attempt = 1; issued === null; attempt++) {
   }
 }
 
-console.log(
-  renderSetupSummary({
+if (output.kind === "file") {
+  const file = writeTokenHandoff(output.file, {
     workerUrl,
     accessToken: issued.minted.token,
+    tokenId: issued.minted.id,
     tokenName: opts.tokenName,
-  })
-);
+  });
+  console.log(`\nSetup complete. Access token written to ${file} (mode 0600), not printed here.`);
+} else {
+  console.log(
+    renderSetupSummary({
+      workerUrl,
+      accessToken: issued.minted.token,
+      tokenName: opts.tokenName,
+    })
+  );
+}

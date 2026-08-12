@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  ROOT,
   parseSetupArgs,
   parseWranglerAccount,
+  tokenOutputPlan,
+  writeTokenHandoff,
+  renderRestDeployCheck,
   renderAccountCheck,
   renderSetupSummary,
   resolveAuthPath,
@@ -16,6 +20,56 @@ import {
   waitForHealth,
 } from "./setup-lib.mjs";
 
+// --- token handoff -----------------------------------------------------------
+
+test("a terminal prints the token; a pipe refuses unless told where to put it", () => {
+  // The credential is vault-wide and returned exactly once, so the refusal has to be
+  // available BEFORE minting — which is why this is a pure decision, not a print guard.
+  assert.equal(tokenOutputPlan({ isTty: true }).kind, "stdout");
+  assert.equal(tokenOutputPlan({ isTty: false }).kind, "refuse");
+  assert.match(tokenOutputPlan({ isTty: false }).reason, /--out/);
+  assert.equal(tokenOutputPlan({ isTty: false, printToken: true }).kind, "stdout");
+
+  const explicit = tokenOutputPlan({ isTty: false, out: "tok.json" });
+  assert.equal(explicit.kind, "file");
+  assert.equal(explicit.file, "tok.json");
+  // An explicit file wins even on a terminal: automation asked for a file, not a screen.
+  assert.equal(tokenOutputPlan({ isTty: true, out: "tok.json" }).kind, "file");
+});
+
+test("the token handoff file is written owner-only, even over a permissive existing file", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "setup-lib-tok-"));
+  const file = path.join(root, "token.json");
+  writeFileSync(file, "{}\n");
+  chmodSync(file, 0o644);
+
+  writeTokenHandoff(file, { workerUrl: "https://x.test", accessToken: "secret-token" });
+
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).accessToken, "secret-token");
+});
+
+test("setup decides where the token may go before it mutates anything", () => {
+  // Ordering, not wording. `mintOrReplaceAccessToken` REVOKES the previous token of that
+  // name, and a token is returned exactly once — so learning after the fact that stdout is a
+  // CI log would have destroyed a working credential and issued a replacement into a void.
+  const source = readFileSync(path.join(ROOT, "scripts", "setup.mjs"), "utf8");
+  const decides = source.indexOf("tokenOutputPlan({");
+  const deploys = source.indexOf("deployViaRest({");
+  const mints = source.indexOf("mintOrReplaceAccessToken({");
+
+  assert.ok(decides > 0 && deploys > 0 && mints > 0, "expected all three call sites");
+  assert.ok(decides < deploys, "output eligibility must be decided before deploying");
+  assert.ok(decides < mints, "output eligibility must be decided before minting a token");
+});
+
+test("a REST setup records the bucket it provisioned, so the next run is not blocked", () => {
+  // deployViaRest() returns the claim; dropping it makes the adoption guard fire on the very
+  // deploy that created the bucket.
+  const source = readFileSync(path.join(ROOT, "scripts", "setup.mjs"), "utf8");
+  assert.match(source, /VAULT_BUCKET_OWNED: deployment\.bucketClaim/);
+});
+
 // --- argument parsing --------------------------------------------------------
 
 test("setup args default to auto-detected auth and the shared token name", () => {
@@ -24,6 +78,9 @@ test("setup args default to auto-detected auth and the shared token name", () =>
     tokenName: "vault",
     assumeYes: false,
     help: false,
+    out: null,
+    printToken: false,
+    adoptBucket: false,
   });
 });
 
@@ -40,6 +97,27 @@ test("contradictory or malformed setup args fail instead of guessing", () => {
   assert.throws(() => parseSetupArgs(["--name", "--yes"]), /needs a value/);
   assert.throws(() => parseSetupArgs(["--deploy"]), /unknown option/);
   assert.throws(() => parseSetupArgs(["--relogin"]), /unknown option/);
+});
+
+test("the REST deploy check names the target without printing the whole account id", () => {
+  const text = renderRestDeployCheck({
+    accountId: "0123456789abcdef0123456789abcdef",
+    scriptName: "obsidian-log-sync",
+    bucket: "obsidian-log-sync",
+    bucketOwned: false,
+  });
+  assert.match(text, /01234567…/);
+  assert.doesNotMatch(text, /0123456789abcdef0123456789abcdef/);
+  assert.match(text, /obsidian-log-sync/);
+  assert.match(text, /stop rather than adopt it/);
+
+  const redeploy = renderRestDeployCheck({
+    accountId: "0123456789abcdef0123456789abcdef",
+    scriptName: "obsidian-log-sync",
+    bucket: "obsidian-log-sync",
+    bucketOwned: true,
+  });
+  assert.match(redeploy, /created by this checkout/);
 });
 
 // --- which account gets the worker -------------------------------------------
@@ -126,7 +204,7 @@ test("the account check offers the way out of a wrong login", () => {
   });
   assert.match(text, /user@example\.com/);
   // The way out is a command the user runs; setup never changes the login itself.
-  assert.match(text, /wrangler logout && npx wrangler login/);
+  assert.match(text, /wrangler logout && \.\/worker\/node_modules\/\.bin\/wrangler login/);
   assert.doesNotMatch(text, /--relogin/);
   assert.match(text, /CLOUDFLARE_TOKEN is configured/);
 });
@@ -353,6 +431,23 @@ test("upserting .env creates the file when there is none", () => {
     readFileSync(path.join(root, ".env"), "utf8"),
     "WORKER_URL=https://fresh.example.com\nADMIN_TOKEN=admin-value\n"
   );
+  assert.equal(statSync(path.join(root, ".env")).mode & 0o777, 0o600);
+});
+
+test("upserting .env tightens the permissions of a file that already existed", () => {
+  // `mode:` on writeFileSync only applies at CREATION. An .env left world-readable by an
+  // editor, or copied from .env.example, keeps 0644 — and this function is what writes the
+  // admin token and a vault-wide access token into it.
+  const root = mkdtempSync(path.join(tmpdir(), "setup-lib-env-"));
+  const file = path.join(root, ".env");
+  writeFileSync(file, "CLOUDFLARE_TOKEN=cf-secret\n", { mode: 0o644 });
+  chmodSync(file, 0o644);
+  assert.equal(statSync(file).mode & 0o777, 0o644);
+
+  upsertEnvFile(root, { ADMIN_TOKEN: "admin-value" });
+
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.match(readFileSync(file, "utf8"), /^CLOUDFLARE_TOKEN=cf-secret$/m);
 });
 
 // --- the output the whole script exists to print -----------------------------

@@ -9,8 +9,10 @@ import {
   fromBase64,
   generateMasterKey,
   generateVaultSalt,
+  manifestAad,
   parseMasterKey,
   parseVaultSalt,
+  settingsAad,
   toBase64,
 } from "../src/crypto";
 import { sha256Hex } from "../src/hash";
@@ -302,5 +304,65 @@ describe("settings document encryption", () => {
     await expect(c.decryptSettingsJson(await c.encryptJson(policy))).rejects.toThrow(
       /failed authentication/
     );
+  });
+});
+
+describe("envelope authentication (AAD)", () => {
+  const envelope = {
+    v: 3,
+    id: "01JJJJJJJJJJJJJJJJJJJJJJJJ",
+    parent: null,
+    device: "laptop",
+    createdAt: "2026-08-11T00:00:00.000Z",
+    keyId: "0011223344556677",
+    blobs: ["a".repeat(64)],
+  };
+
+  it("refuses a payload lifted into a different header", async () => {
+    // The whole attack the version exists to stop: a bearer token can read a valid snapshot
+    // and re-post its ciphertext under a new id and parent. Without AAD a correct-key device
+    // accepts that as a genuine snapshot and rolls files back as ordinary remote edits.
+    const c = await VaultCrypto.create(new Uint8Array(32).fill(7));
+    const enc = await c.encryptJson({ "a.md": { h: "x", size: 1, mtime: 1 } }, manifestAad(envelope));
+
+    await expect(c.decryptJson(enc, manifestAad(envelope))).resolves.toBeDefined();
+
+    for (const spliced of [
+      { ...envelope, id: "01KKKKKKKKKKKKKKKKKKKKKKKK" },
+      { ...envelope, parent: "01KKKKKKKKKKKKKKKKKKKKKKKK" },
+      { ...envelope, device: "someone-else" },
+      { ...envelope, createdAt: "2030-01-01T00:00:00.000Z" },
+      { ...envelope, keyId: "7766554433221100" },
+      { ...envelope, blobs: ["b".repeat(64)] },
+      { ...envelope, v: 2 },
+    ]) {
+      await expect(c.decryptJson(enc, manifestAad(spliced))).rejects.toThrow(/altered header/);
+    }
+  });
+
+  it("does not accept an unbound payload where a bound one is required, or the reverse", async () => {
+    const c = await VaultCrypto.create(new Uint8Array(32).fill(9));
+    const bound = await c.encryptJson({ ok: true }, manifestAad(envelope));
+    const unbound = await c.encryptJson({ ok: true });
+
+    await expect(c.decryptJson(bound)).rejects.toThrow(/failed authentication/);
+    await expect(c.decryptJson(unbound, manifestAad(envelope))).rejects.toThrow(/failed authentication/);
+  });
+
+  it("binds the settings document to its revision, so an old one cannot be replayed", async () => {
+    const c = await VaultCrypto.create(new Uint8Array(32).fill(3));
+    const at = (rev: number) => settingsAad({ v: 3, rev, device: "laptop", keyId: c.keyId });
+    const enc = await c.encryptSettingsJson({ protectPercent: 50 }, at(4));
+
+    await expect(c.decryptSettingsJson(enc, at(4))).resolves.toBeDefined();
+    await expect(c.decryptSettingsJson(enc, at(9))).rejects.toThrow(/altered header/);
+  });
+
+  it("keeps the manifest and settings domains apart", async () => {
+    const c = await VaultCrypto.create(new Uint8Array(32).fill(5));
+    const aad = manifestAad(envelope);
+    const enc = await c.encryptJson({ x: 1 }, aad);
+    // Different derived key AND a different domain string: neither half is load-bearing alone.
+    await expect(c.decryptSettingsJson(enc, aad)).rejects.toThrow(/failed authentication/);
   });
 });

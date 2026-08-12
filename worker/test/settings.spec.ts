@@ -28,6 +28,11 @@ function encDoc(overrides: Record<string, unknown> = {}): Record<string, unknown
   };
 }
 
+/** What the server stores: the document as sent, plus the revision it assigned. */
+function stored(doc: Record<string, unknown>, rev: number): Record<string, unknown> {
+  return { ...doc, rev };
+}
+
 async function put(token: string, body: unknown): Promise<Response> {
   return SELF.fetch(
     URL,
@@ -38,6 +43,58 @@ async function put(token: string, body: unknown): Promise<Response> {
     })
   );
 }
+
+describe("settings revisions", () => {
+  // A device clock used to decide last-writer-wins, so one far-future `updatedAt` — skew, or
+  // a replayed capture — made every honest later write look older and be ignored forever.
+  it("assigns a monotonic revision the client does not choose", async () => {
+    const { token } = await mintToken();
+    expect(await (await put(token, plainDoc({ rev: 1 }))).json()).toMatchObject({ rev: 1 });
+    expect(await (await put(token, plainDoc({ rev: 2, device: "phone" }))).json()).toMatchObject({ rev: 2 });
+
+    // ...and a far-future clock buys nothing, because ordering is no longer the clock's job.
+    const stamped: { rev: number; updatedAt: number } = await (
+      await SELF.fetch(URL, authed(token))
+    ).json();
+    expect(stamped.rev).toBe(2);
+  });
+
+  it("refuses a write aimed at a revision that is no longer current", async () => {
+    const { token } = await mintToken();
+    expect((await put(token, plainDoc({ rev: 1 }))).status).toBe(200);
+
+    // Replaying the same document, or any write claiming to replace revision 0, is refused.
+    const res = await put(token, plainDoc({ rev: 1, device: "impostor" }));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: { code: "stale_revision" }, rev: 1 });
+
+    const current: { device: string } = await (await SELF.fetch(URL, authed(token))).json();
+    expect(current.device).toBe("laptop");
+  });
+
+  it("still accepts a client that predates revisions, and stamps it in sequence", async () => {
+    const { token } = await mintToken();
+    expect((await put(token, plainDoc())).status).toBe(200);
+    const res = await put(token, plainDoc({ device: "old-build" }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ rev: 2 });
+  });
+
+  it("refuses a v3 document with no revision — the server cannot choose one it authenticates", async () => {
+    // `rev` is inside v3's AAD. Stamping one server-side would store a document that no
+    // device can decrypt, so an absent revision is rejected rather than filled in.
+    const { token } = await mintToken();
+    const res = await put(token, encDoc({ v: 3 }));
+    expect(res.status).toBe(422);
+  });
+
+  it("accepts a v3 document, whose ciphertext also authenticates its revision", async () => {
+    const { token } = await mintToken();
+    const res = await put(token, encDoc({ v: 3, rev: 1 }));
+    expect(res.status).toBe(200);
+    expect(await (await SELF.fetch(URL, authed(token))).json()).toMatchObject({ v: 3, rev: 1 });
+  });
+});
 
 describe("shared settings document", () => {
   it("requires an access token on both verbs", async () => {
@@ -59,7 +116,7 @@ describe("shared settings document", () => {
     expect((await put(token, doc)).status).toBe(200);
     const res = await SELF.fetch(URL, authed(token));
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual(doc);
+    expect(await res.json()).toEqual(stored(doc, 1));
   });
 
   it("round-trips an encrypted (v2) document", async () => {
@@ -67,18 +124,18 @@ describe("shared settings document", () => {
     const doc = encDoc();
     expect((await put(token, doc)).status).toBe(200);
     const res = await SELF.fetch(URL, authed(token));
-    expect(await res.json()).toEqual(doc);
+    expect(await res.json()).toEqual(stored(doc, 1));
   });
 
   it("accepts a public vault salt on both document versions", async () => {
     const { token } = await mintToken();
     const v1 = plainDoc({ vaultSalt: VAULT_SALT });
     expect((await put(token, v1)).status).toBe(200);
-    expect(await (await SELF.fetch(URL, authed(token))).json()).toEqual(v1);
+    expect(await (await SELF.fetch(URL, authed(token))).json()).toEqual(stored(v1, 1));
 
     const v2 = encDoc({ updatedAt: 1_754_000_000_001, vaultSalt: VAULT_SALT });
     expect((await put(token, v2)).status).toBe(200);
-    expect(await (await SELF.fetch(URL, authed(token))).json()).toEqual(v2);
+    expect(await (await SELF.fetch(URL, authed(token))).json()).toEqual(stored(v2, 2));
   });
 
   it("establishes a vault salt once and preserves it when later writes omit it", async () => {
@@ -87,10 +144,9 @@ describe("shared settings document", () => {
 
     const replacement = encDoc({ updatedAt: 1_754_000_000_002, device: "phone" });
     expect((await put(token, replacement)).status).toBe(200);
-    expect(await (await SELF.fetch(URL, authed(token))).json()).toEqual({
-      ...replacement,
-      vaultSalt: VAULT_SALT,
-    });
+    expect(await (await SELF.fetch(URL, authed(token))).json()).toEqual(
+      stored({ ...replacement, vaultSalt: VAULT_SALT }, 2)
+    );
   });
 
   it("allows a valid vault salt to be established after saltless settings", async () => {
@@ -99,7 +155,7 @@ describe("shared settings document", () => {
 
     const replacement = plainDoc({ updatedAt: 2, device: "phone", vaultSalt: VAULT_SALT });
     expect((await put(token, replacement)).status).toBe(200);
-    expect(await (await SELF.fetch(URL, authed(token))).json()).toEqual(replacement);
+    expect(await (await SELF.fetch(URL, authed(token))).json()).toEqual(stored(replacement, 2));
   });
 
   it("rejects replacing an established vault salt without changing the document", async () => {
@@ -115,7 +171,7 @@ describe("shared settings document", () => {
         message: "vaultSalt is already established and cannot be changed",
       },
     });
-    expect(await (await SELF.fetch(URL, authed(token))).json()).toEqual(original);
+    expect(await (await SELF.fetch(URL, authed(token))).json()).toEqual(stored(original, 1));
   });
 
   it("allows only one salt to win concurrent first writes", async () => {

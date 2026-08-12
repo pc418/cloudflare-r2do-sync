@@ -1,11 +1,5 @@
 import { describe, it, expect } from "vitest";
-import {
-  VaultCrypto,
-  deriveMasterKeyFromPassphrase,
-  generateMasterKey,
-  parseMasterKey,
-  toBase64,
-} from "../src/crypto";
+import { VaultCrypto, deriveMasterKeyFromPassphrase, generateMasterKey, manifestAad, parseMasterKey, toBase64 } from "../src/crypto";
 import { sha256Hex } from "../src/hash";
 
 // Resolve Node-only test helpers without adding Node globals to the browser plugin build.
@@ -31,7 +25,17 @@ interface RestoreModule {
   passphraseModeRequested(argv?: string[]): boolean;
   keyIdOf(master: Uint8Array): Promise<string>;
   decryptBlob(master: Uint8Array, plainHash: string, cipher: Uint8Array): Promise<Uint8Array>;
-  decryptManifestMap(master: Uint8Array, enc: unknown): Promise<unknown>;
+  decryptManifestMap(master: Uint8Array, enc: unknown, aad?: string): Promise<unknown>;
+  /** Mirrors `manifestAad` in src/crypto.ts; the pairing is asserted below. */
+  manifestAad(envelope: {
+    v: number;
+    id: string;
+    parent: string | null;
+    device: string;
+    createdAt: string;
+    keyId: string;
+    blobs: readonly string[];
+  }): string;
   parseMasterKey(text: string): Uint8Array;
   assertSafePath(p: string): string;
   writeFileSafely(outDir: string, vaultPath: string, bytes: Uint8Array): Promise<void>;
@@ -78,6 +82,42 @@ describe("restore.mjs agrees with the plugin's crypto", () => {
       "private/therapy.md": { h: "c".repeat(64), size: 34, mtime: 2, c: "d".repeat(64) },
     };
     expect(await restore.decryptManifestMap(KEY, await plugin.encryptJson(files))).toEqual(files);
+  });
+
+  it("computes the same v3 envelope the plugin does, byte for byte", async () => {
+    // restore.mjs re-implements the crypto on purpose, so a restore does not depend on the
+    // plugin still working. That only holds while the two agree: the AAD string is now part
+    // of the contract, and a one-character drift makes every v3 snapshot un-restorable.
+    const envelope = {
+      v: 3,
+      id: "01JJJJJJJJJJJJJJJJJJJJJJJJ",
+      parent: "01KKKKKKKKKKKKKKKKKKKKKKKK",
+      device: "laptop",
+      createdAt: "2026-08-11T00:00:00.000Z",
+      keyId: "0011223344556677",
+      blobs: ["a".repeat(64), "b".repeat(64)],
+    };
+    expect(restore.manifestAad(envelope)).toBe(manifestAad(envelope));
+  });
+
+  it("decrypts a v3 path map the plugin produced, and refuses a swapped envelope", async () => {
+    const plugin = await VaultCrypto.create(KEY);
+    const envelope = {
+      v: 3,
+      id: "01JJJJJJJJJJJJJJJJJJJJJJJJ",
+      parent: null,
+      device: "laptop",
+      createdAt: "2026-08-11T00:00:00.000Z",
+      keyId: plugin.keyId,
+      blobs: ["e".repeat(64)],
+    };
+    const files = { "note.md": { h: "f".repeat(64), size: 3, mtime: 4, c: "e".repeat(64) } };
+    const enc = await plugin.encryptJson(files, manifestAad(envelope));
+
+    expect(await restore.decryptManifestMap(KEY, enc, restore.manifestAad(envelope))).toEqual(files);
+    await expect(
+      restore.decryptManifestMap(KEY, enc, restore.manifestAad({ ...envelope, device: "impostor" }))
+    ).rejects.toThrow(/failed authentication/);
   });
 
   it("refuses the wrong master key on both blobs and manifests", async () => {

@@ -26,8 +26,10 @@ npm --prefix worker install && npm --prefix plugin install
 node scripts/setup.mjs
 ```
 
-Log in first with `npx wrangler login` if you have not already — setup never logs you in or
-out, so the account it uses is always one you chose. It prints **which account** it is about
+Log in first, if you have not already, with the wrangler this repo pins —
+`./worker/node_modules/.bin/wrangler login` (that is why the install above comes first).
+Setup uses only that copy and never fetches one on the fly, and it never logs you in or out,
+so the account it uses is always one you chose. It prints **which account** it is about
 to deploy to and waits for you to confirm, then creates the R2 bucket, deploys the Worker,
 sets the admin secret, schedules the nightly garbage collection, smoke-tests `/health`, and
 issues your access token. Every step is idempotent, so re-running it after a failure resumes
@@ -162,6 +164,26 @@ can be two different accounts, so the script never silently switches between the
   folder is whatever your vault uses — if you renamed it under *Settings → About → Override
   config folder*, both that folder and `.obsidian` are skipped, since a rename leaves the
   old copy on disk.
+- **Installed plugins, themes and CSS snippets are never synced**, even with config-folder
+  sync switched on. Obsidian executes those, so syncing them would mean anyone who can write
+  to your vault can run code on all your devices — and `plugins/<id>/data.json` is where your
+  *other* plugins keep their credentials. Obsidian's own settings files still sync.
+- **What the server can still tell about an encrypted vault:** how many files a snapshot has
+  and roughly how big they are, when you sync, your device names, and that two paths hold
+  identical content (that is what makes deduplication work). Not the contents, and not the
+  paths.
+- **Other software on your device is trusted.** The master key and access token sit in the
+  plugin's `data.json` in plaintext, because the plugin needs them to decrypt anything. Any
+  other Obsidian plugin can read them. "Encrypted" here means the *server* cannot read your
+  notes — it is not a sandbox against what runs on your own machine.
+- **Setup links and QR codes contain the key**, base64-encoded, not encrypted. Treat one like
+  the key itself, and remember the clipboard is not private storage (macOS Universal Clipboard
+  forwards it over iCloud).
+- **Snapshot history is not a backup.** It protects against your own mistakes, not against
+  losing the account, the bucket, or the key — all of which take every snapshot at once. Keep
+  an independent export and test it occasionally: `scripts/restore.mjs` decrypts a snapshot to
+  a plain directory and re-implements the crypto on purpose, so restoring does not depend on
+  the plugin still working.
 - **Your data stays your responsibility.** Nothing here is a service: there is no operator
   and no support channel that can read your notes back to you or restore them on your
   behalf. Your own backups and your own master key are part of running this, and the plugin
@@ -190,7 +212,25 @@ node scripts/access-token.mjs --list           # active tokens (no token materia
 node scripts/access-token.mjs --rotate         # fresh token, revokes ALL others
 node scripts/access-token.mjs --name phone     # an extra token, revocable on its own
 node scripts/access-token.mjs --revoke <id>
+node scripts/access-token.mjs --out token.json # write it to a 0600 file instead of the screen
 ```
+
+A token is printed only to a terminal. Piped into a file or a CI log it refuses instead, since
+that is a vault-wide credential landing somewhere nobody chose — pass `--out` for a `0600`
+file, or `--print-token` if stdout really is where you want it.
+
+An access token can be issued with less than full authority. Rebuilding remote history is the
+only action that makes remote content stop existing, so it is a separate power a token can be
+issued without, and a token can be given an expiry date:
+
+```bash
+curl -X POST "$WORKER_URL/api/tokens" -H "authorization: Bearer $ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"name":"phone","scopes":["sync"],"expiresAt":"2027-01-01T00:00:00Z"}'
+```
+
+Tokens issued without either field keep full authority and no expiry, so nothing that already
+works changes.
 
 Running the issue command twice replaces the token rather than leaving two live ones, so
 there is no state to clean up if you lose track. Either way the old token dies immediately:
@@ -341,9 +381,9 @@ two byte-compatible — so a bug in the plugin cannot make your backups unreadab
 # All commands are run from the repository root.
 npm --prefix worker install && npm --prefix plugin install
 
-npm --prefix worker test             # 92 tests, real workerd via vitest-pool-workers
-npm --prefix plugin test             # 712 tests, incl. rendered settings-tab/modal coverage
-node --test scripts/*.test.mjs       # 42 tests: deploy/setup/release/token helpers
+npm --prefix worker test             # 135 tests, real workerd via vitest-pool-workers
+npm --prefix plugin test             # 773 tests, incl. rendered settings-tab/modal coverage
+node --test scripts/*.test.mjs       # 50 tests: deploy/setup/release/token helpers
 npm --prefix plugin run lint         # typed lint; the baseline is zero, so any finding is new
 npm --prefix worker run lint
 

@@ -112,17 +112,35 @@ export async function decryptBlob(master, plainHash, cipher) {
   }
 }
 
-/** Decrypts the manifest's path map. */
-export async function decryptManifestMap(master, enc) {
+/**
+ * The envelope a v3 snapshot authenticates. Must stay byte-identical to `manifestAad` in
+ * plugin/src/crypto.ts — plugin/test/restore.spec.ts is what keeps the two honest.
+ */
+export function manifestAad(envelope) {
+  return JSON.stringify([
+    "r2do-sync/manifest/aad/1",
+    envelope.v,
+    envelope.id,
+    envelope.parent,
+    envelope.device,
+    envelope.createdAt,
+    envelope.keyId,
+    [...envelope.blobs],
+  ]);
+}
+
+/**
+ * Decrypts the manifest's path map. `aad` is supplied for v3 snapshots, whose ciphertext
+ * also authenticates the header it arrived in; v2 has no such binding and passes undefined.
+ */
+export async function decryptManifestMap(master, enc, aad) {
   if (enc.alg !== "AES-GCM") throw new Error(`unsupported manifest cipher "${enc.alg}"`);
   const key = await deriveAesKey(master, "manifest");
+  const params = { name: "AES-GCM", iv: Buffer.from(enc.iv, "base64") };
+  if (aad !== undefined) params.additionalData = Buffer.from(aad, "utf8");
   let plain;
   try {
-    plain = await subtle.decrypt(
-      { name: "AES-GCM", iv: Buffer.from(enc.iv, "base64") },
-      key,
-      Buffer.from(enc.data, "base64")
-    );
+    plain = await subtle.decrypt(params, key, Buffer.from(enc.data, "base64"));
   } catch {
     throw new Error("manifest failed authentication (wrong master key or corrupted data)");
   }
@@ -181,7 +199,18 @@ async function lstatIfPresent(target) {
   }
 }
 
-/** Writes beneath outDir without following pre-existing symlinks in the manifest path. */
+/**
+ * Writes beneath outDir without following pre-existing symlinks in the manifest path.
+ *
+ * The final `open()` carries `O_NOFOLLOW`, so the file itself cannot be swapped for a link
+ * between the check and the write. The *parent directory* checks are ordinary
+ * check-then-use: an attacker with write access to `outDir` while a restore is running could
+ * replace an already-verified directory with a symlink and land bytes outside the tree. That
+ * window is accepted because restore targets a directory the operator names and owns,
+ * usually a fresh one. Point it at a shared or world-writable directory and the assumption
+ * is gone — which would call for descriptor-relative traversal (`openat`-style, holding each
+ * parent's fd and resolving the next segment against it) rather than path-based `lstat`.
+ */
 export async function writeFileSafely(outDir, vaultPath, bytes) {
   assertSafePath(vaultPath);
   await mkdir(outDir, { recursive: true });
@@ -306,7 +335,7 @@ async function main() {
 
   let files;
   let master = null;
-  if (manifest.v === 2) {
+  if (manifest.v === 2 || manifest.v === 3) {
     const passphraseMode = passphraseModeRequested();
     const vaultSalt = arg("salt") ?? process.env.VAULT_SALT?.trim();
     if (passphraseMode) {
@@ -333,7 +362,11 @@ async function main() {
       console.error(`wrong master key: snapshot wants keyId ${manifest.keyId}, this key is ${expected}`);
       process.exit(1);
     }
-    files = await decryptManifestMap(master, manifest.enc);
+    files = await decryptManifestMap(
+      master,
+      manifest.enc,
+      manifest.v === 3 ? manifestAad(manifest) : undefined
+    );
   } else {
     files = manifest.files;
   }

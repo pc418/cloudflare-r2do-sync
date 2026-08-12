@@ -9,10 +9,17 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { createInterface } from "node:readline";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { ensureR2Bucket, loadWorkerDeployConfig } from "./worker-config.mjs";
-import { loadEnvFile, upsertEnvFile, verifyAdminToken, waitForHealth } from "./setup-lib.mjs";
+import { bucketOwnershipClaim, ensureR2Bucket, loadWorkerDeployConfig } from "./worker-config.mjs";
+import {
+  loadEnvFile,
+  renderRestDeployCheck,
+  upsertEnvFile,
+  verifyAdminToken,
+  waitForHealth,
+} from "./setup-lib.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WORKER_DIR = path.join(ROOT, "worker");
@@ -23,7 +30,7 @@ const WORKER_DIR = path.join(ROOT, "worker");
  * a fresh one that replaced it. Rotation is safe — access tokens live in the Durable
  * Object — and it is what guarantees every run can issue tokens afterwards.
  */
-export async function deployViaRest({ log = console.log } = {}) {
+export async function deployViaRest({ log = console.log, confirm = null, adoptBucket = false } = {}) {
   const {
     scriptName: SCRIPT_NAME,
     compatibilityDate: COMPAT_DATE,
@@ -97,9 +104,29 @@ export async function deployViaRest({ log = console.log } = {}) {
     ],
   };
 
+  // Which account, which script, which bucket — before anything is created. The wrangler
+  // path has always named its target; this one used to create resources on whatever account
+  // CLOUDFLARE_ACCOUNT_ID happened to hold. `confirm` is null when setup.mjs already asked.
+  const ownedClaim = (process.env.VAULT_BUCKET_OWNED ?? fileEnv.VAULT_BUCKET_OWNED)?.trim() || null;
+  if (confirm !== null) {
+    const proceed = await confirm(
+      renderRestDeployCheck({
+        accountId: ACCOUNT_ID,
+        scriptName: SCRIPT_NAME,
+        bucket: BUCKET,
+        bucketOwned: ownedClaim === bucketOwnershipClaim(ACCOUNT_ID, BUCKET),
+      })
+    );
+    if (!proceed) throw new Error("cancelled — nothing was deployed");
+  }
+
   // 2. Storage and workers.dev subdomain (must exist before first upload) ------
-  const bucketStatus = await ensureR2Bucket(cf, BUCKET);
-  log(`R2 bucket "${BUCKET}": ${bucketStatus}`);
+  const bucket = await ensureR2Bucket(cf, BUCKET, {
+    accountId: ACCOUNT_ID,
+    owned: ownedClaim,
+    adopt: adoptBucket,
+  });
+  log(`R2 bucket "${BUCKET}": ${bucket.status}`);
 
   let sub = await cf(`/workers/subdomain`);
   let subdomain = sub.body?.result?.subdomain ?? null;
@@ -192,16 +219,44 @@ export async function deployViaRest({ log = console.log } = {}) {
     if (put.status !== 200 && put.status !== 201) fail("put-secret", put);
   }
 
-  return { url, adminToken, adminTokenKept };
+  return { url, adminToken, adminTokenKept, bucketClaim: bucket.claim };
+}
+
+/** Prints the target and waits for a yes. No terminal means no unattended provisioning. */
+async function askToProceed(text) {
+  console.log(text);
+  if (!process.stdin.isTTY) {
+    console.error("no terminal to confirm on — re-run with --yes if this target is correct");
+    return false;
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise((resolve) => rl.question("Deploy to this target? [y/N] ", resolve));
+  rl.close();
+  return /^y(es)?$/i.test(answer.trim());
 }
 
 const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (invokedDirectly) {
   try {
-    const { url, adminToken, adminTokenKept } = await deployViaRest();
+    const argv = process.argv.slice(2);
+    const adoptBucket = argv.includes("--adopt-bucket");
+    const assumeYes = argv.includes("--yes") || argv.includes("-y");
+    const unknown = argv.find((a) => !["--adopt-bucket", "--yes", "-y"].includes(a));
+    if (unknown) throw new Error(`unknown option "${unknown}"\n\nusage: node scripts/deploy.mjs [--adopt-bucket] [--yes]`);
+
+    const { url, adminToken, adminTokenKept, bucketClaim } = await deployViaRest({
+      adoptBucket,
+      confirm: assumeYes ? null : askToProceed,
+    });
     // The admin credential is never shown to a person — it lives in ./.env so the helper
     // scripts (access-token.mjs, setup.mjs) keep working without anyone copying secrets.
-    upsertEnvFile(ROOT, { WORKER_URL: url, ADMIN_TOKEN: adminToken });
+    // The bucket claim records that this checkout provisioned that storage, so a later
+    // redeploy is an ordinary reuse rather than an unexplained adoption.
+    upsertEnvFile(ROOT, {
+      WORKER_URL: url,
+      ADMIN_TOKEN: adminToken,
+      ...(bucketClaim ? { VAULT_BUCKET_OWNED: bucketClaim } : {}),
+    });
     console.log(`admin credential ${adminTokenKept ? "unchanged" : "rotated"} — ./.env updated (WORKER_URL, ADMIN_TOKEN)`);
     console.log(`\nDEPLOYED: ${url}`);
   } catch (error) {

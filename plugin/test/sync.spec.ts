@@ -2,8 +2,8 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { SyncEngine } from "../src/sync";
 import { StaleHeadError } from "../src/api";
 import { FakeServer, FakeStore, FakeVault } from "./fakes";
-import type { FileEntry, Manifest, ManifestV1, ManifestV2 } from "../src/types";
-import { VaultCrypto } from "../src/crypto";
+import type { FileEntry, Manifest, ManifestV1, ManifestV2, ManifestV3 } from "../src/types";
+import { VaultCrypto, manifestAad } from "../src/crypto";
 import { sha256Hex } from "../src/hash";
 import { conflictPath } from "../src/merge";
 import { isResolvable } from "../src/conflict-resolve";
@@ -1002,19 +1002,26 @@ describe("SyncEngine.sync — encrypted", () => {
   let crypto_: VaultCrypto;
   let encEngine: SyncEngine;
 
-  function encManifest(m: Manifest): ManifestV2 {
-    if (m.v !== 2) throw new Error(`expected an encrypted manifest, got v${m.v}`);
+  // v2 and v3 are the same shape; v3 additionally authenticates its envelope. Both are
+  // readable forever, so this accepts either and the version assertions below say which one
+  // a *fresh* commit must be.
+  function encManifest(m: Manifest): ManifestV2 | ManifestV3 {
+    if (m.v !== 2 && m.v !== 3) throw new Error(`expected an encrypted manifest, got v${m.v}`);
     return m;
   }
 
   const headManifest = () => encManifest(server.manifests.get(server.head!)!);
+
+  /** Reads a snapshot's path map the way a device does — v3 must present its envelope. */
+  const decryptMap = (m: ManifestV2 | ManifestV3, key: VaultCrypto = crypto_) =>
+    key.decryptJson<Record<string, FileEntry>>(m.enc, m.v === 3 ? manifestAad(m) : undefined);
 
   beforeEach(async () => {
     crypto_ = await VaultCrypto.create(KEY_A);
     encEngine = makeEngine({ crypto: crypto_ });
   });
 
-  it("commits a v2 snapshot whose encrypted map round-trips", async () => {
+  it("commits a v3 snapshot whose encrypted map round-trips", async () => {
     vault.set("daily/2026-08-03.md", "# today\n");
     vault.set("notes/idea.md", "spark");
 
@@ -1025,7 +1032,7 @@ describe("SyncEngine.sync — encrypted", () => {
     expect(m.keyId).toBe(crypto_.keyId);
     expect(m.blobs).toHaveLength(2);
 
-    const files = await crypto_.decryptJson<Record<string, FileEntry>>(m.enc);
+    const files = await decryptMap(m);
     expect(Object.keys(files).sort()).toEqual(["daily/2026-08-03.md", "notes/idea.md"]);
     expect(files["notes/idea.md"].h).toBe(await hex("spark"));
   });
@@ -1038,7 +1045,7 @@ describe("SyncEngine.sync — encrypted", () => {
     expect(server.blobs.has(plainHash)).toBe(false);
 
     const m = headManifest();
-    const files = await crypto_.decryptJson<Record<string, FileEntry>>(m.enc);
+    const files = await decryptMap(m);
     const entry = files["secret.md"];
     expect(entry.h).toBe(plainHash);
     expect(entry.c).toBeDefined();
@@ -1076,7 +1083,7 @@ describe("SyncEngine.sync — encrypted", () => {
 
     expect(res.status).toBe("committed");
     expect(server.uploads).toEqual([]);
-    const files = await crypto_.decryptJson<Record<string, FileEntry>>(headManifest().enc);
+    const files = await decryptMap(headManifest());
     expect(Object.keys(files)).toEqual(["renamed.md"]);
   });
 
@@ -1102,7 +1109,7 @@ describe("SyncEngine.sync — encrypted", () => {
 
     // "a.md" is unchanged, so its bytes are not in this pass's cache: the recovery path
     // must re-read the file and re-derive the same ciphertext.
-    const files = await crypto_.decryptJson<Record<string, FileEntry>>(headManifest().enc);
+    const files = await decryptMap(headManifest());
     const cA = files["a.md"].c!;
     server.blobs.delete(cA);
     server.uploads.length = 0;
@@ -1144,7 +1151,7 @@ describe("SyncEngine.sync — encrypted", () => {
     const migrated = encManifest(server.manifests.get(server.head!)!);
     expect(migrated.parent).toBe(oldHead);
     expect(migrated.keyId).toBe(target.keyId);
-    const files = await target.decryptJson<Record<string, FileEntry>>(migrated.enc);
+    const files = await decryptMap(migrated, target);
     expect(Object.keys(files).sort()).toEqual(["a.md", "private/remote.md"]);
     expect(vault.writes).toEqual([]);
     expect(vault.removes).toEqual([]);
@@ -1166,7 +1173,7 @@ describe("SyncEngine.sync — encrypted", () => {
     expect(vault.text("a.md")).toBe("one");
   });
 
-  it("migrates a non-empty plaintext head to encrypted v2 without touching local files", async () => {
+  it("migrates a non-empty plaintext head to encrypted v3 without touching local files", async () => {
     vault.set("a.md", "one");
     await engine.sync(); // plaintext first
     expect(server.blobs.has(await hex("one"))).toBe(true);
@@ -1178,7 +1185,7 @@ describe("SyncEngine.sync — encrypted", () => {
 
     expect(res.uploaded).toBe(1);
     const m = headManifest();
-    expect(m.v).toBe(2);
+    expect(m.v).toBe(3);
     expect(m.parent).toBe(oldHead);
     expect(server.uploads).toEqual(m.blobs);
     expect(m.blobs).not.toContain(await hex("one"));
@@ -1240,8 +1247,82 @@ describe("SyncEngine.sync — encrypted", () => {
     const res = await encEngine.sync();
 
     expect(res.status).toBe("committed");
-    expect(headManifest().v).toBe(2);
+    expect(headManifest().v).toBe(3);
     expect(headManifest().parent).not.toBeNull();
+  });
+
+  it("refuses a snapshot whose header was swapped around a valid encrypted map", async () => {
+    // What an access token alone can do to a v2 vault: read a real snapshot, keep its
+    // ciphertext, and re-publish it under an id and parent of the attacker's choosing. A
+    // correct-key device then applies it as ordinary remote edits, rolling files back.
+    vault.set("a.md", "the real content");
+    await encEngine.sync();
+    const head = server.head!;
+    const real = encManifest(server.manifests.get(head)!);
+    expect(real.v).toBe(3);
+
+    server.manifests.set(head, { ...real, device: "impostor", createdAt: "2030-01-01T00:00:00.000Z" });
+
+    await expect(encEngine.snapshotFiles(head)).rejects.toThrow(/altered header/);
+  });
+
+  it("refuses a snapshot whose blob list disagrees with its own entries", async () => {
+    vault.set("a.md", "content");
+    await encEngine.sync();
+    const head = server.head!;
+    const real = encManifest(server.manifests.get(head)!);
+    // The outer list is what the server verifies and what GC treats as live. Two different
+    // answers about which blobs a snapshot needs is not a snapshot.
+    const forged = { ...real, blobs: [...real.blobs, "f".repeat(64)] };
+    server.manifests.set(head, { ...forged, enc: real.enc });
+
+    await expect(encEngine.snapshotFiles(head)).rejects.toThrow(/altered header|blob/);
+  });
+
+  it("still reads legacy v2 snapshots, which carry no envelope binding", async () => {
+    // Existing history is v2 and must stay readable forever; the new binding is prospective,
+    // so a v2 snapshot is decrypted without an envelope rather than rejected for lacking one.
+    const files = { "legacy.md": { h: "a".repeat(64), size: 5, mtime: 1 } };
+    const id = "01LEGACYLEGACYLEGACYLEGACY";
+    server.manifests.set(id, {
+      v: 2,
+      id,
+      parent: null,
+      device: "old-device",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      keyId: crypto_.keyId,
+      blobs: ["a".repeat(64)],
+      enc: await crypto_.encryptJson(files),
+    });
+
+    await expect(encEngine.snapshotFiles(id)).resolves.toEqual(files);
+  });
+
+  // The halt is version-blind on purpose: it is what turns "wrong key" into a sticky, named
+  // failure with a recovery instruction, instead of a generic AES error deep in the decrypt
+  // — and an unrecognised failure is retried automatically, forever.
+  it.each([2, 3] as const)("halts on a v%i remote written with a different master key", async (v) => {
+    const other = await VaultCrypto.create(KEY_B);
+    server.seedRemoteEncryptedCommit({ keyId: other.keyId, v });
+    vault.set("a.md", "one");
+
+    const res = await encEngine.sync();
+
+    expect(res).toMatchObject({ status: "halted", reason: expect.stringMatching(/different master key/) });
+    expect(SyncEngine.isWrongKeyHalt((res as { reason: string }).reason)).toBe(true);
+    expect(encEngine.status.phase).toBe("halted");
+  });
+
+  it.each([2, 3] as const)("halts on a v%i remote when this device has no key", async (v) => {
+    server.seedRemoteEncryptedCommit({ keyId: crypto_.keyId, v });
+    vault.set("a.md", "one");
+
+    const res = await makeEngine().sync();
+
+    expect(res).toMatchObject({
+      status: "halted",
+      reason: expect.stringMatching(/no vault master key is set/),
+    });
   });
 
   it("halts when the remote is encrypted with a different master key", async () => {

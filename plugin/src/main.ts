@@ -12,7 +12,7 @@ import {
   type Vault,
 } from "obsidian";
 import qrcode from "qrcode-generator";
-import { SyncApi, type HttpClient } from "./api";
+import { SettingsStaleError, SyncApi, type HttpClient } from "./api";
 import {
   VaultCrypto,
   deriveMasterKeyFromPassphrase,
@@ -20,6 +20,7 @@ import {
   generateVaultSalt,
   parseMasterKey,
   parseVaultSalt,
+  settingsAad,
 } from "./crypto";
 import {
   activateEncryptionState,
@@ -640,14 +641,14 @@ export default class LogSyncPlugin extends Plugin {
         );
       }
     }
-    const rev: SettingsRev = { updatedAt: raw.updatedAt, device: raw.device };
+    const rev: SettingsRev = { updatedAt: raw.updatedAt, device: raw.device, rev: raw.rev };
     if (this.#sharedSettings !== null && !isNewerRev(rev, this.#sharedSettings.rev)) {
       if (saltChanged) await this.#persist();
       return;
     }
 
     let plain: Record<string, unknown>;
-    if (raw.v === 2) {
+    if (raw.v === 2 || raw.v === 3) {
       if (!this.encryptionEnabled) {
         throw new Error("shared settings are encrypted, but this device has no master key");
       }
@@ -662,7 +663,14 @@ export default class LogSyncPlugin extends Plugin {
       }
       // Positive proof this device holds the vault's key, so any earlier verdict is stale.
       this.#keyMismatch = null;
-      plain = await crypto.decryptSettingsJson<Record<string, unknown>>(raw.enc);
+      // v3 authenticates the revision and identity around the ciphertext; v2 does not, and
+      // stays readable so an upgrade does not strand a vault's existing policy document.
+      plain = await crypto.decryptSettingsJson<Record<string, unknown>>(
+        raw.enc,
+        raw.v === 3
+          ? settingsAad({ v: 3, rev: raw.rev ?? 0, device: raw.device, keyId: raw.keyId, vaultSalt: raw.vaultSalt })
+          : undefined
+      );
     } else {
       // Mixed mode also halts the vault sync itself; refusing here keeps the two aligned.
       if (this.encryptionEnabled) {
@@ -688,25 +696,54 @@ export default class LogSyncPlugin extends Plugin {
     const fingerprint = sharedFingerprint(this.settings);
     if (this.#sharedSettings?.fingerprint === fingerprint) return;
 
-    const rev: SettingsRev = { updatedAt: Date.now(), device: this.settings.deviceName };
     const shared = { ...extractSharedSettings(this.settings) } as Record<string, unknown>;
     const vaultSalt = this.settings.vaultSalt === "" ? {} : { vaultSalt: this.settings.vaultSalt };
-    let doc: SettingsDoc;
-    if (this.encryptionEnabled) {
-      const crypto = await VaultCrypto.fromText(this.settings.masterKey);
-      doc = {
-        v: 2,
-        ...rev,
-        ...vaultSalt,
-        keyId: crypto.keyId,
-        enc: await crypto.encryptSettingsJson(shared),
+
+    // The document says which revision it replaces, so the server refuses it outright if
+    // another device wrote in the meantime. A rejection carries the revision that actually
+    // won, so one retry settles it without re-running the whole pull-and-apply path.
+    let nextRev = (this.#sharedSettings?.rev.rev ?? 0) + 1;
+    for (let attempt = 0; ; attempt++) {
+      const rev: SettingsRev = {
+        updatedAt: Date.now(),
+        device: this.settings.deviceName,
+        rev: nextRev,
       };
-    } else {
-      doc = { v: 1, ...rev, ...vaultSalt, plain: shared };
+      let doc: SettingsDoc;
+      if (this.encryptionEnabled) {
+        const crypto = await VaultCrypto.fromText(this.settings.masterKey);
+        const envelope = {
+          v: 3 as const,
+          ...rev,
+          ...vaultSalt,
+          keyId: crypto.keyId,
+        };
+        doc = {
+          ...envelope,
+          enc: await crypto.encryptSettingsJson(
+            shared,
+            settingsAad({
+              v: 3,
+              rev: nextRev,
+              device: envelope.device,
+              keyId: envelope.keyId,
+              vaultSalt: envelope.vaultSalt,
+            })
+          ),
+        };
+      } else {
+        doc = { v: 1, ...rev, ...vaultSalt, plain: shared };
+      }
+      try {
+        await api.putSettingsDoc(doc);
+        this.#sharedSettings = { rev, fingerprint };
+        await this.#persist();
+        return;
+      } catch (e) {
+        if (attempt >= 1 || !(e instanceof SettingsStaleError)) throw e;
+        nextRev = e.rev + 1;
+      }
     }
-    await api.putSettingsDoc(doc);
-    this.#sharedSettings = { rev, fingerprint };
-    await this.#persist();
   }
 
   /**
@@ -1029,6 +1066,19 @@ export default class LogSyncPlugin extends Plugin {
       new Notice("R2DO Sync: set the server URL and access token in settings first");
       return;
     }
+    // Ahead of the pull, not after it. This used to reach the gate only through the
+    // `syncNow()` that publishes the result — by which point the remote had already been
+    // written over this vault. The consent body is what states the self-hosting disclaimer
+    // and asks for a backup, and it is worth nothing once the files it warns about are gone.
+    this.#interactive++;
+    let consented: boolean;
+    try {
+      consented = await this.#confirmFirstSync();
+    } finally {
+      this.#interactive--;
+    }
+    if (!consented) return;
+
     const summary = await this.#summarise(() => engine.forcePullSummary(), "pull the remote over this device");
     if (summary === null) return;
 
@@ -1048,7 +1098,9 @@ export default class LogSyncPlugin extends Plugin {
         const notice = new Notice("R2DO Sync: pulling the remote over this vault…", 0);
         this.#interactive++;
         try {
-          const result = await engine.forcePull();
+          // Pinned to the snapshot the confirmation described. A head published since was
+          // never in the counts the operator agreed to, and this action overwrites files.
+          const result = await engine.forcePull(summary.head);
           notice.hide();
           new Notice(
             `R2DO Sync: wrote ${result.written} file(s), removed ${result.removed}` +
@@ -1075,10 +1127,10 @@ export default class LogSyncPlugin extends Plugin {
       new Notice("R2DO Sync: set the server URL and access token in settings first");
       return;
     }
-    // Publishing is publishing, however it is spelled. `syncNow` owns this gate and
-    // `forcePull` inherits it by calling `syncNow`, but this path talks to the scheduler
-    // directly — so without asking here a device that has never consented can overwrite the
-    // remote with its whole vault. Asked before the preview, so the two dialogs do not stack.
+    // Publishing is publishing, however it is spelled. `syncNow` owns this gate, but this
+    // path talks to the scheduler directly — so without asking here a device that has never
+    // consented can overwrite the remote with its whole vault. Asked before the preview, so
+    // the two dialogs do not stack. `forcePull` asks for itself, for the same reason.
     this.#interactive++;
     let consented: boolean;
     try {
@@ -1108,7 +1160,7 @@ export default class LogSyncPlugin extends Plugin {
         this.#renderStatus();
         this.#interactive++;
         try {
-          await scheduler.syncNow({ keepLocal: true });
+          await scheduler.syncNow({ keepLocal: true, previewedHead: summary.head });
         } catch (e) {
           await this.#reportUnlessReported(e);
         } finally {
@@ -3566,7 +3618,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Sync Obsidian configuration directory")
-      .setDesc(`Includes ${configDir}/** except this plugin's live/legacy credential directories and workspace files. Bad config merges can break plugins.`)
+      .setDesc(`Includes ${configDir}/** except plugins, themes and snippets, this plugin's live/legacy credential directories, and workspace files. Bad config merges can break plugins.`)
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.syncConfigDir).onChange((enabled) => {
           if (!enabled) {
@@ -3578,9 +3630,11 @@ export class LogSyncSettingTab extends PluginSettingTab {
           new ConfirmModal(this.app, {
             title: "Sync Obsidian configuration files?",
             body:
-              "Plugin settings and configuration JSON are not mergeable like notes. A bad " +
-              "cross-device overwrite can disable plugins or corrupt configuration. R2DO " +
-              "Sync still excludes its own credentials and workspace layouts.",
+              "Obsidian's own configuration JSON is not mergeable like notes. A bad " +
+              "cross-device overwrite can corrupt settings. Installed plugins, themes and " +
+              "CSS snippets are never synced — Obsidian executes those, and syncing them " +
+              "would let anyone who can write to this vault run code on your devices. " +
+              "R2DO Sync also excludes its own credentials and workspace layouts.",
             phrase: "SYNC CONFIG",
             onConfirm: async () => {
               this.plugin.settings.syncConfigDir = true;

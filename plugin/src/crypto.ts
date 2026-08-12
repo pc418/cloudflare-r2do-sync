@@ -156,6 +156,52 @@ async function deriveAesKey(master: Uint8Array, info: string): Promise<CryptoKey
   ]);
 }
 
+/**
+ * The immutable envelope a v3 snapshot authenticates alongside its ciphertext.
+ *
+ * Serialized as a fixed-order array behind a domain string, so it cannot be confused with
+ * any other authenticated payload and cannot change meaning if a field is added later
+ * (a new field means a new version, not a new key in a map whose order might vary).
+ */
+export function manifestAad(envelope: {
+  v: number;
+  id: string;
+  parent: string | null;
+  device: string;
+  createdAt: string;
+  keyId: string;
+  blobs: readonly string[];
+}): string {
+  return JSON.stringify([
+    "r2do-sync/manifest/aad/1",
+    envelope.v,
+    envelope.id,
+    envelope.parent,
+    envelope.device,
+    envelope.createdAt,
+    envelope.keyId,
+    [...envelope.blobs],
+  ]);
+}
+
+/** The same idea for the shared settings document; `rev` is what stops replay. */
+export function settingsAad(envelope: {
+  v: number;
+  rev: number;
+  device: string;
+  keyId: string;
+  vaultSalt?: string;
+}): string {
+  return JSON.stringify([
+    "r2do-sync/settings/aad/1",
+    envelope.v,
+    envelope.rev,
+    envelope.device,
+    envelope.keyId,
+    envelope.vaultSalt ?? null,
+  ]);
+}
+
 export class VaultCrypto {
   private constructor(
     private readonly master: Uint8Array,
@@ -203,33 +249,47 @@ export class VaultCrypto {
     }
   }
 
-  /** Encrypts the manifest's path map. Random IV — this payload is not deduplicated. */
-  async encryptJson(value: unknown): Promise<EncPayload> {
-    return this.encryptJsonWith(this.manifestKey, value);
+  /**
+   * Encrypts the manifest's path map. Random IV — this payload is not deduplicated.
+   *
+   * `aad` binds the ciphertext to the plaintext envelope around it (id, parent, device,
+   * createdAt, keyId, blob set). AES-GCM authenticates but does not conceal it, which is
+   * exactly what is needed: the server has to read those fields, and nobody may change them.
+   * Without it a bearer-token holder can lift a valid encrypted map into a header of their
+   * choosing — a new id and parent — and a correct-key device accepts the result as a
+   * genuine snapshot, rolling files back as if they were ordinary remote edits.
+   */
+  async encryptJson(value: unknown, aad?: string): Promise<EncPayload> {
+    return this.encryptJsonWith(this.manifestKey, value, aad);
   }
 
-  async decryptJson<T>(payload: EncPayload): Promise<T> {
-    return this.decryptJsonWith(this.manifestKey, payload, "manifest");
+  async decryptJson<T>(payload: EncPayload, aad?: string): Promise<T> {
+    return this.decryptJsonWith(this.manifestKey, payload, "manifest", aad);
   }
 
   /** Encrypts the shared settings document, under the settings-specific key. */
-  async encryptSettingsJson(value: unknown): Promise<EncPayload> {
-    return this.encryptJsonWith(this.settingsKey, value);
+  async encryptSettingsJson(value: unknown, aad?: string): Promise<EncPayload> {
+    return this.encryptJsonWith(this.settingsKey, value, aad);
   }
 
-  async decryptSettingsJson<T>(payload: EncPayload): Promise<T> {
-    return this.decryptJsonWith(this.settingsKey, payload, "settings document");
+  async decryptSettingsJson<T>(payload: EncPayload, aad?: string): Promise<T> {
+    return this.decryptJsonWith(this.settingsKey, payload, "settings document", aad);
   }
 
-  private async encryptJsonWith(key: CryptoKey, value: unknown): Promise<EncPayload> {
+  private async encryptJsonWith(key: CryptoKey, value: unknown, aad?: string): Promise<EncPayload> {
     const iv = new Uint8Array(IV_BYTES);
     crypto.getRandomValues(iv);
     const plain = new TextEncoder().encode(JSON.stringify(value));
-    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, view(plain));
+    const ct = await crypto.subtle.encrypt(algorithm(iv, aad), key, view(plain));
     return { alg: "AES-GCM", iv: toBase64(iv), data: toBase64(new Uint8Array(ct)) };
   }
 
-  private async decryptJsonWith<T>(key: CryptoKey, payload: EncPayload, what: string): Promise<T> {
+  private async decryptJsonWith<T>(
+    key: CryptoKey,
+    payload: EncPayload,
+    what: string,
+    aad?: string
+  ): Promise<T> {
     if (payload.alg !== "AES-GCM") {
       // `payload.alg` narrows to `never` — the declared type says this cannot happen. It is
       // remote data, so it can: stringify whatever actually arrived instead of trusting it.
@@ -238,13 +298,23 @@ export class VaultCrypto {
     let pt: ArrayBuffer;
     try {
       pt = await crypto.subtle.decrypt(
-        { name: "AES-GCM", iv: view(fromBase64(payload.iv)) },
+        algorithm(fromBase64(payload.iv), aad),
         key,
         view(fromBase64(payload.data))
       );
     } catch {
-      throw new Error(`${what} failed authentication (wrong key or corrupted data)`);
+      throw new Error(
+        aad === undefined
+          ? `${what} failed authentication (wrong key or corrupted data)`
+          : `${what} failed authentication (wrong key, corrupted data, or an altered header)`
+      );
     }
     return JSON.parse(new TextDecoder().decode(pt)) as T;
   }
+}
+
+function algorithm(iv: Uint8Array, aad?: string): AesGcmParams {
+  const params: AesGcmParams = { name: "AES-GCM", iv: view(iv) };
+  if (aad !== undefined) params.additionalData = view(new TextEncoder().encode(aad));
+  return params;
 }
