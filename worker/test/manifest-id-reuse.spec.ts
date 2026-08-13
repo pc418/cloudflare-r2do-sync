@@ -191,4 +191,39 @@ describe("gc chain walking", () => {
     );
     expect(await env.VAULT.head(`blobs/${h}`)).not.toBeNull();
   });
+
+  it("still catches a cycle when the walk crosses an invocation boundary", async () => {
+    const h = await putBlob(token, "resumed cycle content");
+    const m1 = makeManifest({ files: { "a.md": { h } } });
+    const m2 = makeManifest({ id: ulid(Date.now() + 1), parent: m1.id, files: { "a.md": { h } } });
+    const m3 = makeManifest({ id: ulid(Date.now() + 2), parent: m2.id, files: { "a.md": { h } } });
+    // m1 points back at m3, so the loop only closes on the walk's third link — past the bound
+    // of a single call. An in-memory visited set would not survive to see it.
+    await env.VAULT.put(`manifests/${m1.id}.json`, JSON.stringify({ ...m1, parent: m3.id }));
+    await env.VAULT.put(`manifests/${m2.id}.json`, JSON.stringify(m2));
+    await env.VAULT.put(`manifests/${m3.id}.json`, JSON.stringify(m3));
+    const lock = env.VAULT_LOCK.getByName("default");
+    await runInDurableObject(lock, (_instance, state) => {
+      state.storage.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?)", m3.id);
+    });
+
+    // Two calls of real progress, then the loop closes on a link neither of them could have
+    // held in memory.
+    expect(await lock.advanceGcIndex({ maxManifests: 1 })).toMatchObject({
+      done: false,
+      cursor: m2.id,
+    });
+    expect(await lock.advanceGcIndex({ maxManifests: 1 })).toMatchObject({
+      done: false,
+      cursor: m1.id,
+    });
+    // Awaited inside a plain async wrapper: a Durable Object RPC promise is a pipelining
+    // proxy, so handing it straight to `.rejects` makes the matcher's own property access an
+    // RPC call and the assertion fails on that instead of on the rejection.
+    const advance = async (): Promise<void> => {
+      await lock.advanceGcIndex({ maxManifests: 1 });
+    };
+    await expect(advance()).rejects.toThrow(/manifest chain cycles at/);
+    expect(await env.VAULT.head(`blobs/${h}`)).not.toBeNull();
+  });
 });

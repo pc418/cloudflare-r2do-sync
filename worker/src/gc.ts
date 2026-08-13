@@ -11,6 +11,8 @@ export interface GcOptions {
   minAgeMs?: number;
   /** Upper bound on how long this run may hold commits off. */
   leaseTtlMs?: number;
+  /** Manifests the one-time reference-index migration may read in this run. */
+  indexChunk?: number;
   /** Test seam: move the head after planning but before the fenced delete phase. */
   testHookBeforeLease?: () => Promise<void>;
 }
@@ -98,7 +100,18 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
   };
 
   const lock = env.VAULT_LOCK.getByName("default");
-  await lock.ensureGcIndex();
+  // A vault older than the reference index has to be translated into it before its retained
+  // set can be derived. That walk is bounded per invocation, so a run may legitimately end
+  // here having only advanced it — retaining everything is the safe half of GC.
+  const progress = await lock.advanceGcIndex({ maxManifests: opts.indexChunk });
+  if (!progress.done) {
+    logPhase("gc_plan", gcStartedAt, { indexed: progress.indexed, indexComplete: false });
+    console.log(
+      `gc: reference index still building (${progress.indexed} manifest(s) this run, resuming at ${progress.cursor}); deleting nothing`
+    );
+    report.skipped = "index_backfilling";
+    return report;
+  }
   const plan = await lock.getGcPlan({ keepCount, ageCutoff });
   logPhase("gc_plan", gcStartedAt, {
     retainedManifests: plan.retainedIds.length,

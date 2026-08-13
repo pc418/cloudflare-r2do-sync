@@ -1,8 +1,18 @@
-import { env, runInDurableObject } from "cloudflare:test";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, beforeEach } from "vitest";
 import { runGc } from "../src/gc";
 import type { Manifest } from "../src/manifest";
-import { commit, makeManifest, makeManifestV2, mintToken, sha256hex, ulid } from "./helpers";
+import {
+  ADMIN,
+  BASE,
+  authed,
+  commit,
+  makeManifest,
+  makeManifestV2,
+  mintToken,
+  sha256hex,
+  ulid,
+} from "./helpers";
 import type { VaultLock } from "../src/vault-lock";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -278,6 +288,160 @@ describe("runGc", () => {
       expect(
         state.storage.sql.exec<{ hash: string }>("SELECT hash FROM current_blob_refs").toArray()
       ).toEqual([{ hash: kept }]);
+    });
+  });
+
+  /**
+   * The migration cannot assume any one invocation can finish it: a request gets 10 ms of CPU
+   * on the free plan, and a chain is one R2 GET and one JSON parse per link. Driven one link
+   * at a time it must reach exactly the index a single pass would have built.
+   */
+  it("builds the same reference index one bounded step at a time", async () => {
+    const now = Date.now() + 10 * DAY;
+    const kept = await seedBlob("kept across the chain");
+    const dropped = await seedBlob("dropped partway");
+    const legacy1 = manifest(ulid(Date.now() - 3 * DAY), null, Date.now() - 3 * DAY, {
+      "a.md": kept,
+      "b.md": dropped,
+    });
+    const legacy2 = manifest(ulid(Date.now() - 2 * DAY), legacy1.id, Date.now() - 2 * DAY, {
+      "a.md": kept,
+    });
+    const legacy3 = manifest(ulid(Date.now() - DAY), legacy2.id, Date.now() - DAY, { "a.md": kept });
+    for (const m of [legacy1, legacy2, legacy3]) {
+      await env.VAULT.put(`manifests/${m.id}.json`, JSON.stringify(m));
+    }
+    const lock = env.VAULT_LOCK.getByName("default");
+    await runInDurableObject(lock, (_instance: VaultLock, state) => {
+      state.storage.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?)", legacy3.id);
+    });
+
+    const first = await lock.advanceGcIndex({ maxManifests: 1 });
+    expect(first).toMatchObject({ done: false, indexed: 1, cursor: legacy2.id });
+    // Nothing may be deleted while the walk is only partly done.
+    const midway = await runGc(env, { now, minAgeMs: 0, keepCount: 1, keepDays: 0, indexChunk: 1 });
+    expect(midway.skipped).toBe("index_backfilling");
+    expect(midway.deletedManifests).toBe(0);
+    expect(await env.VAULT.head(`blobs/${dropped}`)).not.toBeNull();
+
+    let guard = 0;
+    let progress = await lock.advanceGcIndex({ maxManifests: 1 });
+    while (!progress.done) {
+      if (++guard > 10) throw new Error("index walk did not converge");
+      progress = await lock.advanceGcIndex({ maxManifests: 1 });
+    }
+    // A finished index answers immediately and reads nothing further.
+    expect(await lock.advanceGcIndex({ maxManifests: 1 })).toEqual({
+      done: true,
+      indexed: 0,
+      cursor: null,
+    });
+
+    await runInDurableObject(lock, (_instance: VaultLock, state) => {
+      expect(
+        state.storage.sql
+          .exec<{ id: string }>("SELECT id FROM manifest_index ORDER BY uploaded_at, id")
+          .toArray()
+          .map((r) => r.id)
+      ).toEqual([legacy1.id, legacy2.id, legacy3.id]);
+      expect(
+        state.storage.sql.exec<{ hash: string }>("SELECT hash FROM current_blob_refs").toArray()
+      ).toEqual([{ hash: kept }]);
+      // legacy2 is where `dropped` stopped being referenced; legacy1 is where both began.
+      expect(
+        state.storage.sql
+          .exec<{ manifest_id: string; hash: string; delta: number }>(
+            "SELECT manifest_id, hash, delta FROM manifest_blob_deltas WHERE hash = ? ORDER BY delta",
+            dropped
+          )
+          .toArray()
+      ).toEqual([
+        { manifest_id: legacy2.id, hash: dropped, delta: -1 },
+        { manifest_id: legacy1.id, hash: dropped, delta: 1 },
+      ]);
+    });
+
+    const report = await runGc(env, { now, minAgeMs: 0, keepCount: 1, keepDays: 0 });
+    expect(report.skipped).toBeNull();
+    expect(report.retainedManifests).toBe(1);
+    expect(report.deletedManifests).toBe(2);
+    expect(await env.VAULT.head(`blobs/${kept}`)).not.toBeNull();
+    expect(await env.VAULT.head(`blobs/${dropped}`)).toBeNull();
+  });
+
+  /**
+   * Cloudflare cannot fire a deployed Worker's Cron Trigger — `--test-scheduled` is a local
+   * dev server only — so without these routes the only way to see GC act on a real vault is
+   * to wait for 04:00 and read logs afterwards.
+   */
+  describe("admin trigger", () => {
+    it("runs the sweep on demand and reports what it did", async () => {
+      const blob = await seedBlob("swept by hand");
+      const orphan = await seedBlob("nothing references me");
+      await publish(makeManifest({ files: { "a.md": { h: blob } } }), null);
+
+      const res = await SELF.fetch(`${BASE}/api/gc`, authed(ADMIN, { method: "POST" }));
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ skipped: null, retainedManifests: 1 });
+      // minAgeMs defaults to a day, so a freshly written orphan is deliberately spared.
+      expect(await env.VAULT.head(`blobs/${orphan}`)).not.toBeNull();
+      expect(await env.VAULT.head(`blobs/${blob}`)).not.toBeNull();
+    });
+
+    it("advances the reference-index migration by the requested bound", async () => {
+      const blob = await seedBlob("legacy");
+      const legacy1 = manifest(ulid(Date.now() - 2 * DAY), null, Date.now() - 2 * DAY, {
+        "a.md": blob,
+      });
+      const legacy2 = manifest(ulid(Date.now() - DAY), legacy1.id, Date.now() - DAY, {
+        "a.md": blob,
+      });
+      await env.VAULT.put(`manifests/${legacy1.id}.json`, JSON.stringify(legacy1));
+      await env.VAULT.put(`manifests/${legacy2.id}.json`, JSON.stringify(legacy2));
+      await runInDurableObject(
+        env.VAULT_LOCK.getByName("default"),
+        (_instance: VaultLock, state) => {
+          state.storage.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?)", legacy2.id);
+        }
+      );
+
+      const step = await SELF.fetch(
+        `${BASE}/api/gc/index?manifests=1`,
+        authed(ADMIN, { method: "POST" })
+      );
+      expect(step.status).toBe(200);
+      // One link per call, and the cursor names where the next one picks up.
+      expect(await step.json()).toEqual({ done: false, indexed: 1, cursor: legacy1.id });
+
+      const finish = await SELF.fetch(
+        `${BASE}/api/gc/index?manifests=1`,
+        authed(ADMIN, { method: "POST" })
+      );
+      expect(await finish.json()).toEqual({ done: true, indexed: 1, cursor: null });
+
+      const again = await SELF.fetch(`${BASE}/api/gc/index`, authed(ADMIN, { method: "POST" }));
+      expect(await again.json()).toEqual({ done: true, indexed: 0, cursor: null });
+    });
+
+    it("refuses an unusable bound rather than silently choosing one", async () => {
+      for (const bad of ["0", "-3", "2.5", "1001", "lots"]) {
+        const res = await SELF.fetch(
+          `${BASE}/api/gc/index?manifests=${bad}`,
+          authed(ADMIN, { method: "POST" })
+        );
+        expect(res.status).toBe(422);
+      }
+    });
+
+    it("is admin-only — an access token may sync, not collect", async () => {
+      const { token } = await mintToken("device");
+      for (const path of ["/api/gc", "/api/gc/index"]) {
+        expect((await SELF.fetch(`${BASE}${path}`, authed(token, { method: "POST" }))).status).toBe(
+          403
+        );
+        expect((await SELF.fetch(`${BASE}${path}`, { method: "POST" })).status).toBe(401);
+      }
     });
   });
 

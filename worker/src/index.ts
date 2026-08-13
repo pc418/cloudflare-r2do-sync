@@ -164,6 +164,48 @@ app.delete("/api/tokens/:id", adminAuth, async (c) => {
   return c.body(null, 204);
 });
 
+/**
+ * Runs the sweep the daily cron runs, on demand. Cloudflare has no way to fire a deployed
+ * Worker's Cron Trigger — `--test-scheduled` is a local dev server only — so without this
+ * the only way to see GC work against a real vault is to wait for 04:00 and read logs after
+ * the fact. Admin-only, and no new authority: the admin token already mints access tokens,
+ * and this is the same `runGc` the schedule calls, under the same fenced lease.
+ */
+app.post("/api/gc", adminAuth, async (c) => {
+  const manifests = indexChunkOf(c);
+  if (manifests === undefined) {
+    return c.json(errJson("invalid_manifests", "manifests must be an integer from 1 to 1000"), 422);
+  }
+  const report = await runGc(c.env, manifests === null ? {} : { indexChunk: manifests });
+  console.log(JSON.stringify({ event: "gc_report", trigger: "manual", ...report }));
+  return c.json(report);
+});
+
+/**
+ * Advances the one-time reference-index migration without running a sweep. Separate from
+ * `/api/gc` because the migration is the expensive half and is bounded per call: an operator
+ * can drive it to completion at whatever chunk size this Worker's CPU budget actually allows.
+ */
+app.post("/api/gc/index", adminAuth, async (c) => {
+  const manifests = indexChunkOf(c);
+  if (manifests === undefined) {
+    return c.json(errJson("invalid_manifests", "manifests must be an integer from 1 to 1000"), 422);
+  }
+  const progress = await vault(c.env).advanceGcIndex(
+    manifests === null ? {} : { maxManifests: manifests }
+  );
+  return c.json(progress);
+});
+
+/** `null` when unspecified, `undefined` when present but not a usable count. */
+function indexChunkOf(c: Context<AppEnv>): number | null | undefined {
+  const raw = c.req.query("manifests");
+  if (raw === undefined) return null;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > 1000) return undefined;
+  return value;
+}
+
 // --- vault routes (access token) ----------------------------------------------------------
 
 const accessAuth = async (c: Context<AppEnv>, next: () => Promise<void>) => {

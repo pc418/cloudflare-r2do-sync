@@ -27,6 +27,24 @@ export interface GcPlan {
   retainedEtags: Array<{ id: string; etag: string }>;
 }
 
+/** How far the one-time reference-index migration got, and whether it is finished. */
+export interface GcIndexProgress {
+  done: boolean;
+  /** Manifests whose delta this call recorded. */
+  indexed: number;
+  /** The link the next call resumes from, or null once the walk is complete. */
+  cursor: string | null;
+}
+
+/** One link of the manifest chain, with everything the index stores about it. */
+interface ChainLink {
+  id: string;
+  parent: string | null;
+  uploadedAt: number;
+  etag: string;
+  hashes: Set<string>;
+}
+
 /**
  * What an access token is allowed to do. `sync` is everything an ordinary device needs;
  * `reroot` is separate because it is the only operation that makes remote content stop
@@ -60,6 +78,14 @@ function parseScopes(stored: string | null): TokenScope[] {
  * sized in parameters and the row count falls out of how many columns it writes.
  */
 const MAX_SQL_PARAMS = 100;
+
+/**
+ * Manifests one `advanceGcIndex` call will read before handing control back. Deliberately
+ * modest: this is a once-per-vault migration, an incomplete index costs only retention (GC
+ * declines to delete rather than deleting wrongly), and a bound that no invocation can
+ * exceed is worth more than finishing in one go.
+ */
+const DEFAULT_GC_INDEX_CHUNK = 25;
 
 function setDifference(from: ReadonlySet<string>, without: ReadonlySet<string>): string[] {
   const out: string[] = [];
@@ -316,6 +342,17 @@ export class VaultLock extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM manifest_blob_deltas");
     this.ctx.storage.sql.exec("DELETE FROM manifest_index");
     this.ctx.storage.sql.exec("DELETE FROM current_blob_refs");
+    this.#setMeta("gc_index_cursor", "");
+  }
+
+  #writeIndexRow(link: { id: string; parent: string | null; uploadedAt: number; etag: string }): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO manifest_index (id, parent, uploaded_at, etag) VALUES (?, ?, ?, ?)",
+      link.id,
+      link.parent,
+      link.uploadedAt,
+      link.etag
+    );
   }
 
   /**
@@ -338,77 +375,140 @@ export class VaultLock extends DurableObject<Env> {
     });
   }
 
-  /**
-   * One-time migration for vaults deployed before commit-side reference indexing. This runs
-   * under the same in-flight fence as commit, so GC cannot acquire a deletion lease while
-   * the authoritative chain is being translated into SQLite.
-   *
-   * Walks newest-first holding only two adjacent hash sets. A real chain is a hundred-odd
-   * manifests of a third of a megabyte each, and each step needs exactly one neighbour, so
-   * keeping the parsed chain would spend ~100 MB of the isolate's memory to avoid nothing.
-   */
-  async #ensureGcIndex(): Promise<void> {
-    if (this.#gcIndexReady()) return;
-    // Completion is the only thing recorded, so an attempt that died partway leaves rows
-    // behind with no flag. Start from empty rather than layering onto a half-written index.
-    this.ctx.storage.transactionSync(() => this.#resetGcIndex());
+  #finishGcIndex(): void {
+    this.#setMeta("gc_index_cursor", "");
+    this.#setMeta("gc_index_backfilled", "1");
+  }
 
-    const head = this.#storedHead();
-    const visited = new Set<string>();
-    let cursor = head;
-    /** The manifest one step newer than `cursor`; its delta is what `cursor` reveals. */
-    let newer: { id: string; hashes: Set<string> } | null = null;
-    while (cursor !== null) {
-      if (visited.has(cursor)) throw new Error(`manifest chain cycles at ${cursor}`);
-      visited.add(cursor);
-      const object = await this.env.VAULT.get(`manifests/${cursor}.json`);
-      if (object === null) {
-        if (cursor === head) throw new Error(`head manifest ${cursor} is missing`);
-        break; // an ancestor trimmed by an earlier GC
-      }
-      const parsed = validateManifest(await object.json());
-      if (!parsed.ok) throw new Error(`stored manifest ${cursor} is invalid: ${parsed.message}`);
-      const manifest = parsed.manifest;
-      if (manifest.id !== cursor) {
-        throw new Error(`stored manifest ${cursor} identifies itself as ${manifest.id}`);
-      }
-      const hashes = new Set(manifestHashes(manifest));
-      const child = newer;
-      const uploadedAt = object.uploaded.getTime();
-      const etag = object.etag;
-      this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec(
-          "INSERT INTO manifest_index (id, parent, uploaded_at, etag) VALUES (?, ?, ?, ?)",
-          manifest.id,
-          manifest.parent,
-          uploadedAt,
-          etag
-        );
-        if (child === null) {
-          // The head's own set is the live set every older delta is replayed against.
-          this.#insertBatched(
-            (values) => `INSERT INTO current_blob_refs (hash) VALUES ${values}`,
-            [...hashes].map((hash) => [hash])
-          );
-        } else {
-          this.#writeBlobDeltas(
-            child.id,
-            setDifference(child.hashes, hashes),
-            setDifference(hashes, child.hashes)
-          );
-        }
-      });
-      newer = { id: manifest.id, hashes };
-      cursor = manifest.parent;
+  #isIndexed(id: string): boolean {
+    return (
+      this.ctx.storage.sql.exec("SELECT id FROM manifest_index WHERE id = ?", id).toArray().length >
+      0
+    );
+  }
+
+  async #readChainLink(id: string): Promise<ChainLink | null> {
+    const object = await this.env.VAULT.get(`manifests/${id}.json`);
+    if (object === null) return null;
+    const parsed = validateManifest(await object.json());
+    if (!parsed.ok) throw new Error(`stored manifest ${id} is invalid: ${parsed.message}`);
+    if (parsed.manifest.id !== id) {
+      throw new Error(`stored manifest ${id} identifies itself as ${parsed.manifest.id}`);
+    }
+    return {
+      id,
+      parent: parsed.manifest.parent,
+      uploadedAt: object.uploaded.getTime(),
+      etag: object.etag,
+      hashes: new Set(manifestHashes(parsed.manifest)),
+    };
+  }
+
+  /**
+   * The manifest the next delta is measured from: the head on a fresh start, wherever the
+   * previous call stopped on a resume. Null once there is nothing left to index.
+   */
+  async #startOrResumeGcIndex(): Promise<ChainLink | null> {
+    const cursor = this.#meta("gc_index_cursor");
+    if (cursor !== null && cursor !== "") {
+      const resumed = await this.#readChainLink(cursor);
+      // The cursor names a manifest already recorded as retained, and GC will not delete
+      // while the index is incomplete, so its disappearance is corruption rather than a race.
+      if (resumed === null) throw new Error(`gc index cursor ${cursor} vanished from R2`);
+      return resumed;
     }
 
-    const oldest = newer;
+    // Completion is the only thing recorded, so an abandoned earlier attempt leaves rows with
+    // no flag and no cursor. Start from empty rather than layering onto a half-written index.
+    this.ctx.storage.transactionSync(() => this.#resetGcIndex());
+    const head = this.#storedHead();
+    if (head === null) {
+      this.ctx.storage.transactionSync(() => this.#finishGcIndex());
+      return null;
+    }
+    const link = await this.#readChainLink(head);
+    if (link === null) throw new Error(`head manifest ${head} is missing`);
     this.ctx.storage.transactionSync(() => {
-      // The oldest manifest still on the chain has no indexed parent — whether it is the real
-      // root or the point an earlier GC trimmed — so everything it names counts as an addition.
-      if (oldest !== null) this.#writeBlobDeltas(oldest.id, [...oldest.hashes], []);
-      this.#setMeta("gc_index_backfilled", "1");
+      this.#writeIndexRow(link);
+      // The head's own set is the live set every older delta is replayed against.
+      this.#insertBatched(
+        (values) => `INSERT INTO current_blob_refs (hash) VALUES ${values}`,
+        [...link.hashes].map((hash) => [hash])
+      );
+      this.#setMeta("gc_index_cursor", link.id);
     });
+    return link;
+  }
+
+  /**
+   * Advances the one-time migration for vaults deployed before commit-side reference
+   * indexing by at most `maxManifests` links, and says whether it is finished.
+   *
+   * Bounded and resumable on purpose. The walk costs one R2 `GET` and one JSON parse per
+   * manifest — 104 manifests and 35.6 MB on the vault this was written for — while a request
+   * on the free plan gets 10 ms of CPU and Cron Triggers are documented only as 15 minutes of
+   * *wall* time, which is not a promise about CPU. So no invocation is assumed to finish it.
+   * Each step commits its rows and its cursor in one transaction, which makes an invocation
+   * killed mid-walk indistinguishable from one that stopped at its bound: the next call
+   * resumes from the last committed link instead of starting over.
+   */
+  async advanceGcIndex(opts: { maxManifests?: number } = {}): Promise<GcIndexProgress> {
+    if (this.#gcIndexReady()) return { done: true, indexed: 0, cursor: null };
+    const max = Math.max(1, opts.maxManifests ?? DEFAULT_GC_INDEX_CHUNK);
+    const run = this.#commitChain.then(async (): Promise<GcIndexProgress> => {
+      if (this.#gcIndexReady()) return { done: true, indexed: 0, cursor: null };
+      // The same fence a commit takes: GC cannot acquire a deletion lease, and no commit can
+      // advance the head, while the authoritative chain is being translated into SQLite.
+      this.#commitInFlight++;
+      try {
+        return await this.#advanceGcIndex(max);
+      } finally {
+        this.#commitInFlight--;
+      }
+    });
+    this.#commitChain = run.catch(() => {});
+    return run;
+  }
+
+  async #advanceGcIndex(maxManifests: number): Promise<GcIndexProgress> {
+    const start = await this.#startOrResumeGcIndex();
+    if (start === null) return { done: true, indexed: 0, cursor: null };
+    // Annotated because the loop reassigns it from a value derived from itself, which TS
+    // otherwise refuses to infer.
+    let child: ChainLink = start;
+
+    for (let indexed = 0; ; ) {
+      const older = child;
+      const parentId = older.parent;
+      // Either the real root or the point an earlier GC trimmed. Both mean this link has no
+      // indexed parent, so everything it names counts as an addition and the walk is over.
+      const parent = parentId === null ? null : await this.#readParentLink(parentId);
+      if (parent === null) {
+        this.ctx.storage.transactionSync(() => {
+          this.#writeBlobDeltas(older.id, [...older.hashes], []);
+          this.#finishGcIndex();
+        });
+        return { done: true, indexed: indexed + 1, cursor: null };
+      }
+      this.ctx.storage.transactionSync(() => {
+        this.#writeIndexRow(parent);
+        this.#writeBlobDeltas(
+          older.id,
+          setDifference(older.hashes, parent.hashes),
+          setDifference(parent.hashes, older.hashes)
+        );
+        this.#setMeta("gc_index_cursor", parent.id);
+      });
+      child = parent;
+      if (++indexed >= maxManifests) return { done: false, indexed, cursor: parent.id };
+    }
+  }
+
+  async #readParentLink(parentId: string): Promise<ChainLink | null> {
+    // A parent already in the index means the chain loops back into itself. Checked against a
+    // stored row rather than an in-memory visited set, because this walk spans invocations.
+    if (this.#isIndexed(parentId)) throw new Error(`manifest chain cycles at ${parentId}`);
+    return this.#readChainLink(parentId);
   }
 
   /**
@@ -446,22 +546,6 @@ export class VaultLock extends DurableObject<Env> {
         ...slice
       );
     }
-  }
-
-  /** Ensures legacy state is indexed without holding a GC lease across R2 reads. */
-  async ensureGcIndex(): Promise<void> {
-    if (this.#gcIndexReady()) return;
-    const run = this.#commitChain.then(async () => {
-      if (this.#gcIndexReady()) return;
-      this.#commitInFlight++;
-      try {
-        await this.#ensureGcIndex();
-      } finally {
-        this.#commitInFlight--;
-      }
-    });
-    this.#commitChain = run.catch(() => {});
-    await run;
   }
 
   /** Builds the retained union from indexed deltas only; no R2 manifest download occurs. */
