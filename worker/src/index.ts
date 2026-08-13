@@ -1,9 +1,10 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { ALL_SCOPES, VaultLock, isTokenScope, type TokenScope } from "./vault-lock";
-import { checkBlobs, getBlob, putBlob } from "./blobs";
+import { MAX_CHECK_BODY_BYTES, checkBlobs, getBlob, putBlob } from "./blobs";
 import { runGc } from "./gc";
 import { ULID_RE } from "./manifest";
+import { logPhase } from "./timing";
 import {
   MAX_SETTINGS_BYTES,
   SETTINGS_KEY,
@@ -166,9 +167,11 @@ app.delete("/api/tokens/:id", adminAuth, async (c) => {
 // --- vault routes (access token) ----------------------------------------------------------
 
 const accessAuth = async (c: Context<AppEnv>, next: () => Promise<void>) => {
+  const startedAt = performance.now();
   const token = bearer(c);
   if (token === null) return c.json(errJson("unauthorized", "missing bearer token"), 401);
   const verified = await vault(c.env).verifyToken(token);
+  logPhase("auth_rpc", startedAt, { authorized: verified !== null });
   if (verified === null) {
     return c.json(errJson("unauthorized", "invalid, revoked, or expired token"), 401);
   }
@@ -237,9 +240,17 @@ app.put("/api/settings", accessAuth, async (c) => {
 });
 
 app.post("/api/blobs/check", accessAuth, async (c) => {
+  const declaredLength = Number(c.req.header("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_CHECK_BODY_BYTES) {
+    return c.json(errJson("too_large", `request exceeds ${MAX_CHECK_BODY_BYTES} bytes`), 413);
+  }
   let body: unknown;
   try {
-    body = await c.req.json();
+    const raw = await c.req.text();
+    if (new TextEncoder().encode(raw).byteLength > MAX_CHECK_BODY_BYTES) {
+      return c.json(errJson("too_large", `request exceeds ${MAX_CHECK_BODY_BYTES} bytes`), 413);
+    }
+    body = JSON.parse(raw) as unknown;
   } catch {
     return c.json(errJson("bad_json", "request body must be JSON"), 400);
   }
@@ -264,6 +275,7 @@ app.get("/api/blobs/:hash", accessAuth, async (c) => {
 });
 
 app.post("/api/commit", accessAuth, async (c) => {
+  const startedAt = performance.now();
   let body: unknown;
   try {
     body = await c.req.json();
@@ -292,6 +304,7 @@ app.post("/api/commit", accessAuth, async (c) => {
     );
   }
   const result = await vault(c.env).commit(manifest, expectedHead, { reroot: reroot === true });
+  logPhase("commit", startedAt, { ok: result.ok });
   if (result.ok) return c.json({ head: result.head });
   switch (result.code) {
     case "stale_head":
@@ -316,6 +329,6 @@ export default {
   fetch: app.fetch,
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
     const report = await runGc(env);
-    console.log("gc report", JSON.stringify(report));
+    console.log(JSON.stringify({ event: "gc_report", ...report }));
   },
 };

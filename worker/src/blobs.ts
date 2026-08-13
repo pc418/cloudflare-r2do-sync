@@ -1,8 +1,10 @@
 import { HASH_RE } from "./manifest";
 import type { Env } from "./index";
+import { logPhase } from "./timing";
 
 export const MAX_BLOB_BYTES = 100 * 1024 * 1024; // Workers request-body limit (free plan)
-export const MAX_CHECK_HASHES = 1000;
+export const MAX_CHECK_HASHES = 100_000;
+export const MAX_CHECK_BODY_BYTES = 7 * 1024 * 1024;
 /** Below this size we buffer + verify before writing (no wrong-key window at all). */
 const BUFFER_VERIFY_LIMIT = 32 * 1024 * 1024;
 const HEAD_BATCH = 50;
@@ -29,9 +31,6 @@ export async function putBlob(env: Env, hash: string, request: Request): Promise
     return { ok: false, code: "bad_hash", message: "hash must be lowercase sha256 hex" };
   }
   const key = `blobs/${hash}`;
-  if ((await env.VAULT.head(key)) !== null) {
-    return { ok: true, existed: true }; // content-addressed: same key ⇒ same bytes
-  }
 
   const lenHeader = request.headers.get("content-length");
   const length = lenHeader === null ? null : Number(lenHeader);
@@ -49,18 +48,23 @@ export async function putBlob(env: Env, hash: string, request: Request): Promise
     if (actual !== hash) {
       return { ok: false, code: "hash_mismatch", message: `body hashes to ${actual}, not ${hash}` };
     }
-    await env.VAULT.put(key, buf);
-    return { ok: true, existed: false };
+    const stored = await env.VAULT.put(key, buf, {
+      onlyIf: { etagDoesNotMatch: "*" },
+    });
+    return { ok: true, existed: stored === null };
   }
 
   // Large path: stream to R2 with server-side checksum enforcement — R2 rejects
   // and discards the object atomically if the payload does not hash to `hash`.
   try {
-    await env.VAULT.put(key, request.body, { sha256: hash });
+    const stored = await env.VAULT.put(key, request.body, {
+      sha256: hash,
+      onlyIf: { etagDoesNotMatch: "*" },
+    });
+    return { ok: true, existed: stored === null };
   } catch (e) {
     return { ok: false, code: "hash_mismatch", message: e instanceof Error ? e.message : String(e) };
   }
-  return { ok: true, existed: false };
 }
 
 export async function getBlob(env: Env, hash: string): Promise<R2ObjectBody | null> {
@@ -79,6 +83,7 @@ export interface MissingBlobsOptions {
 
 /** One head() per requested hash. Cheap only while the request is small. */
 async function missingByHead(env: Env, hashes: string[]): Promise<string[]> {
+  const startedAt = performance.now();
   const missing: string[] = [];
   for (let i = 0; i < hashes.length; i += HEAD_BATCH) {
     const batch = hashes.slice(i, i + HEAD_BATCH);
@@ -87,20 +92,26 @@ async function missingByHead(env: Env, hashes: string[]): Promise<string[]> {
       if (r === null) missing.push(batch[j]);
     });
   }
+  logPhase("r2_check", startedAt, { strategy: "head", requested: hashes.length });
   return missing;
 }
 
 /** One listing per 1000 *stored* blobs, then a set difference. Cost is independent of how
  *  many hashes were asked about. */
 async function missingByListing(env: Env, hashes: string[], limit: number): Promise<string[]> {
+  const startedAt = performance.now();
   const present = new Set<string>();
+  let pages = 0;
   let cursor: string | undefined;
   do {
     const page = await env.VAULT.list({ prefix: "blobs/", cursor, limit });
+    pages++;
     for (const o of page.objects) present.add(o.key.slice("blobs/".length));
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor !== undefined);
-  return hashes.filter((h) => !present.has(h));
+  const missing = hashes.filter((h) => !present.has(h));
+  logPhase("r2_list", startedAt, { strategy: "inventory", requested: hashes.length, pages });
+  return missing;
 }
 
 /**

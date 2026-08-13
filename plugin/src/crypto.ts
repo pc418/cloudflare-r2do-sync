@@ -1,3 +1,5 @@
+import { exactArrayBuffer } from "./buffer";
+
 /**
  * End-to-end encryption for vault contents and metadata.
  *
@@ -30,7 +32,7 @@ export interface EncPayload {
 }
 
 function view(bytes: Uint8Array): ArrayBuffer {
-  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  return exactArrayBuffer(bytes);
 }
 
 export function toBase64(bytes: Uint8Array): string {

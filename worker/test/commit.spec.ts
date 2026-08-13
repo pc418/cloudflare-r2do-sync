@@ -75,6 +75,48 @@ describe("POST /api/commit", () => {
     expect(await headRes.json()).toEqual({ head: m2.id });
   });
 
+  it("records per-commit blob deltas and the current reference set in SQLite", async () => {
+    const a = await putBlob(token, "a");
+    const b = await putBlob(token, "b");
+    const c = await putBlob(token, "c");
+    const first = makeManifest({ files: { "a.md": { h: a }, "b.md": { h: b } } });
+    const second = makeManifest({
+      id: ulid(Date.now() + 1),
+      parent: first.id,
+      files: { "b.md": { h: b }, "c.md": { h: c } },
+    });
+    expect((await commit(token, first, null)).status).toBe(200);
+    expect((await commit(token, second, first.id)).status).toBe(200);
+
+    await runInDurableObject(env.VAULT_LOCK.getByName("default"), (_instance, state) => {
+      const indexed = state.storage.sql
+        .exec<{ id: string; parent: string | null }>(
+          "SELECT id, parent FROM manifest_index ORDER BY uploaded_at, id"
+        )
+        .toArray();
+      expect(indexed).toEqual([
+        { id: first.id, parent: null },
+        { id: second.id, parent: first.id },
+      ]);
+      const deltas = state.storage.sql
+        .exec<{ manifest_id: string; hash: string; delta: number }>(
+          "SELECT manifest_id, hash, delta FROM manifest_blob_deltas ORDER BY manifest_id, hash"
+        )
+        .toArray();
+      expect(deltas).toEqual(
+        [
+          { manifest_id: first.id, hash: a, delta: 1 },
+          { manifest_id: first.id, hash: b, delta: 1 },
+          { manifest_id: second.id, hash: a, delta: -1 },
+          { manifest_id: second.id, hash: c, delta: 1 },
+        ].sort((x, y) => x.manifest_id.localeCompare(y.manifest_id) || x.hash.localeCompare(y.hash))
+      );
+      expect(
+        state.storage.sql.exec<{ hash: string }>("SELECT hash FROM current_blob_refs ORDER BY hash").toArray()
+      ).toEqual([{ hash: b }, { hash: c }].sort((x, y) => x.hash.localeCompare(y.hash)));
+    });
+  });
+
   it("delete-by-omission round-trips", async () => {
     const h1 = await putBlob(token, "keep me");
     const h2 = await putBlob(token, "delete me");

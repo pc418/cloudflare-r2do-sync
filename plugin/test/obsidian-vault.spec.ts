@@ -10,6 +10,8 @@ class FakeDataAdapter {
   readonly systemTrash: string[] = [];
   readonly localTrash: string[] = [];
   systemTrashAvailable = true;
+  readonly statCalls: string[] = [];
+  readonly listCalls: string[] = [];
 
   addFile(path: string, text: string, mtime = 1): void {
     this.entries.set(path, { type: "file", bytes: new TextEncoder().encode(text), mtime });
@@ -20,6 +22,7 @@ class FakeDataAdapter {
   }
 
   async list(path: string): Promise<{ files: string[]; folders: string[] }> {
+    this.listCalls.push(path);
     const prefix = path === "" ? "" : `${path}/`;
     const files: string[] = [];
     const folders = new Set<string>();
@@ -38,6 +41,7 @@ class FakeDataAdapter {
   }
 
   async stat(path: string): Promise<{ type: "file" | "folder"; ctime: number; mtime: number; size: number } | null> {
+    this.statCalls.push(path);
     const entry = this.entries.get(path);
     if (entry === undefined) return null;
     if (entry.type === "folder") return { type: "folder", ctime: 0, mtime: 0, size: 0 };
@@ -74,8 +78,8 @@ class FakeDataAdapter {
   }
 }
 
-function vault(adapter: FakeDataAdapter): ObsidianVault {
-  return new ObsidianVault({ vault: { adapter } } as never);
+function vault(adapter: FakeDataAdapter, lanes = 4): ObsidianVault {
+  return new ObsidianVault({ vault: { adapter } } as never, lanes);
 }
 
 describe("ObsidianVault DataAdapter bridge", () => {
@@ -90,6 +94,65 @@ describe("ObsidianVault DataAdapter bridge", () => {
       { path: ".obsidian/plugins/other/data.json", size: 6, mtime: 30 },
       { path: "note.md", size: 4, mtime: 10 },
     ]);
+    expect(adapter.statCalls).toEqual([
+      expect.stringMatching(/\.json$|\.md$/),
+      expect.stringMatching(/\.json$|\.md$/),
+      expect.stringMatching(/\.json$|\.md$/),
+    ]);
+    expect(adapter.statCalls).not.toContain(".obsidian");
+    expect(adapter.statCalls).not.toContain(".obsidian/plugins");
+  });
+
+  it("keeps deterministic output under shuffled bounded adapter completion", async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.addFile("z/slow.md", "slow", 30);
+    adapter.addFile("a/fast.md", "fast", 10);
+    adapter.addFile("m/mid.md", "mid", 20);
+    let active = 0;
+    let peak = 0;
+    const originalList = adapter.list.bind(adapter);
+    adapter.list = async (path) => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, path === "z" ? 8 : 1));
+      try {
+        return await originalList(path);
+      } finally {
+        active--;
+      }
+    };
+
+    await expect(vault(adapter, 2).list()).resolves.toEqual([
+      { path: "a/fast.md", size: 4, mtime: 10 },
+      { path: "m/mid.md", size: 3, mtime: 20 },
+      { path: "z/slow.md", size: 4, mtime: 30 },
+    ]);
+    expect(peak).toBeLessThanOrEqual(2);
+  });
+
+  it("propagates a stat failure only after in-flight lanes settle and starts no straggler", async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.addFile("a.md", "a");
+    adapter.addFile("b.md", "b");
+    adapter.addFile("c.md", "c");
+    const started: string[] = [];
+    let active = 0;
+    const originalStat = adapter.stat.bind(adapter);
+    adapter.stat = async (path) => {
+      started.push(path);
+      active++;
+      try {
+        await new Promise((resolve) => setTimeout(resolve, path === "a.md" ? 1 : 8));
+        if (path === "a.md") throw new Error("stat failed");
+        return await originalStat(path);
+      } finally {
+        active--;
+      }
+    };
+
+    await expect(vault(adapter, 2).list()).rejects.toThrow(/stat failed/);
+    expect(active).toBe(0);
+    expect(started).toEqual(["a.md", "b.md"]);
   });
 
   it("creates parents, writes, reads, and trashes through the adapter", async () => {

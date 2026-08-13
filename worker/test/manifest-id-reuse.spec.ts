@@ -1,4 +1,4 @@
-import { SELF, env } from "cloudflare:test";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, beforeEach } from "vitest";
 import { runGc } from "../src/gc";
 import { BASE, authed, commit, makeManifest, mintToken, putBlob, ulid } from "./helpers";
@@ -153,20 +153,42 @@ describe("manifest id reuse", () => {
 });
 
 describe("gc chain walking", () => {
-  it("fails closed on a cyclic chain instead of walking until the CPU limit", async () => {
+  it("fails closed when a retained manifest is rewritten in R2 behind the index", async () => {
     const h = await putBlob(token, "cycle content");
     const m1 = makeManifest({ files: { "a.md": { h } } });
     await commitOk(m1, null);
     const m2 = makeManifest({ id: ulid(Date.now() + 1), parent: m1.id, files: { "a.md": { h } } });
     await commitOk(m2, m1.id);
 
-    // Corruption that predates the registry: the root now points back at its own child.
+    // Corruption that predates the registry: the root now points back at its own child. GC
+    // plans from the Durable Object's index rather than from R2, so what catches this is the
+    // stored ETag no longer matching — which catches every out-of-band rewrite, not just the
+    // ones that happen to close a cycle.
     await env.VAULT.put(`manifests/${m1.id}.json`, JSON.stringify({ ...m1, parent: m2.id }));
+
+    await expect(runGc(env, { now: Date.now(), keepCount: 50, minAgeMs: 0 })).rejects.toThrow(
+      /changed in R2 after it was indexed/
+    );
+    // Fail-closed means nothing was deleted on the way to noticing.
+    expect(await env.VAULT.head(`blobs/${h}`)).not.toBeNull();
+  });
+
+  it("fails closed on a cyclic pre-index chain instead of walking until the CPU limit", async () => {
+    const h = await putBlob(token, "legacy cycle content");
+    const m1 = makeManifest({ files: { "a.md": { h } } });
+    const m2 = makeManifest({ id: ulid(Date.now() + 1), parent: m1.id, files: { "a.md": { h } } });
+    // A vault from before reference indexing: history in R2, an authoritative head, and no
+    // index. The backfill is the only walk that reads R2's parent pointers, so it is the one
+    // that has to notice the cycle.
+    await env.VAULT.put(`manifests/${m1.id}.json`, JSON.stringify({ ...m1, parent: m2.id }));
+    await env.VAULT.put(`manifests/${m2.id}.json`, JSON.stringify(m2));
+    await runInDurableObject(env.VAULT_LOCK.getByName("default"), (_instance, state) => {
+      state.storage.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?)", m2.id);
+    });
 
     await expect(runGc(env, { now: Date.now(), keepCount: 50, minAgeMs: 0 })).rejects.toThrow(
       /manifest chain cycles at/
     );
-    // Fail-closed means nothing was deleted on the way to noticing.
     expect(await env.VAULT.head(`blobs/${h}`)).not.toBeNull();
   });
 });

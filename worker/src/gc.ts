@@ -1,5 +1,5 @@
 import type { Env } from "./index";
-import { manifestHashes, type Manifest } from "./manifest";
+import { logPhase } from "./timing";
 
 export interface GcOptions {
   now?: number;
@@ -11,6 +11,8 @@ export interface GcOptions {
   minAgeMs?: number;
   /** Upper bound on how long this run may hold commits off. */
   leaseTtlMs?: number;
+  /** Test seam: move the head after planning but before the fenced delete phase. */
+  testHookBeforeLease?: () => Promise<void>;
 }
 
 export interface GcReport {
@@ -26,18 +28,41 @@ const DAY = 24 * 60 * 60 * 1000;
 /** Generous against a full sweep of this bucket, short enough that a killed run unblocks
  *  commits again long before the next daily trigger. */
 const DEFAULT_LEASE_TTL_MS = 5 * 60 * 1000;
-/** Manifests walked between lease renewals. Small enough that a long chain cannot lapse. */
-const LEASE_RENEW_EVERY = 25;
-
-async function listAll(env: Env, prefix: string): Promise<R2Object[]> {
-  const objects: R2Object[] = [];
+async function collectDead(
+  env: Env,
+  prefix: string,
+  live: ReadonlySet<string>,
+  uploadedBefore: (object: R2Object) => boolean,
+  expectedEtags?: ReadonlyMap<string, string>
+): Promise<Array<{ key: string; id: string }>> {
+  const dead: Array<{ key: string; id: string }> = [];
+  const seenExpected = new Set<string>();
   let cursor: string | undefined;
   do {
     const page = await env.VAULT.list({ prefix, cursor });
-    objects.push(...page.objects);
+    for (const object of page.objects) {
+      const id = object.key.slice(prefix.length).replace(prefix === "manifests/" ? /\.json$/ : /$^/, "");
+      const expectedEtag = expectedEtags?.get(id);
+      if (expectedEtag !== undefined) {
+        seenExpected.add(id);
+        if (object.etag !== expectedEtag) {
+          throw new Error(
+            `retained manifest ${id} changed in R2 after it was indexed; refusing GC`
+          );
+        }
+      }
+      if (!live.has(id) && uploadedBefore(object)) dead.push({ key: object.key, id });
+    }
     cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-  return objects;
+  } while (cursor !== undefined);
+  if (expectedEtags !== undefined) {
+    for (const id of expectedEtags.keys()) {
+      if (!seenExpected.has(id)) {
+        throw new Error(`retained manifest ${id} is missing; refusing GC`);
+      }
+    }
+  }
+  return dead;
 }
 
 /**
@@ -57,6 +82,7 @@ async function listAll(env: Env, prefix: string): Promise<R2Object[]> {
  *    successful commit can never name a blob this run removed.
  */
 export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
+  const gcStartedAt = performance.now();
   const now = opts.now ?? Date.now();
   const keepCount = opts.keepCount ?? 50;
   const keepDays = opts.keepDays ?? 30;
@@ -72,111 +98,103 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
   };
 
   const lock = env.VAULT_LOCK.getByName("default");
+  await lock.ensureGcIndex();
+  const plan = await lock.getGcPlan({ keepCount, ageCutoff });
+  logPhase("gc_plan", gcStartedAt, {
+    retainedManifests: plan.retainedIds.length,
+    retainedBlobs: plan.liveHashes.length,
+  });
+  if (plan.head === null) {
+    await opts.testHookBeforeLease?.();
+    const lease = await lock.acquireGcLease({
+      nowMs: Date.now(),
+      ttlMs: opts.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS,
+    });
+    if (!lease.ok) {
+      report.skipped = lease.reason;
+      return report;
+    }
+    try {
+      report.skipped = lease.head === null ? "no_head" : "head_moved";
+      return report;
+    } finally {
+      await lock.releaseGcLease(lease.leaseId);
+    }
+  }
+  if ((await env.VAULT.head(`manifests/${plan.head}.json`)) === null) {
+    throw new Error(`head manifest ${plan.head} is missing; refusing to run GC`);
+  }
+
+  const retainedIds = new Set(plan.retainedIds);
+  const liveHashes = new Set(plan.liveHashes);
+  report.retainedManifests = retainedIds.size;
+  report.retainedBlobs = liveHashes.size;
+  const uploadedBefore = (object: R2Object) => object.uploaded.getTime() < now - minAgeMs;
+
+  // R2 scanning is deliberately outside the exclusion window. Only dead candidates are
+  // retained, page by page; whole bucket listings are never accumulated in memory.
+  const deadManifests = await collectDead(
+    env,
+    "manifests/",
+    retainedIds,
+    uploadedBefore,
+    new Map(plan.retainedEtags.map(({ id, etag }) => [id, etag]))
+  );
+  const deadBlobs = await collectDead(env, "blobs/", liveHashes, uploadedBefore);
+  await opts.testHookBeforeLease?.();
+
   const ttlMs = opts.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
-  // Real time, not the caller's logical `now`: this bounds a live exclusion window.
   const lease = await lock.acquireGcLease({ nowMs: Date.now(), ttlMs });
   if (!lease.ok) {
     console.log(`gc: declined the lease (${lease.reason}); skipping this run`);
     report.skipped = lease.reason;
     return report;
   }
-
-  /**
-   * The exclusion has to hold for the WHOLE sweep, not just its first instant. A lease that
-   * quietly expired mid-run stops holding commits off, so a snapshot can land and make the
-   * live set computed below stale — deleting against it would then remove blobs the new head
-   * references. Renewing before every step that could act on that set turns "the lease
-   * lapsed" into a loud abort instead of silent data loss.
-   */
-  const holdLease = async (): Promise<void> => {
-    if (!(await lock.renewGcLease(lease.leaseId, { nowMs: Date.now(), ttlMs }))) {
-      throw new Error(
-        "gc: lost the deletion lease mid-sweep (it expired, or another run took it); " +
-          "aborting rather than deleting against a live set that may be stale"
-      );
-    }
-  };
-
   try {
-    const head = lease.head;
-    if (head === null) {
-      // Either an empty vault or a Durable Object that has lost its storage. Deleting on
-      // "the authority knows of no head" would empty a populated bucket, so it never does.
-      report.skipped = "no_head";
+    if (lease.head !== plan.head) {
+      report.skipped = "head_moved";
       return report;
     }
-    await repairHeadMirror(env, head);
-
-    // Walk the head chain; retain while within keepCount OR younger than keepDays.
-    const retainedIds = new Set<string>();
-    const liveHashes = new Set<string>();
-    const visited = new Set<string>();
-    let cursor: string | null = head;
-    let depth = 0;
-    while (cursor !== null) {
-      // Manifest IDs are refused once used, so a cycle means history was corrupted before
-      // that rule existed — or around it. Either way the live set below would be a
-      // half-walk, and deleting against a half-walk destroys reachable data.
-      if (visited.has(cursor)) {
-        throw new Error(`manifest chain cycles at ${cursor}; refusing to run GC`);
+    const holdLease = async (): Promise<void> => {
+      if (!(await lock.renewGcLease(lease.leaseId, { nowMs: Date.now(), ttlMs }))) {
+        throw new Error(
+          "gc: lost the deletion lease mid-sweep (it expired, or another run took it); " +
+            "aborting rather than deleting against a live set that may be stale"
+        );
       }
-      visited.add(cursor);
+    };
 
-      if (depth % LEASE_RENEW_EVERY === 0) await holdLease();
-      const obj: R2ObjectBody | null = await env.VAULT.get(`manifests/${cursor}.json`);
-      if (obj === null) {
-        // A missing ancestor after retained snapshots is expected once an earlier GC trimmed
-        // history. A missing *head* is different: there is no trustworthy live set, so any
-        // deletion would be blind and can destroy the actual vault.
-        if (depth === 0) throw new Error(`head manifest ${cursor} is missing; refusing to run GC`);
-        console.log(`gc: chain broken at ${cursor}, stopping walk`);
-        break;
-      }
-      // Age comes from when R2 accepted the object, never from `createdAt` — that is a
-      // client-chosen string. A far-future one would make ancient snapshots permanently
-      // "young" and stop history from ever being collected; a far-past one would expire
-      // history early. The upload time is the server's own record and cannot be dictated.
-      const uploadedAt = obj.uploaded.getTime();
-      const m: Manifest = await obj.json();
-      const young = uploadedAt >= ageCutoff;
-      if (depth >= keepCount && !young) break; // older links are older still
-      retainedIds.add(m.id);
-      for (const h of manifestHashes(m)) liveHashes.add(h);
-      cursor = m.parent;
-      depth++;
-    }
-    report.retainedManifests = retainedIds.size;
-    report.retainedBlobs = liveHashes.size;
-
-    const uploadedBefore = (o: R2Object) => o.uploaded.getTime() < now - minAgeMs;
-
-    // The walk is finished; the live set is fixed from here. Everything below deletes.
+    await repairHeadMirror(env, plan.head);
+    const deleteStartedAt = performance.now();
+    // Verify ownership even when this particular run found no aged candidates. A lapsed
+    // sweep must never report completion, because its plan was no longer fenced.
     await holdLease();
-    const manifestObjects = await listAll(env, "manifests/");
-    const deadManifests = manifestObjects.filter((o) => {
-      const id = o.key.slice("manifests/".length).replace(/\.json$/, "");
-      return !retainedIds.has(id) && uploadedBefore(o);
-    });
     for (let i = 0; i < deadManifests.length; i += 100) {
       await holdLease();
-      await env.VAULT.delete(deadManifests.slice(i, i + 100).map((o) => o.key));
+      await env.VAULT.delete(deadManifests.slice(i, i + 100).map((object) => object.key));
     }
     report.deletedManifests = deadManifests.length;
-
-    const blobObjects = await listAll(env, "blobs/");
-    const deadBlobs = blobObjects.filter((o) => {
-      const hash = o.key.slice("blobs/".length);
-      return !liveHashes.has(hash) && uploadedBefore(o);
-    });
     for (let i = 0; i < deadBlobs.length; i += 100) {
       await holdLease();
-      await env.VAULT.delete(deadBlobs.slice(i, i + 100).map((o) => o.key));
+      await env.VAULT.delete(deadBlobs.slice(i, i + 100).map((object) => object.key));
     }
     report.deletedBlobs = deadBlobs.length;
-
+    await holdLease();
+    if (
+      !(await lock.pruneGcIndex(
+        lease.leaseId,
+        plan.head,
+        deadManifests.map((object) => object.id)
+      ))
+    ) {
+      throw new Error("gc: lost the deletion lease before pruning its reference index");
+    }
+    logPhase("gc_delete", deleteStartedAt, {
+      deletedManifests: report.deletedManifests,
+      deletedBlobs: report.deletedBlobs,
+    });
     return report;
   } finally {
-    // Ownership-checked: a sweep that lapsed must not clear a lease a later one now holds.
     await lock.releaseGcLease(lease.leaseId);
   }
 }

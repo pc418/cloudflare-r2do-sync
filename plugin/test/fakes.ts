@@ -8,6 +8,8 @@ import type { SyncApiLike } from "../src/sync";
 export class FakeVault implements VaultAdapter {
   files = new Map<string, { data: Uint8Array; mtime: number }>();
   reads: string[] = [];
+  listCalls = 0;
+  stats: string[] = [];
   writes: string[] = [];
   removes: string[] = [];
   /** Every engine-driven write gets a fresh mtime, as a real filesystem would. */
@@ -48,11 +50,20 @@ export class FakeVault implements VaultAdapter {
   }
 
   async list(): Promise<VaultFile[]> {
+    this.listCalls++;
     return [...this.files.entries()].map(([path, f]) => ({
       path,
       size: f.data.byteLength,
       mtime: f.mtime,
     }));
+  }
+
+  async stat(path: string): Promise<VaultFile | null> {
+    this.stats.push(path);
+    const file = this.files.get(path);
+    return file === undefined
+      ? null
+      : { path, size: file.data.byteLength, mtime: file.mtime };
   }
 
   /**

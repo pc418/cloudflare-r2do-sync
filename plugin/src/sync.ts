@@ -232,6 +232,15 @@ interface Snapshot {
   lines: LineCounts;
   /** Every on-disk path, including excluded/skipped ones, for collision-safe planning. */
   occupiedPaths: string[];
+  /** All discovered files, including excluded/skipped paths. Device-local, never on the wire. */
+  inventory: Record<string, VaultFile>;
+}
+
+interface SnapshotBuildOptions {
+  dirtyPaths: string[];
+  baseFiles: Record<string, FileEntry>;
+  baseLines: LineCounts;
+  baseInventory: Record<string, VaultFile>;
 }
 
 interface RemoteCollisionResolution {
@@ -258,6 +267,8 @@ export interface EncryptionMigrationResult {
 }
 
 export interface SyncPassOptions {
+  /** Internal scheduler flag: startup/resume/manual/periodic passes are correctness audits. */
+  fullScan?: boolean;
   /**
    * Force this device's snapshot over the remote: absorb the remote head only as the CAS
    * parent, apply nothing from it, and do not consult the mass-change guard — the operator
@@ -389,6 +400,8 @@ export class SyncEngine {
   readonly #lanes: number;
 
   #state: SyncState | null = null;
+  readonly #dirtyPaths = new Set<string>();
+  #dirtyRequiresFullScan = false;
   status: SyncStatus = { phase: "idle" };
 
   constructor(opts: SyncEngineOptions) {
@@ -437,6 +450,14 @@ export class SyncEngine {
     }
   }
 
+  /** Records exact event paths. Folder events request a full scan because they cover a subtree. */
+  markDirty(paths: readonly string[], opts: { fullScan?: boolean } = {}): void {
+    for (const path of paths) {
+      if (path !== "") this.#dirtyPaths.add(path);
+    }
+    if (opts.fullScan === true) this.#dirtyRequiresFullScan = true;
+  }
+
   async sync(opts: SyncPassOptions = {}): Promise<SyncResult> {
     const reroot = opts.reroot ?? null;
     const previewedHead = opts.previewedHead;
@@ -456,10 +477,19 @@ export class SyncEngine {
     // the vault, and a pass that began halfway through one would plan against a snapshot that
     // is half old and half new. The scheduler already serialises passes against each other.
     if (this.status.phase === "syncing") throw new Error("sync is already running");
+    const capturedDirty = [...this.#dirtyPaths];
+    for (const path of capturedDirty) this.#dirtyPaths.delete(path);
+    const capturedFullScan = this.#dirtyRequiresFullScan;
+    this.#dirtyRequiresFullScan = false;
     this.status = { phase: "syncing" };
     try {
-      return await this.#sync(keepLocal, reroot, previewedHead);
+      return await this.#sync(keepLocal, reroot, previewedHead, {
+        fullScan: opts.fullScan === true || capturedFullScan,
+        dirtyPaths: capturedDirty,
+      });
     } catch (e) {
+      for (const path of capturedDirty) this.#dirtyPaths.add(path);
+      if (capturedFullScan) this.#dirtyRequiresFullScan = true;
       if (e instanceof HaltError) return this.#halt(e.message);
       if (this.status.phase === "syncing") {
         this.status = { phase: "error", message: e instanceof Error ? e.message : String(e) };
@@ -490,7 +520,11 @@ export class SyncEngine {
   async #sync(
     forceKeepLocal = false,
     reroot: { previewedHead: string | null } | null = null,
-    previewedHead?: string | null
+    previewedHead?: string | null,
+    requestedScan: { fullScan: boolean; dirtyPaths: string[] } = {
+      fullScan: true,
+      dirtyPaths: [],
+    }
   ): Promise<SyncResult> {
     const loaded = this.#state ?? (await this.#store.load()) ?? {
       lastSyncedHead: null,
@@ -527,6 +561,21 @@ export class SyncEngine {
     let baseBlobs = new Set(Object.values(state.files).map(blobKey));
     /** Line counts for the snapshot this pass starts from; the baseline for every net figure. */
     const baseLines = state.lines;
+    let incrementalScan =
+      !requestedScan.fullScan &&
+      requestedScan.dirtyPaths.length > 0 &&
+      state.inventory !== undefined;
+    const buildSnapshot = (): Promise<Snapshot> =>
+      this.#buildSnapshot(
+        incrementalScan
+          ? {
+              dirtyPaths: requestedScan.dirtyPaths,
+              baseFiles: state.files,
+              baseLines: state.lines ?? pathMap<number>(),
+              baseInventory: state.inventory!,
+            }
+          : undefined
+      );
 
     const outcome: MergeOutcome = { pulled: 0, merged: 0, pulledChanges: [], conflicts: [], conflictDetails: [] };
 
@@ -572,6 +621,13 @@ export class SyncEngine {
       };
 
       if (serverHead !== null && serverHead !== baseHead) {
+        // A pass that touches the remote is a full audit from here on, and that has to include
+        // the snapshot the plan is built from — not just the one that gets published. An
+        // event journal describes edits, not the whole vault, so its `skipped` list covers
+        // only journaled paths; planning against it would leave a locally oversized or
+        // invalid file out of `untouchable` and let the remote copy overwrite it. Applying
+        // the remote then touches paths the journal never mentioned either.
+        incrementalScan = false;
         const remote = await this.#api.getManifest(serverHead);
         const mismatch = this.#modeError(remote, serverHead);
         if (mismatch !== null) return this.#halt(mismatch, outcome);
@@ -580,7 +636,7 @@ export class SyncEngine {
         // these, are the blobs the manifest we are about to parent onto references.
         const remoteBlobs = new Set(Object.values(remoteFiles).map(blobKey));
 
-        const local = await this.#buildSnapshot();
+        const local = await buildSnapshot();
         remoteSkipped = local.skipped;
         const collisionResolution = this.#resolveRemoteCaseCollisions(
           remoteFiles,
@@ -690,7 +746,7 @@ export class SyncEngine {
       }
 
       // What our commit will be layered on: the snapshot we are about to parent onto.
-      const { files, skipped, lines: freshLines } = await this.#buildSnapshot();
+      const { files, skipped, lines: freshLines, inventory } = await buildSnapshot();
       const carried = this.#carry(baseFiles, untouchable(skipped));
 
       // Excludes govern discovery, so a prior remote-only entry remains part of the
@@ -710,6 +766,14 @@ export class SyncEngine {
       // A reroot commits even when nothing changed: discarding history IS the change, and
       // "your files already match" is not an answer to "stop storing the old versions".
       if (reroot === null && remoteFiles === null && !keyMigrationPending && sameFiles(finalFiles, baseFiles)) {
+        this.#state = {
+          lastSyncedHead: baseHead,
+          files: finalFiles,
+          keyId,
+          lines: carryLineCounts(finalFiles, baseLines, freshLines),
+          inventory,
+        };
+        await this.#store.save(this.#state);
         this.status = { phase: "idle", lastSyncAt: this.#now() };
         return this.#result({
           status: "unchanged",
@@ -731,6 +795,7 @@ export class SyncEngine {
           files: finalFiles,
           keyId,
           lines: carryLineCounts(finalFiles, baseLines, freshLines),
+          inventory,
         };
         await this.#store.save(this.#state);
         this.status = { phase: "idle", lastSyncAt: this.#now() };
@@ -815,6 +880,7 @@ export class SyncEngine {
         files: finalFiles,
         keyId,
         lines: carryLineCounts(finalFiles, baseLines, freshLines),
+        inventory,
       };
       await this.#store.save(this.#state);
       this.status = { phase: "idle", lastSyncAt: this.#now() };
@@ -1917,13 +1983,40 @@ export class SyncEngine {
     await this.#api.putBlob(hash, cipher);
   }
 
-  async #buildSnapshot(): Promise<Snapshot> {
-    const files = pathMap<FileEntry>();
-    const lines: LineCounts = pathMap<number>();
+  async #buildSnapshot(options?: SnapshotBuildOptions): Promise<Snapshot> {
+    const files =
+      options === undefined ? pathMap<FileEntry>() : copyPathMap(options.baseFiles);
+    const lines: LineCounts =
+      options === undefined ? pathMap<number>() : copyPathMap(options.baseLines);
+    const inventory =
+      options === undefined ? pathMap<VaultFile>() : copyPathMap(options.baseInventory);
     const skipped: SkippedFile[] = [];
     const scan: VaultFileToRead[] = [];
-    const listed = await this.#vault.list();
-    const occupiedPaths = listed.map((file) => file.path);
+    let listed: VaultFile[];
+    if (options === undefined) {
+      listed = await this.#vault.list();
+      for (const file of listed) inventory[file.path] = file;
+    } else {
+      const stats = await mapPool(options.dirtyPaths, this.#lanes, (path) =>
+        this.#vault.stat(path)
+      );
+      listed = [];
+      for (let i = 0; i < options.dirtyPaths.length; i++) {
+        const path = options.dirtyPaths[i];
+        delete inventory[path];
+        delete files[path];
+        delete lines[path];
+        const file = stats[i];
+        if (file !== null) {
+          inventory[path] = file;
+          listed.push(file);
+        }
+      }
+    }
+    // Sorted, not insertion-ordered: an incremental scan re-appends the paths it restated, and
+    // collision planning groups case-folded spellings in this order. Snapshot and conflict
+    // order must not depend on which files happened to be journaled.
+    const occupiedPaths = Object.keys(inventory).sort((a, b) => a.localeCompare(b));
 
     for (const file of [...listed].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
       // Silent skips: excludes are the user's choice and junk/self-excludes are not
@@ -1973,6 +2066,19 @@ export class SyncEngine {
       if (this.#crypto === null) {
         return { kind: "file", path: file.path, entry: common, lines: count };
       }
+      const cached = this.#state?.files[file.path];
+      if (
+        (this.#state?.keyId ?? null) === this.#crypto.keyId &&
+        cached?.h === h &&
+        cached.c !== undefined
+      ) {
+        return {
+          kind: "file",
+          path: file.path,
+          entry: { ...common, c: cached.c },
+          lines: count,
+        };
+      }
       const cipher = await this.#crypto.encryptBlob(h, bytes);
       const c = await sha256Hex(cipher);
       return {
@@ -1991,7 +2097,7 @@ export class SyncEngine {
       files[item.path] = item.entry;
       if (item.lines !== null) lines[item.path] = item.lines;
     }
-    return { files, skipped, lines, occupiedPaths };
+    return { files, skipped, lines, occupiedPaths, inventory };
   }
 }
 

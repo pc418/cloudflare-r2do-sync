@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { SyncEngine } from "../src/sync";
 import { StaleHeadError } from "../src/api";
 import { FakeServer, FakeStore, FakeVault } from "./fakes";
@@ -107,6 +107,88 @@ describe("SyncEngine.sync — happy paths", () => {
     expect(server.uploads).toEqual([]);
     const m = server.manifests.get(server.head!)!;
     expect(Object.keys(plainFiles(m))).toEqual(["new.md"]);
+  });
+
+  it("uses only journaled paths for an event-driven pass", async () => {
+    vault.set("a.md", "one");
+    vault.set("b.md", "two");
+    await engine.sync({ fullScan: true });
+    vault.listCalls = 0;
+    vault.stats.length = 0;
+    vault.reads.length = 0;
+
+    vault.set("a.md", "one edited", now + 1000);
+    engine.markDirty(["a.md"]);
+    await engine.sync();
+
+    expect(vault.listCalls).toBe(0);
+    expect(vault.stats).toEqual(["a.md"]);
+    expect(vault.reads).not.toContain("b.md");
+    expect(plainFiles(server.manifests.get(server.head!)!)["a.md"].h).toBe(
+      await hex("one edited")
+    );
+  });
+
+  it("journals both sides of a rename", async () => {
+    vault.set("old.md", "same bytes");
+    await engine.sync({ fullScan: true });
+    vault.listCalls = 0;
+    vault.stats.length = 0;
+
+    vault.rename("old.md", "new.md");
+    engine.markDirty(["old.md", "new.md"]);
+    await engine.sync();
+
+    expect(vault.listCalls).toBe(0);
+    expect(vault.stats).toEqual(["old.md", "new.md"]);
+    expect(Object.keys(plainFiles(server.manifests.get(server.head!)!))).toEqual(["new.md"]);
+  });
+
+  it("audits the whole vault before planning against a moved remote head", async () => {
+    vault.set("keep.md", "small");
+    vault.set("big.md", "shared version");
+    await engine.sync({ fullScan: true });
+    // Now oversized on this device only: skipped locally, carried from the remote snapshot.
+    vault.set("big.md", new Uint8Array(2048), now + 1000);
+    expect((await engine.sync({ fullScan: true })).skipped).toEqual([
+      { path: "big.md", reason: "exceeds 1024 byte limit" },
+    ]);
+
+    // Another device edits the very path this one cannot read, and the journal for this pass
+    // knows nothing about it. Planning from the journal alone would leave "big.md" out of
+    // `untouchable` and overwrite 2 KB of local content with the remote copy.
+    await server.seedRemoteCommit({ "keep.md": "small", "big.md": "their edit" });
+    vault.set("keep.md", "small edited", now + 2000);
+    engine.markDirty(["keep.md"]);
+
+    const res = await engine.sync();
+
+    expect(res.status).toBe("committed");
+    expect(vault.writes).not.toContain("big.md");
+    expect(vault.files.get("big.md")!.data.byteLength).toBe(2048);
+    // Carried through untouched, so the other device keeps its version of the path.
+    expect(plainFiles(server.manifests.get(server.head!)!)["big.md"].h).toBe(
+      await hex("their edit")
+    );
+  });
+
+  it("repairs a change missed by the journal on the next full audit", async () => {
+    vault.set("missed.md", "before");
+    vault.set("observed.md", "stable");
+    await engine.sync({ fullScan: true });
+    const beforeAudit = server.head;
+
+    // Simulates an out-of-band adapter write that emitted no Obsidian event.
+    vault.set("missed.md", "after", now + 1000);
+    engine.markDirty(["observed.md"]);
+    expect((await engine.sync()).status).toBe("unchanged");
+    expect(server.head).toBe(beforeAudit);
+
+    const audit = await engine.sync({ fullScan: true });
+    expect(audit.status).toBe("committed");
+    expect(plainFiles(server.manifests.get(server.head!)!)["missed.md"].h).toBe(
+      await hex("after")
+    );
   });
 
   it("chains each commit onto the previous head", async () => {
@@ -1100,6 +1182,22 @@ describe("SyncEngine.sync — encrypted", () => {
     expect(res.status).toBe("committed");
     expect(res.uploaded).toBe(1);
     expect(server.uploads).toHaveLength(1);
+  });
+
+  it("reuses cached ciphertext for unchanged files and encrypts changed files", async () => {
+    vault.set("a.md", "one");
+    vault.set("b.md", "two");
+    await encEngine.sync({ fullScan: true });
+    const encrypt = vi.spyOn(crypto_, "encryptBlob");
+
+    expect((await encEngine.sync({ fullScan: true })).status).toBe("unchanged");
+    expect(encrypt).not.toHaveBeenCalled();
+
+    vault.set("a.md", "one edited", now + 1000);
+    await encEngine.sync({ fullScan: true });
+    expect(encrypt).toHaveBeenCalled();
+    expect(encrypt.mock.calls.every(([, bytes]) => new TextDecoder().decode(bytes) === "one edited"))
+      .toBe(true);
   });
 
   it("re-encrypts on demand when a cached blob has gone missing server-side", async () => {

@@ -141,6 +141,15 @@ describe("keyId", () => {
 });
 
 describe("blob encryption", () => {
+  it("encrypts only an offset subview", async () => {
+    const c = await VaultCrypto.create(KEY_A);
+    const padded = bytes("outsidepayloadoutside");
+    const subview = padded.subarray(7, 14);
+    const standalone = bytes("payload");
+    const h = await sha256Hex(standalone);
+    expect(await c.encryptBlob(h, subview)).toEqual(await c.encryptBlob(h, standalone));
+  });
+
   it("round-trips content", async () => {
     const c = await VaultCrypto.create(KEY_A);
     const plain = bytes("# daily log\n\n- shipped encryption\n");

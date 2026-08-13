@@ -20,6 +20,13 @@ export type GcLeaseResult =
   | { ok: true; head: string | null; leaseId: string; expiresAt: number }
   | { ok: false; reason: "commit_in_flight" | "already_leased" };
 
+export interface GcPlan {
+  head: string | null;
+  retainedIds: string[];
+  liveHashes: string[];
+  retainedEtags: Array<{ id: string; etag: string }>;
+}
+
 /**
  * What an access token is allowed to do. `sync` is everything an ordinary device needs;
  * `reroot` is separate because it is the only operation that makes remote content stop
@@ -46,6 +53,20 @@ function normalizeScopes(scopes: readonly TokenScope[] | undefined): TokenScope[
 function parseScopes(stored: string | null): TokenScope[] {
   if (stored === null || stored.trim() === "") return [...ALL_SCOPES];
   return ALL_SCOPES.filter((s) => stored.split(",").includes(s));
+}
+
+/**
+ * Durable Object SQL refuses a statement with more than 100 bound parameters, so a batch is
+ * sized in parameters and the row count falls out of how many columns it writes.
+ */
+const MAX_SQL_PARAMS = 100;
+
+function setDifference(from: ReadonlySet<string>, without: ReadonlySet<string>): string[] {
+  const out: string[] = [];
+  for (const value of from) {
+    if (!without.has(value)) out.push(value);
+  }
+  return out;
 }
 
 async function sha256hex(s: string): Promise<string> {
@@ -94,6 +115,23 @@ export class VaultLock extends DurableObject<Env> {
         CREATE TABLE IF NOT EXISTS manifest_ids (
           id TEXT PRIMARY KEY,
           first_seen TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS manifest_index (
+          id TEXT PRIMARY KEY,
+          parent TEXT,
+          uploaded_at INTEGER NOT NULL,
+          etag TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS manifest_blob_deltas (
+          manifest_id TEXT NOT NULL,
+          hash TEXT NOT NULL,
+          delta INTEGER NOT NULL CHECK(delta IN (-1, 1)),
+          PRIMARY KEY (manifest_id, hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_manifest_blob_deltas_manifest
+          ON manifest_blob_deltas(manifest_id);
+        CREATE TABLE IF NOT EXISTS current_blob_refs (
+          hash TEXT PRIMARY KEY
         );
       `);
       this.#addTokenColumns();
@@ -268,6 +306,260 @@ export class VaultLock extends DurableObject<Env> {
     this.#registryReady = true;
   }
 
+  // --- GC reference index ---------------------------------------------------------------
+
+  #gcIndexReady(): boolean {
+    return this.#meta("gc_index_backfilled") === "1";
+  }
+
+  #resetGcIndex(): void {
+    this.ctx.storage.sql.exec("DELETE FROM manifest_blob_deltas");
+    this.ctx.storage.sql.exec("DELETE FROM manifest_index");
+    this.ctx.storage.sql.exec("DELETE FROM current_blob_refs");
+  }
+
+  /**
+   * The cheap half of index initialization, and the only half a commit is allowed to do.
+   *
+   * A vault with no head has no chain to translate, so its index is complete the moment it is
+   * empty, and every commit from then on maintains it for the cost of one snapshot diff. A
+   * vault that already has history is the opposite case: indexing it means downloading and
+   * parsing every manifest still on the chain — tens of megabytes on a real vault, and
+   * nowhere near what a request's CPU budget affords. That backfill belongs to the scheduled
+   * GC run, the one caller that can afford it, so this leaves the index uninitialized and
+   * `#recordGcIndex` stands aside until GC has built it.
+   */
+  #ensureGcIndexForNewVault(): void {
+    if (this.#gcIndexReady()) return;
+    if (this.#storedHead() !== null) return;
+    this.ctx.storage.transactionSync(() => {
+      this.#resetGcIndex();
+      this.#setMeta("gc_index_backfilled", "1");
+    });
+  }
+
+  /**
+   * One-time migration for vaults deployed before commit-side reference indexing. This runs
+   * under the same in-flight fence as commit, so GC cannot acquire a deletion lease while
+   * the authoritative chain is being translated into SQLite.
+   *
+   * Walks newest-first holding only two adjacent hash sets. A real chain is a hundred-odd
+   * manifests of a third of a megabyte each, and each step needs exactly one neighbour, so
+   * keeping the parsed chain would spend ~100 MB of the isolate's memory to avoid nothing.
+   */
+  async #ensureGcIndex(): Promise<void> {
+    if (this.#gcIndexReady()) return;
+    // Completion is the only thing recorded, so an attempt that died partway leaves rows
+    // behind with no flag. Start from empty rather than layering onto a half-written index.
+    this.ctx.storage.transactionSync(() => this.#resetGcIndex());
+
+    const head = this.#storedHead();
+    const visited = new Set<string>();
+    let cursor = head;
+    /** The manifest one step newer than `cursor`; its delta is what `cursor` reveals. */
+    let newer: { id: string; hashes: Set<string> } | null = null;
+    while (cursor !== null) {
+      if (visited.has(cursor)) throw new Error(`manifest chain cycles at ${cursor}`);
+      visited.add(cursor);
+      const object = await this.env.VAULT.get(`manifests/${cursor}.json`);
+      if (object === null) {
+        if (cursor === head) throw new Error(`head manifest ${cursor} is missing`);
+        break; // an ancestor trimmed by an earlier GC
+      }
+      const parsed = validateManifest(await object.json());
+      if (!parsed.ok) throw new Error(`stored manifest ${cursor} is invalid: ${parsed.message}`);
+      const manifest = parsed.manifest;
+      if (manifest.id !== cursor) {
+        throw new Error(`stored manifest ${cursor} identifies itself as ${manifest.id}`);
+      }
+      const hashes = new Set(manifestHashes(manifest));
+      const child = newer;
+      const uploadedAt = object.uploaded.getTime();
+      const etag = object.etag;
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO manifest_index (id, parent, uploaded_at, etag) VALUES (?, ?, ?, ?)",
+          manifest.id,
+          manifest.parent,
+          uploadedAt,
+          etag
+        );
+        if (child === null) {
+          // The head's own set is the live set every older delta is replayed against.
+          this.#insertBatched(
+            (values) => `INSERT INTO current_blob_refs (hash) VALUES ${values}`,
+            [...hashes].map((hash) => [hash])
+          );
+        } else {
+          this.#writeBlobDeltas(
+            child.id,
+            setDifference(child.hashes, hashes),
+            setDifference(hashes, child.hashes)
+          );
+        }
+      });
+      newer = { id: manifest.id, hashes };
+      cursor = manifest.parent;
+    }
+
+    const oldest = newer;
+    this.ctx.storage.transactionSync(() => {
+      // The oldest manifest still on the chain has no indexed parent — whether it is the real
+      // root or the point an earlier GC trimmed — so everything it names counts as an addition.
+      if (oldest !== null) this.#writeBlobDeltas(oldest.id, [...oldest.hashes], []);
+      this.#setMeta("gc_index_backfilled", "1");
+    });
+  }
+
+  /**
+   * As many rows per statement as the parameter cap allows. At snapshot scale the per-row
+   * alternative is thousands of boundary crossings, which is real CPU inside a request that
+   * has ten milliseconds of it.
+   */
+  #insertBatched(statement: (values: string) => string, rows: readonly unknown[][]): void {
+    if (rows.length === 0) return;
+    const width = rows[0].length;
+    const perStatement = Math.max(1, Math.floor(MAX_SQL_PARAMS / width));
+    const row = `(${new Array<string>(width).fill("?").join(", ")})`;
+    for (let i = 0; i < rows.length; i += perStatement) {
+      const slice = rows.slice(i, i + perStatement);
+      this.ctx.storage.sql.exec(statement(new Array<string>(slice.length).fill(row).join(", ")), ...slice.flat());
+    }
+  }
+
+  /** Records `manifestId`'s reference delta against its parent. */
+  #writeBlobDeltas(manifestId: string, added: readonly string[], removed: readonly string[]): void {
+    this.#insertBatched(
+      (values) => `INSERT INTO manifest_blob_deltas (manifest_id, hash, delta) VALUES ${values}`,
+      [
+        ...added.map((hash) => [manifestId, hash, 1]),
+        ...removed.map((hash) => [manifestId, hash, -1]),
+      ]
+    );
+  }
+
+  #dropCurrentBlobRefs(hashes: readonly string[]): void {
+    for (let i = 0; i < hashes.length; i += MAX_SQL_PARAMS) {
+      const slice = hashes.slice(i, i + MAX_SQL_PARAMS);
+      this.ctx.storage.sql.exec(
+        `DELETE FROM current_blob_refs WHERE hash IN (${new Array<string>(slice.length).fill("?").join(", ")})`,
+        ...slice
+      );
+    }
+  }
+
+  /** Ensures legacy state is indexed without holding a GC lease across R2 reads. */
+  async ensureGcIndex(): Promise<void> {
+    if (this.#gcIndexReady()) return;
+    const run = this.#commitChain.then(async () => {
+      if (this.#gcIndexReady()) return;
+      this.#commitInFlight++;
+      try {
+        await this.#ensureGcIndex();
+      } finally {
+        this.#commitInFlight--;
+      }
+    });
+    this.#commitChain = run.catch(() => {});
+    await run;
+  }
+
+  /** Builds the retained union from indexed deltas only; no R2 manifest download occurs. */
+  async getGcPlan(opts: { keepCount: number; ageCutoff: number }): Promise<GcPlan> {
+    if (!this.#gcIndexReady()) throw new Error("GC reference index is not initialized");
+    const head = this.#storedHead();
+    if (head === null) return { head: null, retainedIds: [], liveHashes: [], retainedEtags: [] };
+
+    const retainedIds: string[] = [];
+    const retainedEtags: Array<{ id: string; etag: string }> = [];
+    const liveHashes = new Set(
+      this.ctx.storage.sql.exec<{ hash: string }>("SELECT hash FROM current_blob_refs").toArray().map((r) => r.hash)
+    );
+    let cursor: string | null = head;
+    let depth = 0;
+    let childToInvert: string | null = null;
+    const visited = new Set<string>();
+    while (cursor !== null) {
+      if (visited.has(cursor)) throw new Error(`manifest index cycles at ${cursor}`);
+      visited.add(cursor);
+      const row: { id: string; parent: string | null; uploaded_at: number; etag: string } | undefined =
+        this.ctx.storage.sql
+        .exec<{ id: string; parent: string | null; uploaded_at: number; etag: string }>(
+          "SELECT id, parent, uploaded_at, etag FROM manifest_index WHERE id = ?",
+          cursor
+        )
+        .toArray()[0];
+      if (row === undefined) {
+        if (depth === 0) throw new Error(`head manifest ${cursor} is missing from the GC index`);
+        break;
+      }
+      if (depth >= opts.keepCount && row.uploaded_at < opts.ageCutoff) break;
+      if (childToInvert !== null) {
+        const removed = this.ctx.storage.sql
+          .exec<{ hash: string }>(
+            "SELECT hash FROM manifest_blob_deltas WHERE manifest_id = ? AND delta = -1",
+            childToInvert
+          )
+          .toArray();
+        for (const { hash } of removed) liveHashes.add(hash);
+      }
+      retainedIds.push(row.id);
+      retainedEtags.push({ id: row.id, etag: row.etag });
+      childToInvert = row.id;
+      cursor = row.parent;
+      depth++;
+    }
+    return { head, retainedIds, liveHashes: [...liveHashes], retainedEtags };
+  }
+
+  /** Prunes only the disposable GC index. The permanent manifest ID registry is untouched. */
+  async pruneGcIndex(
+    leaseId: string,
+    expectedHead: string,
+    manifestIds: readonly string[]
+  ): Promise<boolean> {
+    if (this.#meta("gc_lease_id") !== leaseId || this.#gcLeaseUntil() <= Date.now()) return false;
+    if (this.#storedHead() !== expectedHead) return false;
+    this.ctx.storage.transactionSync(() => {
+      for (const id of manifestIds) {
+        this.ctx.storage.sql.exec("DELETE FROM manifest_blob_deltas WHERE manifest_id = ?", id);
+        this.ctx.storage.sql.exec("DELETE FROM manifest_index WHERE id = ?", id);
+      }
+    });
+    return true;
+  }
+
+  #recordGcIndex(
+    manifest: Manifest,
+    parentHashes: ReadonlySet<string>,
+    uploadedAt: number,
+    etag: string
+  ): void {
+    // A vault whose pre-index history has not been translated yet has no consistent index to
+    // extend, and extending it anyway would leave `current_blob_refs` missing every hash this
+    // snapshot inherited — a live set that GC would delete against. The scheduled backfill
+    // reads this manifest off the head chain instead.
+    if (!this.#gcIndexReady()) return;
+    const next = new Set(manifestHashes(manifest));
+    this.ctx.storage.sql.exec(
+      "INSERT INTO manifest_index (id, parent, uploaded_at, etag) VALUES (?, ?, ?, ?)",
+      manifest.id,
+      manifest.parent,
+      uploadedAt,
+      etag
+    );
+    // A new root replaces the live set outright instead of differing from a parent.
+    if (manifest.parent === null) this.ctx.storage.sql.exec("DELETE FROM current_blob_refs");
+    const added = setDifference(next, parentHashes);
+    const removed = setDifference(parentHashes, next);
+    this.#writeBlobDeltas(manifest.id, added, removed);
+    this.#insertBatched(
+      (values) => `INSERT OR IGNORE INTO current_blob_refs (hash) VALUES ${values}`,
+      added.map((hash) => [hash])
+    );
+    this.#dropCurrentBlobRefs(removed);
+  }
+
   // --- GC lease ---------------------------------------------------------------------------
 
   #gcLeaseUntil(): number {
@@ -385,6 +677,7 @@ export class VaultLock extends DurableObject<Env> {
   /** Registry backfill through head advancement, with GC excluded for the whole of it. */
   async #commitExclusive(manifest: Manifest, expectedHead: string | null): Promise<CommitResult> {
     await this.#ensureIdRegistry();
+    this.#ensureGcIndexForNewVault();
 
     const head = this.#storedHead();
     if (head === manifest.id) {
@@ -447,11 +740,14 @@ export class VaultLock extends DurableObject<Env> {
 
     await this.testHookAfterVerify?.();
 
-    await this.env.VAULT.put(`manifests/${manifest.id}.json`, JSON.stringify(manifest), {
+    const stored = await this.env.VAULT.put(`manifests/${manifest.id}.json`, JSON.stringify(manifest), {
       httpMetadata: { contentType: "application/json" },
     });
-    this.#registerId(manifest.id);
-    this.#setMeta("head", manifest.id);
+    this.ctx.storage.transactionSync(() => {
+      this.#recordGcIndex(manifest, parentHashes, stored.uploaded.getTime(), stored.etag);
+      this.#registerId(manifest.id);
+      this.#setMeta("head", manifest.id);
+    });
     // Mirror for disaster recovery / S3-tool reads. If this throws, the commit is
     // already durable in DO storage; the client's retry hits the idempotent path
     // above and re-attempts the mirror. GC never treats the mirror as a root, so a

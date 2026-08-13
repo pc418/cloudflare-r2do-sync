@@ -10,6 +10,7 @@ import {
   requestUrl,
   setIcon,
   type Vault,
+  type TAbstractFile,
 } from "obsidian";
 import qrcode from "qrcode-generator";
 import { SettingsStaleError, SyncApi, type HttpClient } from "./api";
@@ -328,6 +329,7 @@ const obsidianHttp: HttpClient = async (url, req) => {
   });
   return {
     status: res.status,
+    headers: res.headers,
     text: async () => res.text,
     // Obsidian types `res.json` as `any`. `HttpResponse.json()` promises `unknown`, and
     // returning `any` through it silently re-opens every validated call site in `api.ts`.
@@ -490,16 +492,23 @@ export default class LogSyncPlugin extends Plugin {
       await this.#resumeEncryptionTransition();
     }
 
-    const onChange = () => {
+    const scheduleChanged = (paths: readonly string[], fullScan: boolean) => {
       // While a decision is pending, an automatic pass would re-run the whole plan and
       // silently re-park it. Manual syncs still work — that is how the user answers.
       if (this.#phase === "decision") return;
+      this.#engine?.markDirty(paths, { fullScan });
       this.#scheduler?.notifyChange();
     };
+    const onChange = (file: TAbstractFile) =>
+      scheduleChanged([file.path], file instanceof TFolder);
     this.registerEvent(this.app.vault.on("create", onChange));
     this.registerEvent(this.app.vault.on("modify", onChange));
     this.registerEvent(this.app.vault.on("delete", onChange));
-    this.registerEvent(this.app.vault.on("rename", onChange));
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) =>
+        scheduleChanged([oldPath, file.path], file instanceof TFolder)
+      )
+    );
 
     this.#restartAutoSyncTimer();
 
@@ -570,7 +579,7 @@ export default class LogSyncPlugin extends Plugin {
     }
     if (!this.#scheduler) return; // an applied settings doc rebuilt into "unconfigured"
     try {
-      await this.#scheduler.syncNow();
+      await this.#scheduler.syncNow({ fullScan: true });
     } catch {
       // reported through onError
     }
@@ -860,7 +869,7 @@ export default class LogSyncPlugin extends Plugin {
     };
 
     this.#engine = new SyncEngine({
-      vault: new ObsidianVault(this.app),
+      vault: new ObsidianVault(this.app, this.settings.lanes),
       api: new SyncApi({
         baseUrl: serverUrl,
         token: this.settings.accessToken,
@@ -1003,7 +1012,7 @@ export default class LogSyncPlugin extends Plugin {
         new Notice(`R2DO Sync: shared settings check failed: ${message(e)}`, 10_000);
       }
       if (!this.#scheduler) return;
-      await this.#scheduler.syncNow();
+      await this.#scheduler.syncNow({ fullScan: true });
     } catch {
       // reported through onError
     } finally {
@@ -1160,7 +1169,9 @@ export default class LogSyncPlugin extends Plugin {
         this.#renderStatus();
         this.#interactive++;
         try {
-          await scheduler.syncNow({ keepLocal: true, previewedHead: summary.head });
+          // A full audit, like the preview that produced `summary`. Publishing one direction
+          // over the other from an event journal would push a vault the operator never saw.
+          await scheduler.syncNow({ keepLocal: true, previewedHead: summary.head, fullScan: true });
         } catch (e) {
           await this.#reportUnlessReported(e);
         } finally {
@@ -1235,7 +1246,7 @@ export default class LogSyncPlugin extends Plugin {
           // Pinned to the head the confirmation just described. A snapshot published
           // since then has never been reviewed, and this is the one action that would
           // delete it rather than merge it.
-          await scheduler.syncNow({ reroot: { previewedHead: summary.head } });
+          await scheduler.syncNow({ reroot: { previewedHead: summary.head }, fullScan: true });
         } catch (e) {
           await this.#reportUnlessReported(e);
         } finally {

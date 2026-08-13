@@ -54,13 +54,12 @@ describe("SyncApi", () => {
     expect(JSON.parse(calls[0].body as string)).toEqual({ hashes: ["aa", "bb"] });
   });
 
-  it("checkBlobs chunks requests above the server limit of 1000", async () => {
+  it("sends a multi-thousand-hash logical check in one byte-bounded request", async () => {
     const { client, calls } = fakeHttp(() => ({ status: 200, body: { missing: [] } }));
     const hashes = Array.from({ length: 2500 }, (_, i) => String(i).padStart(64, "0"));
     await api(client).checkBlobs(hashes);
-    expect(calls.length).toBe(3);
-    expect(JSON.parse(calls[0].body as string).hashes.length).toBe(1000);
-    expect(JSON.parse(calls[2].body as string).hashes.length).toBe(500);
+    expect(calls.length).toBe(1);
+    expect(JSON.parse(calls[0].body as string).hashes).toEqual(hashes);
   });
 
   it("putBlob PUTs raw bytes to the hash-keyed route", async () => {
@@ -70,6 +69,25 @@ describe("SyncApi", () => {
     expect(calls[0].url).toBe(`https://vault.example/api/blobs/${"a".repeat(64)}`);
     expect(calls[0].method).toBe("PUT");
     expect(new Uint8Array(calls[0].body as ArrayBuffer)).toEqual(bytes);
+    expect(calls[0].body).toBe(bytes.buffer);
+  });
+
+  it("putBlob copies only an offset subview", async () => {
+    const { client, calls } = fakeHttp(() => ({ status: 201, body: { existed: false } }));
+    const padded = new Uint8Array([99, 1, 2, 3, 88]);
+    await api(client).putBlob("a".repeat(64), padded.subarray(1, 4));
+    expect([...new Uint8Array(calls[0].body as ArrayBuffer)]).toEqual([1, 2, 3]);
+  });
+
+  it("classifies a thrown HTTP client call as a transport failure", async () => {
+    const client: HttpClient = async () => {
+      throw new Error("offline");
+    };
+    await expect(api(client).getHead()).rejects.toMatchObject({
+      name: "TransportError",
+      status: 0,
+      message: "offline",
+    });
   });
 
   it("commit returns the new head on success", async () => {

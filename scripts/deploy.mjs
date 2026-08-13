@@ -24,6 +24,9 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WORKER_DIR = path.join(ROOT, "worker");
 
+/** Source of truth for retained Worker logs on REST deployments. */
+export const WORKER_OBSERVABILITY = { enabled: true, head_sampling_rate: 0.01 };
+
 /**
  * Runs the whole REST deployment. Returns the live URL plus a *working* admin token:
  * the stored one when it still matches the deployed secret (`adminTokenKept`), otherwise
@@ -86,6 +89,7 @@ export async function deployViaRest({ log = console.log, confirm = null, adoptBu
       "--platform=neutral",
       "--conditions=workerd,worker,browser",
       "--external:cloudflare:workers",
+      "--minify",
       "--outfile=dist/worker.js",
     ],
     { cwd: WORKER_DIR, stdio: "inherit" }
@@ -98,6 +102,7 @@ export async function deployViaRest({ log = console.log, confirm = null, adoptBu
     compatibility_date: COMPAT_DATE,
     compatibility_flags: COMPAT_FLAGS,
     keep_secrets: true,
+    observability: WORKER_OBSERVABILITY,
     bindings: [
       { type: "r2_bucket", name: "VAULT", bucket_name: BUCKET },
       { type: "durable_object_namespace", name: DO_BINDING, class_name: DO_CLASS },

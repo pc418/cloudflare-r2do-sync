@@ -83,6 +83,35 @@ describe("gc / commit exclusion", () => {
     expect((await commit(token, m, null)).status).toBe(200);
   });
 
+  it("aborts with no deletions when the head moves between planning and lease acquisition", async () => {
+    const live = await sha256hex("live");
+    const next = await sha256hex("next");
+    const orphan = await sha256hex("orphan");
+    await env.VAULT.put(`blobs/${live}`, "live");
+    await env.VAULT.put(`blobs/${next}`, "next");
+    await env.VAULT.put(`blobs/${orphan}`, "orphan");
+    const first = makeManifest({ files: { "a.md": { h: live } } });
+    expect((await commit(token, first, null)).status).toBe(200);
+
+    const report = await runGc(env, {
+      now: Date.now(),
+      minAgeMs: 0,
+      testHookBeforeLease: async () => {
+        const second = makeManifest({
+          id: ulid(Date.now() + 1),
+          parent: first.id,
+          files: { "a.md": { h: live }, "b.md": { h: next } },
+        });
+        expect((await commit(token, second, first.id)).status).toBe(200);
+      },
+    });
+
+    expect(report.skipped).toBe("head_moved");
+    expect(report.deletedBlobs).toBe(0);
+    expect(await env.VAULT.head(`blobs/${orphan}`)).not.toBeNull();
+    expect(await env.VAULT.head(`blobs/${next}`)).not.toBeNull();
+  });
+
   it("expires the lease so a killed sweep cannot wedge commits", async () => {
     const hash = await sha256hex("content");
     await env.VAULT.put(`blobs/${hash}`, "content");

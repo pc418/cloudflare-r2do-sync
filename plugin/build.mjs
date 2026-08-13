@@ -18,7 +18,7 @@ await build({
   external: ["obsidian", "electron"],
   outfile: path.join(OUT, "main.js"),
   sourcemap: false,
-  minify: false,
+  minify: true,
   logLevel: "info",
 });
 

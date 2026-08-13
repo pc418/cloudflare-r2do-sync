@@ -1,7 +1,7 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, it, expect, beforeEach } from "vitest";
 import { BASE, authed, mintToken, putBlob, sha256hex } from "./helpers";
-import { checkBlobs, LIST_THRESHOLD } from "../src/blobs";
+import { checkBlobs, LIST_THRESHOLD, putBlob as putBlobDirect } from "../src/blobs";
 import type { Env } from "../src/index";
 
 let token: string;
@@ -11,6 +11,52 @@ beforeEach(async () => {
 });
 
 describe("PUT /api/blobs/:hash", () => {
+  it("writes a new blob with one conditional put and no head", async () => {
+    const content = new TextEncoder().encode("one operation");
+    const hash = await sha256hex("one operation");
+    const calls: { head: number; puts: Array<R2PutOptions | undefined> } = { head: 0, puts: [] };
+    const fake = {
+      VAULT: {
+        head(): Promise<R2Object | null> {
+          calls.head++;
+          return Promise.resolve(null);
+        },
+        put(_key: string, _value: unknown, options?: R2PutOptions): Promise<R2Object | null> {
+          calls.puts.push(options);
+          return Promise.resolve({ key: `blobs/${hash}` } as R2Object);
+        },
+      },
+    } as unknown as Env;
+
+    await expect(
+      putBlobDirect(fake, hash, new Request("https://test", { method: "PUT", body: content }))
+    ).resolves.toEqual({ ok: true, existed: false });
+    expect(calls.head).toBe(0);
+    expect(calls.puts).toEqual([{ onlyIf: { etagDoesNotMatch: "*" } }]);
+  });
+
+  it("reports a conditional-put precondition failure as an existing blob", async () => {
+    const content = "already there";
+    const hash = await sha256hex(content);
+    let puts = 0;
+    const fake = {
+      VAULT: {
+        head(): never {
+          throw new Error("head must not be called");
+        },
+        put(): Promise<null> {
+          puts++;
+          return Promise.resolve(null);
+        },
+      },
+    } as unknown as Env;
+
+    await expect(
+      putBlobDirect(fake, hash, new Request("https://test", { method: "PUT", body: content }))
+    ).resolves.toEqual({ ok: true, existed: true });
+    expect(puts).toBe(1);
+  });
+
   it("stores a blob under its verified hash", async () => {
     const content = "hello vault";
     const h = await putBlob(token, content);
@@ -84,19 +130,14 @@ describe("POST /api/blobs/check", () => {
     expect(body.missing).toEqual([missing]);
   });
 
-  it("rejects over 1000 hashes with 422", async () => {
-    const hashes = Array.from({ length: 1001 }, (_, i) =>
-      i.toString(16).padStart(64, "0")
-    );
-    const res = await SELF.fetch(
-      `${BASE}/api/blobs/check`,
+  it("rejects an explicitly oversized request before parsing JSON", async () => {
+    const res = await SELF.fetch(`${BASE}/api/blobs/check`,
       authed(token, {
         method: "POST",
-        body: JSON.stringify({ hashes }),
-        headers: { "content-type": "application/json" },
-      })
-    );
-    expect(res.status).toBe(422);
+        body: "{}",
+        headers: { "content-type": "application/json", "content-length": "9000000" },
+      }));
+    expect(res.status).toBe(413);
   });
 
   it("rejects malformed hash entries with 422", async () => {
@@ -187,13 +228,15 @@ describe("checkBlobs cost", () => {
   });
 
   it("pages through a bucket holding more blobs than one listing page", async () => {
-    const stored = Array.from({ length: 5 }, (_, i) => hexHash(i));
+    // 2,500 requested hashes would have been three client chunks before this fix. The one
+    // logical call must still walk each of the three stored-object pages exactly once.
+    const stored = Array.from({ length: 2500 }, (_, i) => hexHash(i));
     const { env: fake, calls } = countingBucket(stored);
-    const asked = [...stored, hexHash(99)];
+    const asked = [...stored, hexHash(9999)];
     const missing = expectMissing(
-      await checkBlobs(fake, asked, { listThreshold: 0, listPageLimit: 2 })
+      await checkBlobs(fake, asked, { listThreshold: 0, listPageLimit: 1000 })
     );
-    expect(missing).toEqual([hexHash(99)]);
+    expect(missing).toEqual([hexHash(9999)]);
     expect(calls.list).toBe(3);
   });
 

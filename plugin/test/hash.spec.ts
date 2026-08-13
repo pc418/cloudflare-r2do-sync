@@ -30,4 +30,9 @@ describe("sha256Hex", () => {
     const ab = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
     expect(await sha256Hex(ab)).toBe(await sha256Hex(u8));
   });
+
+  it("hashes only an offset subview", async () => {
+    const padded = new TextEncoder().encode("outsideabcoutside");
+    expect(await sha256Hex(padded.subarray(7, 10))).toBe(await sha256Hex(enc("abc")));
+  });
 });

@@ -1,4 +1,5 @@
 import type { SyncPassOptions, SyncResult } from "./sync";
+import { ApiError } from "./api";
 
 export interface SchedulerOptions {
   engine: { sync(opts?: SyncPassOptions): Promise<SyncResult> };
@@ -10,6 +11,17 @@ export interface SchedulerOptions {
 
 const DEFAULT_DEBOUNCE_MS = 2000;
 const DEFAULT_RETRIES_MS = [1000, 4000, 15_000];
+
+/** Whole-pass retries are reserved for failures that can plausibly heal without user action. */
+export function isRetryable(error: unknown): error is ApiError {
+  if (!(error instanceof ApiError)) return false;
+  return (
+    error.status === 0 ||
+    error.status === 408 ||
+    error.status === 429 ||
+    (error.status >= 500 && error.status <= 599)
+  );
+}
 
 /**
  * Coalesces vault events into one push at a time, with backoff for transient failures.
@@ -104,8 +116,12 @@ export class SyncScheduler {
         if (this.#stopped) throw new Error("sync scheduler stopped", { cause: e });
         this.lastError = error;
         this.#onError?.(error);
-        if (attempt >= this.#retryDelaysMs.length || this.#stopped) throw error;
-        await this.#waitForRetry(this.#retryDelaysMs[attempt++]);
+        if (!isRetryable(error) || attempt >= this.#retryDelaysMs.length || this.#stopped) {
+          throw error;
+        }
+        const configuredDelay = this.#retryDelaysMs[attempt++];
+        const delay = error.status === 429 ? (error.retryAfterMs ?? configuredDelay) : configuredDelay;
+        await this.#waitForRetry(delay);
         if (this.#stopped) throw new Error("sync scheduler stopped", { cause: e });
       }
     }

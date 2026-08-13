@@ -1,7 +1,7 @@
-import { DEFAULT_LANES, clampLanes, mapPool } from "./pool";
 import { parseManifest, type Manifest } from "./types";
 import type { SettingsDoc } from "./settings-doc";
 import { normalizeServerUrl } from "./setup-link";
+import { exactArrayBuffer } from "./buffer";
 
 export interface HttpRequest {
   method: string;
@@ -11,6 +11,7 @@ export interface HttpRequest {
 
 export interface HttpResponse {
   status: number;
+  headers?: Record<string, string>;
   text(): Promise<string>;
   json(): Promise<unknown>;
   arrayBuffer(): Promise<ArrayBuffer>;
@@ -22,10 +23,19 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly status = 0,
-    readonly code = "unknown"
+    readonly code = "unknown",
+    readonly retryAfterMs?: number
   ) {
     super(message);
     this.name = "ApiError";
+  }
+}
+
+export class TransportError extends ApiError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, 0, "transport");
+    this.name = "TransportError";
+    if (options !== undefined && "cause" in options) this.cause = options.cause;
   }
 }
 
@@ -79,7 +89,7 @@ export class SettingsStaleError extends ApiError {
   }
 }
 
-const MAX_CHECK_HASHES = 1000;
+const MAX_CHECK_BODY_BYTES = 7 * 1024 * 1024;
 const GC_BUSY_ATTEMPTS = 4;
 const GC_BUSY_DELAY_MS = 2000;
 
@@ -94,7 +104,6 @@ export class SyncApi {
   readonly #baseUrl: string;
   readonly #token: string;
   readonly #http: HttpClient;
-  readonly #lanes: number;
   readonly #sleep: (ms: number) => Promise<void>;
 
   constructor(opts: {
@@ -110,7 +119,6 @@ export class SyncApi {
     this.#baseUrl = normalizeServerUrl(opts.baseUrl);
     this.#token = opts.token;
     this.#http = opts.http;
-    this.#lanes = clampLanes(opts.lanes ?? DEFAULT_LANES);
     this.#sleep =
       opts.sleep ??
       ((ms) =>
@@ -120,17 +128,23 @@ export class SyncApi {
   }
 
   async #request(path: string, req: Partial<HttpRequest> = {}): Promise<HttpResponse> {
-    const res = await this.#http(`${this.#baseUrl}${path}`, {
-      method: req.method ?? "GET",
-      headers: {
-        authorization: `Bearer ${this.#token}`,
-        ...(req.body !== undefined && typeof req.body === "string"
-          ? { "content-type": "application/json" }
-          : {}),
-        ...(req.headers ?? {}),
-      },
-      body: req.body,
-    });
+    let res: HttpResponse;
+    try {
+      res = await this.#http(`${this.#baseUrl}${path}`, {
+        method: req.method ?? "GET",
+        headers: {
+          authorization: `Bearer ${this.#token}`,
+          ...(req.body !== undefined && typeof req.body === "string"
+            ? { "content-type": "application/json" }
+            : {}),
+          ...(req.headers ?? {}),
+        },
+        body: req.body,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new TransportError(message, { cause: error });
+    }
     if (res.status >= 200 && res.status < 300) return res;
     throw await this.#toError(res);
   }
@@ -155,7 +169,7 @@ export class SyncApi {
     if (res.status === 409 && code === "stale_revision") {
       return new SettingsStaleError(message, typeof body?.rev === "number" ? body.rev : 0);
     }
-    return new ApiError(message, res.status, code);
+    return new ApiError(message, res.status, code, retryAfterMs(res));
   }
 
   async getHead(): Promise<string | null> {
@@ -180,27 +194,25 @@ export class SyncApi {
   }
 
   async checkBlobs(hashes: string[]): Promise<string[]> {
-    const chunks: string[][] = [];
-    for (let i = 0; i < hashes.length; i += MAX_CHECK_HASHES) {
-      chunks.push(hashes.slice(i, i + MAX_CHECK_HASHES));
+    const body = JSON.stringify({ hashes });
+    const bodyBytes = new TextEncoder().encode(body).byteLength;
+    if (bodyBytes > MAX_CHECK_BODY_BYTES) {
+      throw new Error(
+        `blob inventory check body is ${bodyBytes} bytes, exceeding ${MAX_CHECK_BODY_BYTES}`
+      );
     }
-    // Chunks are independent, so a 10k-file vault asks in parallel instead of ten round
-    // trips end to end. mapPool keeps chunk order, so `missing` stays deterministic.
-    const answers = await mapPool(chunks, this.#lanes, async (chunk) => {
-      const res = await this.#request("/api/blobs/check", {
-        method: "POST",
-        body: JSON.stringify({ hashes: chunk }),
-      });
-      return ((await res.json()) as { missing: string[] }).missing;
+    const res = await this.#request("/api/blobs/check", {
+      method: "POST",
+      body,
     });
-    return answers.flat();
+    return ((await res.json()) as { missing: string[] }).missing;
   }
 
   async putBlob(hash: string, bytes: Uint8Array): Promise<void> {
     await this.#request(`/api/blobs/${hash}`, {
       method: "PUT",
       headers: { "content-type": "application/octet-stream" },
-      body: bytes.slice().buffer,
+      body: exactArrayBuffer(bytes),
     });
   }
 
@@ -253,4 +265,16 @@ export class SyncApi {
       }
     }
   }
+}
+
+function retryAfterMs(res: HttpResponse): number | undefined {
+  if (res.status !== 429 || res.headers === undefined) return undefined;
+  const entry = Object.entries(res.headers).find(([name]) => name.toLowerCase() === "retry-after");
+  const raw = entry?.[1]?.trim();
+  if (raw === undefined || raw === "") return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const at = Date.parse(raw);
+  if (!Number.isFinite(at)) return undefined;
+  return Math.max(0, at - Date.now());
 }

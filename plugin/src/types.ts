@@ -131,6 +131,8 @@ export interface VaultFile {
 
 export interface VaultAdapter {
   list(): Promise<VaultFile[]>;
+  /** Metadata for one journaled path, or null when it no longer exists. */
+  stat(path: string): Promise<VaultFile | null>;
   read(path: string): Promise<Uint8Array>;
   /** Creates or overwrites a file, making parent folders as needed. */
   write(path: string, bytes: Uint8Array): Promise<void>;
@@ -150,6 +152,8 @@ export interface SyncState {
    * previous version of every edited file. Absent for binary and never-scanned paths.
    */
   lines?: Record<string, number>;
+  /** Device-local discovery cache used to reconstruct occupied paths from a dirty journal. */
+  inventory?: Record<string, VaultFile>;
 }
 
 export interface StateStore {

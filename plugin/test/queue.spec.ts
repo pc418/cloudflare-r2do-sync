@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { SyncScheduler } from "../src/queue";
+import { ApiError, AuthError, TransportError } from "../src/api";
+import { SyncScheduler, isRetryable } from "../src/queue";
 import type { SyncPassOptions, SyncResult } from "../src/sync";
 
 const committed = (head: string): SyncResult => ({
@@ -159,8 +160,19 @@ describe("SyncScheduler forced passes", () => {
 });
 
 describe("SyncScheduler retry", () => {
+  it("classifies only transport, timeout, throttling, and server failures as retryable", () => {
+    expect(isRetryable(new TransportError("offline"))).toBe(true);
+    expect(isRetryable(new ApiError("timeout", 408))).toBe(true);
+    expect(isRetryable(new ApiError("slow down", 429))).toBe(true);
+    expect(isRetryable(new ApiError("unavailable", 503))).toBe(true);
+    for (const status of [400, 401, 403, 404, 409, 422]) {
+      expect(isRetryable(new ApiError("client", status))).toBe(false);
+    }
+    expect(isRetryable(new Error("local filesystem failure"))).toBe(false);
+  });
+
   it("retries transient failures with backoff and reports success", async () => {
-    engine.results = [new Error("network down"), { ...committed("01Y"), uploaded: 1 }];
+    engine.results = [new TransportError("network down"), { ...committed("01Y"), uploaded: 1 }];
 
     const done = scheduler.syncNow().catch(() => {});
     await vi.advanceTimersByTimeAsync(0);
@@ -173,7 +185,11 @@ describe("SyncScheduler retry", () => {
   });
 
   it("gives up after exhausting the backoff schedule and records the error", async () => {
-    engine.results = [new Error("down"), new Error("down"), new Error("down")];
+    engine.results = [
+      new TransportError("down"),
+      new TransportError("down"),
+      new TransportError("down"),
+    ];
 
     const done = scheduler.syncNow().catch(() => {});
     await vi.advanceTimersByTimeAsync(0);
@@ -183,6 +199,38 @@ describe("SyncScheduler retry", () => {
 
     expect(engine.calls).toBe(3);
     expect(scheduler.lastError?.message).toMatch(/down/);
+  });
+
+  it("runs exactly one pass for a 401 and reports it once", async () => {
+    const reported: Error[] = [];
+    const once = new SyncScheduler({
+      engine: engine as never,
+      retryDelaysMs: [1, 2, 3],
+      onError: (error) => reported.push(error),
+    });
+    engine.results = [new AuthError("wrong token")];
+
+    await expect(once.syncNow()).rejects.toThrow(/wrong token/);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(engine.calls).toBe(1);
+    expect(reported).toHaveLength(1);
+    once.stop();
+  });
+
+  it("honours a server-provided retry delay for 429", async () => {
+    engine.results = [
+      new ApiError("slow down", 429, "rate_limited", 2500),
+      committed("01Y"),
+    ];
+    const done = scheduler.syncNow();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(engine.calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(1499);
+    expect(engine.calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await done;
+    expect(engine.calls).toBe(2);
   });
 
   it("does not retry a halted engine — divergence needs a human, not a retry", async () => {
@@ -195,7 +243,7 @@ describe("SyncScheduler retry", () => {
   });
 
   it("stop() cancels a retry that is already waiting in backoff", async () => {
-    engine.results = [new Error("network down"), committed("must-not-run")];
+    engine.results = [new TransportError("network down"), committed("must-not-run")];
 
     const done = scheduler.syncNow().catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);

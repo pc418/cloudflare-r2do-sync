@@ -1,8 +1,9 @@
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, beforeEach } from "vitest";
 import { runGc } from "../src/gc";
 import type { Manifest } from "../src/manifest";
 import { commit, makeManifest, makeManifestV2, mintToken, sha256hex, ulid } from "./helpers";
+import type { VaultLock } from "../src/vault-lock";
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -72,6 +73,14 @@ describe("runGc", () => {
     // The purged content is gone; content the new root still names survives.
     expect(await env.VAULT.head(`blobs/${secret}`)).toBeNull();
     expect(await env.VAULT.head(`blobs/${shared}`)).not.toBeNull();
+    await runInDurableObject(env.VAULT_LOCK.getByName("default"), (_instance: VaultLock, state) => {
+      expect(
+        state.storage.sql.exec<{ id: string }>("SELECT id FROM manifest_index ORDER BY id").toArray()
+      ).toEqual([{ id: root.id }]);
+      expect(
+        state.storage.sql.exec<{ id: string }>("SELECT id FROM manifest_ids ORDER BY id").toArray()
+      ).toHaveLength(3);
+    });
   });
 
   it("missing head manifest aborts without deleting anything", async () => {
@@ -214,5 +223,92 @@ describe("runGc", () => {
     await publish(m, null);
     const report = await runGc(env, { now: Date.now(), minAgeMs: 0 });
     expect(report.skipped).toBeNull();
+  });
+
+  /**
+   * Indexing a vault that predates the index means reading every manifest still on its chain
+   * — on a real vault a hundred-odd objects and tens of megabytes. A request cannot pay for
+   * that, and the commit path is a request, so the migration belongs to the scheduled sweep.
+   */
+  it("leaves pre-index history to the scheduled sweep instead of walking it inside a commit", async () => {
+    const now = Date.now() + 10 * DAY;
+    const kept = await seedBlob("still referenced");
+    const dropped = await seedBlob("only in the older snapshot");
+    const legacy1 = manifest(ulid(Date.now() - 2 * DAY), null, Date.now() - 2 * DAY, {
+      "a.md": kept,
+      "b.md": dropped,
+    });
+    const legacy2 = manifest(ulid(Date.now() - DAY), legacy1.id, Date.now() - DAY, { "a.md": kept });
+    // History exactly as an older deployment left it: objects in R2, an authoritative head in
+    // the Durable Object, and no reference index.
+    await env.VAULT.put(`manifests/${legacy1.id}.json`, JSON.stringify(legacy1));
+    await env.VAULT.put(`manifests/${legacy2.id}.json`, JSON.stringify(legacy2));
+    await runInDurableObject(env.VAULT_LOCK.getByName("default"), (_instance: VaultLock, state) => {
+      state.storage.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?)", legacy2.id);
+    });
+
+    const next = manifest(ulid(), legacy2.id, Date.now(), { "a.md": kept });
+    await publish(next, legacy2.id);
+    await runInDurableObject(env.VAULT_LOCK.getByName("default"), (_instance: VaultLock, state) => {
+      expect(
+        state.storage.sql
+          .exec<{ value: string }>("SELECT value FROM meta WHERE key = 'gc_index_backfilled'")
+          .toArray()
+      ).toEqual([]);
+      expect(state.storage.sql.exec("SELECT id FROM manifest_index").toArray()).toEqual([]);
+    });
+
+    const report = await runGc(env, { now, minAgeMs: 0, keepCount: 1, keepDays: 0 });
+
+    expect(report.skipped).toBeNull();
+    expect(report.retainedManifests).toBe(1);
+    expect(report.deletedManifests).toBe(2);
+    expect(report.deletedBlobs).toBe(1);
+    expect(await env.VAULT.head(`blobs/${kept}`)).not.toBeNull();
+    expect(await env.VAULT.head(`blobs/${dropped}`)).toBeNull();
+    await runInDurableObject(env.VAULT_LOCK.getByName("default"), (_instance: VaultLock, state) => {
+      expect(
+        state.storage.sql
+          .exec<{ value: string }>("SELECT value FROM meta WHERE key = 'gc_index_backfilled'")
+          .toArray()
+      ).toEqual([{ value: "1" }]);
+      expect(
+        state.storage.sql.exec<{ id: string }>("SELECT id FROM manifest_index").toArray()
+      ).toEqual([{ id: next.id }]);
+      expect(
+        state.storage.sql.exec<{ hash: string }>("SELECT hash FROM current_blob_refs").toArray()
+      ).toEqual([{ hash: kept }]);
+    });
+  });
+
+  it("derives retained liveness without downloading retained manifests", async () => {
+    const blob = await seedBlob("indexed");
+    const first = makeManifest({ files: { "a.md": { h: blob } } });
+    await publish(first, null);
+    let manifestGets = 0;
+    let listCalls = 0;
+    const real = env.VAULT;
+    const counting = {
+      head: (key: string) => real.head(key),
+      get: (key: string, options?: R2GetOptions) => {
+        if (key.startsWith("manifests/")) manifestGets++;
+        return real.get(key, options);
+      },
+      list: (options?: R2ListOptions) => {
+        listCalls++;
+        return real.list(options);
+      },
+      put: (key: string, value: ReadableStream | ArrayBuffer | string, options?: R2PutOptions) =>
+        real.put(key, value, options),
+      delete: (keys: string | string[]) => real.delete(keys),
+    };
+
+    const report = await runGc(
+      { ...env, VAULT: counting as unknown as R2Bucket },
+      { now: Date.now(), minAgeMs: 0 }
+    );
+    expect(report.skipped).toBeNull();
+    expect(manifestGets).toBe(0);
+    expect(listCalls).toBe(2); // one incremental pass per prefix at this bucket size
   });
 });
