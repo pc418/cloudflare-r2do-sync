@@ -317,4 +317,6 @@ PolyForm terms apply from 0.3.0 onward.
 ## Support
 
 If this plugin replaced a sync subscription for you, you can keep a fraction of the
-difference flowing: [ko-fi.com/pc418](https://ko-fi.com/pc418) ☕
+difference flowing:
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/F1F11WRQDT)
