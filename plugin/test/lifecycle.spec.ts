@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import LogSyncPlugin, { DEFAULT_SETTINGS, type Settings } from "../src/main";
+import LogSyncPlugin, {
+  continuityBody,
+  DEFAULT_SETTINGS,
+  type Settings,
+} from "../src/main";
 import { encodeSetupPayload } from "../src/setup-link";
 import { LifecycleApp, Modal, Notice, Platform, requestUrlMock } from "./obsidian-fake";
 
@@ -579,5 +583,130 @@ describe("registration and teardown", () => {
     expect(requestUrlMock.calls).toHaveLength(0);
     await plugin.syncNow();
     expect(Notice.shown.some((n) => /server URL and access token/.test(n))).toBe(true);
+  });
+});
+
+// --- head-descent verification ----------------------------------------------------------
+
+/**
+ * A server serving a head whose history does not contain this device's own snapshot. The
+ * engine's own spec covers what the walk concludes; what is wired here is who gets asked.
+ */
+function unrelatedHistoryServer(): void {
+  requestUrlMock.impl = async (req) => {
+    const url = (req as { url: string }).url;
+    if (url.endsWith("/api/head")) {
+      return { status: 200, text: '{"head":"01UNRELATED"}', json: { head: "01UNRELATED" } };
+    }
+    if (url.includes("/api/manifests/")) {
+      const manifest = {
+        v: 1,
+        id: "01UNRELATED",
+        parent: null,
+        device: "somewhere-else",
+        createdAt: "2026-08-13T00:00:00Z",
+        files: {},
+      };
+      return { status: 200, text: JSON.stringify(manifest), json: manifest };
+    }
+    if (url.endsWith("/api/settings")) {
+      return { status: 404, text: "{}", json: { error: { code: "not_found", message: "none" } } };
+    }
+    return { status: 200, text: "{}", json: {} };
+  };
+}
+
+describe("continuity gate", () => {
+  const configured = () =>
+    makePlugin(
+      persisted({
+        settings: {
+          ...CONFIGURED,
+          firstSyncAcknowledged: true,
+          retryAttempts: 0,
+          intervalMinutes: 5,
+        },
+      })
+    );
+
+  it("a timer pass answers nothing, changes nothing, and says so", async () => {
+    const { plugin, app } = configured();
+    emptyVault(app);
+    unrelatedHistoryServer();
+    await plugin.onload();
+    Notice.shown.length = 0;
+    Modal.shown.length = 0;
+
+    const timer = live("interval").find((t) => t.ms === 5 * 60_000);
+    expect(timer).toBeDefined();
+    timer!.fn();
+    await flush();
+    await flush();
+
+    // Nobody is at the keyboard, so nothing may be asked and nothing may be published.
+    expect(Modal.shown).toHaveLength(0);
+    expect(requestUrlMock.calls.some((c) => (c as { url: string }).url.endsWith("/api/commit"))).toBe(
+      false
+    );
+    expect(Notice.shown.some((n) => /could not trace the remote's current snapshot/.test(n))).toBe(
+      true
+    );
+  });
+
+  it("a sync the user started raises the window instead", async () => {
+    const { plugin, app } = configured();
+    emptyVault(app);
+    unrelatedHistoryServer();
+    await plugin.onload();
+    Modal.shown.length = 0;
+
+    const pass = plugin.syncNow();
+    await flush();
+
+    const modal = lastModal();
+    expect(modal).toBeDefined();
+    expect(modal.contentEl.log.headings).toContain("Cannot confirm the remote's history");
+    // Dismissal is not an answer; the pass settles as "stopped" rather than hanging.
+    modal.close();
+    await pass;
+
+    expect(requestUrlMock.calls.some((c) => (c as { url: string }).url.endsWith("/api/commit"))).toBe(
+      false
+    );
+  });
+
+  it("names the ordinary cause of each reason instead of only the alarming one", () => {
+    const summary = { head: "01NEW", lastHead: "01OURS", walked: 3, alreadyApplied: 0 } as const;
+    const replaced = continuityBody({ ...summary, reason: "replaced" }).join(" ");
+    const truncated = continuityBody({ ...summary, reason: "truncated" }).join(" ");
+    const limit = continuityBody({ ...summary, reason: "limit" }).join(" ");
+
+    expect(replaced).toContain("Rebuild remote history");
+    expect(truncated).toContain("away longer than the server keeps history");
+    expect(limit).toContain("3 snapshots back");
+    const unauthenticated = continuityBody({ ...summary, reason: "unauthenticated" }).join(" ");
+    expect(unauthenticated).toContain("past an encryption change");
+    // Every one of them names both heads and says what stopping costs, which is nothing.
+    for (const text of [replaced, truncated, limit, unauthenticated]) {
+      expect(text).toContain("01NEW");
+      expect(text).toContain("01OURS");
+      expect(text).toContain("Stopping leaves both sides exactly as they are");
+    }
+  });
+
+  it("does not promise nothing changed when this pass already applied a verified snapshot", () => {
+    // The one case where "stopping changes nothing" is a lie: an earlier turn of the same
+    // pass merged a head whose ancestry it confirmed, then lost the head race.
+    const text = continuityBody({
+      head: "01NEW",
+      lastHead: "01OURS",
+      reason: "replaced",
+      walked: 1,
+      alreadyApplied: 2,
+    }).join(" ");
+
+    expect(text).not.toContain("Stopping leaves both sides exactly as they are");
+    expect(text).toContain("Stopping publishes nothing");
+    expect(text).toContain("does not undo the 2 file(s)");
   });
 });

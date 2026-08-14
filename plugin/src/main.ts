@@ -51,6 +51,8 @@ import { ObsidianVault } from "./obsidian-vault";
 import {
   SyncEngine,
   type ConflictInfo,
+  type ContinuityDecision,
+  type ContinuitySummary,
   type MassChangeDecision,
   type MassChangeSummary,
   type SnapshotInfo,
@@ -894,6 +896,10 @@ export default class LogSyncPlugin extends Plugin {
         generation === this.#generation
           ? this.#decideMassChange(s)
           : Promise.resolve<MassChangeDecision>("cancel"),
+      decideContinuity: (s) =>
+        generation === this.#generation
+          ? this.#decideContinuity(s)
+          : Promise.resolve<ContinuityDecision>("stop"),
       onProgress: ({ phase, done, total }) => {
         if (generation !== this.#generation) return;
         this.#progress = `${phase === "pull" ? "pulling" : "uploading"} ${done}/${total}`;
@@ -933,6 +939,18 @@ export default class LogSyncPlugin extends Plugin {
     if (this.#interactive === 0) return "cancel";
     return await new Promise<MassChangeDecision>((resolve) => {
       new MassChangeModal(this.app, summary, resolve).open();
+    });
+  }
+
+  /**
+   * Asked by the engine when it cannot trace the remote head back to the snapshot this device
+   * last absorbed. Same rule as the mass-change guard, and for a stronger reason: a background
+   * timer cannot judge whether the server's history is still the one it was syncing with.
+   */
+  async #decideContinuity(summary: ContinuitySummary): Promise<ContinuityDecision> {
+    if (this.#interactive === 0) return "stop";
+    return await new Promise<ContinuityDecision>((resolve) => {
+      new ContinuityModal(this.app, summary, resolve).open();
     });
   }
 
@@ -1553,7 +1571,7 @@ export default class LogSyncPlugin extends Plugin {
     this.#phase =
       result.status === "halted"
         ? "halted"
-        : result.status === "needs-decision"
+        : result.status === "needs-decision" || result.status === "needs-continuity"
           ? "decision"
           : "idle";
     this.#renderStatus();
@@ -1766,6 +1784,17 @@ export default class LogSyncPlugin extends Plugin {
         `R2DO Sync paused: the remote would delete ${deletes.length} and overwrite ` +
           `${overwrites.length} file(s) here — ${percent}% of this vault. Run "Sync now" to ` +
           `review and choose what happens.`,
+        0
+      );
+    }
+    if (result.status === "needs-continuity") {
+      // "Nothing was published" and not "nothing was changed": an earlier turn of the same
+      // pass may have applied a snapshot whose history it did confirm, and `result.pulled`
+      // has its own notice above saying so.
+      new Notice(
+        "R2DO Sync paused: it could not trace the remote's current snapshot back to the one " +
+          `this device last synced (${result.continuity.reason}). Nothing was published. Run ` +
+          '"Sync now" to see what was checked and decide.',
         0
       );
     }
@@ -2059,6 +2088,96 @@ class MassChangeModal extends Modal {
   }
 }
 
+/**
+ * The user-facing half of head-descent verification: the remote is offering a snapshot whose
+ * ancestry this device cannot trace back to what it last synced.
+ *
+ * Deliberately not phrased as an accusation. Every reason here has an ordinary cause — a
+ * rebuilt history, a device away past the retention window — and the same shape as a served
+ * rollback, and there is nothing on this device that can tell them apart. So it states what
+ * was checked, what that could mean, and lets someone who knows which devices exist decide.
+ */
+export function continuityBody(summary: ContinuitySummary): string[] {
+  const what: Record<ContinuitySummary["reason"], string> = {
+    replaced:
+      "The remote's history now starts from a snapshot that has no parent, and this device's " +
+      "own snapshot is not anywhere in it. That is exactly what \"Rebuild remote history\" on " +
+      "another device does — and also what a remote whose history was replaced looks like.",
+    truncated:
+      "The remote's history stops before this device's own snapshot. That is ordinary once a " +
+      "device has been away longer than the server keeps history — and also what a remote " +
+      "whose history was replaced looks like.",
+    limit:
+      `The check walked ${summary.walked} snapshots back without finding this device's own ` +
+      "and stopped there rather than downloading the rest of the chain.",
+    unauthenticated:
+      "The trail runs back into a snapshot this device cannot authenticate — an older " +
+      "encryption version, or one written under a key this device no longer holds. From " +
+      "there on, the link from each snapshot to the one before it is only the server's " +
+      "word, so the check stopped rather than finish on it. Ordinary on a vault whose " +
+      "history reaches back past an encryption change.",
+  };
+  return [
+    what[summary.reason],
+    `Remote head: ${summary.head}. Last synced from this device: ${summary.lastHead}.`,
+    "Continuing merges the remote in the ordinary way: nothing is deleted here without the " +
+      "usual large-change question, and anything that cannot be merged keeps both versions.",
+    // Never "stopping changes nothing": a pass that applied a verified snapshot and then lost
+    // the head race has already written files, and saying otherwise would be a false promise
+    // about the very thing the user is being asked to judge.
+    summary.alreadyApplied > 0
+      ? `Stopping publishes nothing and leaves the remote untouched. It does not undo the ` +
+        `${summary.alreadyApplied} file(s) this pass already applied from an earlier snapshot ` +
+        `whose history it did confirm. The question comes back on the next sync.`
+      : "Stopping leaves both sides exactly as they are, and the question comes back on the " +
+        "next sync.",
+    "If you did not expect this, check Browse snapshot history before continuing.",
+  ];
+}
+
+class ContinuityModal extends Modal {
+  #answered = false;
+
+  constructor(
+    app: App,
+    private readonly summary: ContinuitySummary,
+    private readonly resolve: (d: ContinuityDecision) => void
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Cannot confirm the remote's history" });
+    for (const text of continuityBody(this.summary)) contentEl.createEl("p", { text });
+
+    new Setting(contentEl)
+      .addButton((b) => {
+        b.setButtonText("Stop for now")
+          .setCta()
+          .onClick(() => this.#answer("stop"));
+      })
+      .addButton((b) => {
+        b.setButtonText("Merge anyway")
+          .setWarning()
+          .onClick(() => this.#answer("continue"));
+      });
+  }
+
+  #answer(decision: ContinuityDecision): void {
+    this.#answered = true;
+    this.resolve(decision);
+    this.close();
+  }
+
+  onClose(): void {
+    // Dismissal is not an answer, and here the safe non-answer is to touch nothing.
+    if (!this.#answered) this.resolve("stop");
+    this.contentEl.empty();
+  }
+}
+
 /** Read-only report of what a sync would do right now. */
 class PreviewModal extends Modal {
   constructor(
@@ -2079,6 +2198,15 @@ class PreviewModal extends Modal {
     if (preview.halted) {
       contentEl.createEl("p", { text: `Sync would halt: ${preview.halted}` });
       return;
+    }
+    if (preview.continuity) {
+      // Above the plan, not beside it: everything below assumes this remote is the same
+      // history this device has been syncing with, and that is the assumption in question.
+      contentEl.createEl("p", {
+        text:
+          "This pass would stop to ask first: the remote's current snapshot could not be " +
+          `traced back to the one this device last synced (${preview.continuity.reason}).`,
+      });
     }
     if (preview.guard) {
       contentEl.createEl("p", {

@@ -78,6 +78,13 @@ function detailOf(result: SyncResult): string {
         `${percent}% of the vault, over the ${threshold}% limit`
       );
     }
+    case "needs-continuity": {
+      const { head, lastHead, reason, walked } = result.continuity;
+      return (
+        `remote head ${head} could not be traced back to ${lastHead} (${reason}, ` +
+        `${walked} snapshot(s) walked)`
+      );
+    }
     case "unchanged":
       return "";
   }
@@ -115,7 +122,16 @@ export function announcePass(opts: {
   result: SyncResult;
 }): boolean {
   if (!opts.notifyOnSync) return false;
-  if (opts.result.status === "halted") return false;
+  // A pass that stopped to ask something did not finish, so the per-pass summary would be a
+  // false statement — "up to date" printed above a notice explaining that nothing was done.
+  // Each of these carries its own message instead.
+  if (
+    opts.result.status === "halted" ||
+    opts.result.status === "needs-decision" ||
+    opts.result.status === "needs-continuity"
+  ) {
+    return false;
+  }
   if (passChangedSomething(opts.result)) return true;
   if (opts.interactive) return true;
   return !opts.onlyChanged;

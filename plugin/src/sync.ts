@@ -1,4 +1,4 @@
-import { MissingBlobError, StaleHeadError } from "./api";
+import { ApiError, MissingBlobError, StaleHeadError } from "./api";
 import { manifestAad, type VaultCrypto } from "./crypto";
 import { sha256Hex } from "./hash";
 import {
@@ -28,6 +28,7 @@ import {
   isEmptyManifest,
   type FileEntry,
   type Manifest,
+  type ManifestV3,
   type StateStore,
   type SyncState,
   type VaultAdapter,
@@ -115,11 +116,60 @@ export interface MassChangeSummary {
   threshold: number;
 }
 
+/**
+ * Why a pass could not confirm that the head the server is serving grew out of the snapshot
+ * this device last absorbed.
+ *
+ * None of these is proof of an attack, and the difference between them is the whole point of
+ * reporting them separately — a device that has simply been away longer than history retention
+ * looks, from here, exactly like a server that replaced its history.
+ */
+export type ContinuityReason =
+  /**
+   * The chain ends at a snapshot with no parent that is not one of ours. Another device ran
+   * "Rebuild remote history", which orphans everything earlier by design — or something
+   * replaced the vault's history wholesale.
+   */
+  | "replaced"
+  /** An ancestor is no longer stored. Ordinary once a device is past the retention window. */
+  | "truncated"
+  /** The chain was longer than this check walks. Says nothing either way. */
+  | "limit"
+  /**
+   * The walk started from an envelope this device authenticated and reached one it cannot:
+   * an older manifest version, or one encrypted under a key we no longer hold. From there
+   * the parent links are the server's word rather than evidence, so the walk stops instead
+   * of finishing a proof it can no longer make. Ordinary on a vault whose history predates
+   * an encryption migration.
+   */
+  | "unauthenticated";
+
+/** What a pass found when it could not place its own last snapshot in the remote's history. */
+export interface ContinuitySummary {
+  /** The head the server is serving now. */
+  head: string;
+  /** The snapshot this device last absorbed — what the walk was looking for. */
+  lastHead: string;
+  reason: ContinuityReason;
+  /** Snapshots walked back from `head`, including it, before the walk gave up. */
+  walked: number;
+  /**
+   * Local files this pass had already written or removed before the question arose, by
+   * applying an *earlier* head whose ancestry it did verify and then losing the head race.
+   * Usually zero. Never a number the message may round down to "nothing was changed".
+   */
+  alreadyApplied: number;
+}
+
+/** Whether to merge a remote whose ancestry could not be verified, or leave it alone. */
+export type ContinuityDecision = "continue" | "stop";
+
 export type SyncResult =
   | ({ status: "committed"; head: string } & ResultBase)
   | ({ status: "pulled"; head: string } & ResultBase)
   | ({ status: "unchanged" } & ResultBase)
   | ({ status: "needs-decision"; summary: MassChangeSummary } & ResultBase)
+  | ({ status: "needs-continuity"; continuity: ContinuitySummary } & ResultBase)
   | ({ status: "halted"; reason: string } & ResultBase);
 
 export interface PreviewAction {
@@ -139,6 +189,12 @@ export interface SyncPreview {
   guard: MassChangeSummary | null;
   /** Set when the remote cannot be read at all; the lists are then empty. */
   halted?: string;
+  /**
+   * Set when this preview could not confirm that the remote head descends from the snapshot
+   * this device last absorbed. The plan below is still what a sync would do; this is the
+   * caveat that a sync would stop to ask about first.
+   */
+  continuity?: ContinuitySummary;
 }
 
 /** One entry in the snapshot chain, as shown in the history browser. */
@@ -191,6 +247,12 @@ export interface SyncEngineOptions {
   protectPercent?: number;
   /** Asked before a destructive pull is applied. Absent means "cancel" — never guess. */
   decideMassChange?: (summary: MassChangeSummary) => Promise<MassChangeDecision>;
+  /**
+   * Asked when the remote head cannot be shown to descend from the one this device last
+   * absorbed. Absent means "stop": an unattended pass must not answer a question about
+   * whether the server's history is the one it was syncing with yesterday.
+   */
+  decideContinuity?: (summary: ContinuitySummary) => Promise<ContinuityDecision>;
   /** What happens to unmergeable pairs. Default "keep-both"; see `ConflictMode`. */
   conflictMode?: ConflictMode;
   onProgress?: (p: { phase: "pull" | "upload"; done: number; total: number }) => void;
@@ -211,6 +273,17 @@ const MAX_COMMIT_ATTEMPTS = 3;
  * would otherwise loop forever at full cost.
  */
 const MAX_RESCAN_ATTEMPTS = 3;
+
+/**
+ * How far back a pass will walk the remote chain to find the snapshot it last absorbed.
+ *
+ * A backstop, not a policy: the honest walk is already bounded by retention, because an
+ * ancestor older than the server keeps is simply gone and ends the walk as `truncated`. Every
+ * step past the first is one manifest fetch — and a manifest restates the vault's whole path
+ * map — so the cost is proportional to how many commits this device missed. The first step is
+ * free: the head manifest the pass is about to merge is already in hand.
+ */
+const MAX_DESCENT_STEPS = 250;
 
 /**
  * The vault changed while a pass was publishing it. Recoverable by rescanning — the snapshot is
@@ -396,6 +469,7 @@ export class SyncEngine {
   readonly #protectPercent: number;
   readonly #conflictMode: ConflictMode;
   readonly #decideMassChange: ((s: MassChangeSummary) => Promise<MassChangeDecision>) | null;
+  readonly #decideContinuity: ((s: ContinuitySummary) => Promise<ContinuityDecision>) | null;
   readonly #onProgress: SyncEngineOptions["onProgress"];
   readonly #lanes: number;
 
@@ -439,6 +513,7 @@ export class SyncEngine {
     this.#protectPercent = opts.protectPercent ?? DEFAULT_PROTECT_PERCENT;
     this.#conflictMode = opts.conflictMode ?? "keep-both";
     this.#decideMassChange = opts.decideMassChange ?? null;
+    this.#decideContinuity = opts.decideContinuity ?? null;
     this.#onProgress = opts.onProgress;
     this.#lanes = clampLanes(opts.lanes ?? DEFAULT_LANES);
   }
@@ -552,6 +627,8 @@ export class SyncEngine {
     // base that preceded both remotes.
     let baseFiles = state.files;
     let baseHead = state.lastSyncedHead;
+    /** Where this pass started, so an early return knows whether it absorbed anything. */
+    const originalHead = state.lastSyncedHead;
     /**
      * The blobs the base snapshot already put on the server, so a pass can ask about the
      * ones it is *adding* rather than about its whole vault. Deliberately not derived from
@@ -631,7 +708,32 @@ export class SyncEngine {
         const remote = await this.#api.getManifest(serverHead);
         const mismatch = this.#modeError(remote, serverHead);
         if (mismatch !== null) return this.#halt(mismatch, outcome);
+
+        // Deliberately before the descent check below, not after it: decrypting a v3 head is
+        // also what authenticates its envelope, `parent` included, so the check reads a link
+        // this device has verified rather than one the server merely asserted.
         remoteFiles = await this.#remoteFiles(remote);
+
+        // "The head moved" is the ordinary case, and it is also what a served rollback looks
+        // like. The difference is whether the snapshot this device already absorbed is an
+        // ancestor of the one being offered. Forced pushes and reroots skip the check: they
+        // were previewed against a named head and deliberately do not merge what they find.
+        if (baseHead !== null && !forceKeepLocal && reroot === null && previewedHead === undefined) {
+          const gap = await this.#verifyDescent(remote, baseHead, outcome.pulled);
+          if (gap !== null) {
+            const decision = this.#decideContinuity
+              ? await this.#decideContinuity(gap)
+              : "stop";
+            if (decision !== "continue") {
+              // Not a halt, for the same reason the mass-change guard is not one: the question
+              // should re-raise itself on the next pass rather than wait for an explicit reset.
+              await this.#persistAbsorbed(originalHead, baseHead, baseFiles, baseLines, keyId, outcome);
+              this.status = { phase: "idle" };
+              return this.#result({ status: "needs-continuity", continuity: gap, ...outcome });
+            }
+          }
+        }
+
         // Captured before collision resolution can mix local entries in: these, and only
         // these, are the blobs the manifest we are about to parent onto references.
         const remoteBlobs = new Set(Object.values(remoteFiles).map(blobKey));
@@ -690,6 +792,7 @@ export class SyncEngine {
               // Deliberately not a halt: halts are sticky and need an explicit reset, but a
               // pending decision should re-raise itself on the next pass so the user can
               // answer it whenever they next sync.
+              await this.#persistAbsorbed(originalHead, baseHead, baseFiles, baseLines, keyId, outcome);
               this.status = { phase: "idle" };
               return this.#result({
                 status: "needs-decision",
@@ -1389,13 +1492,22 @@ export class SyncEngine {
 
     let remoteFiles: Record<string, FileEntry> | null = null;
     let remoteDevice: string | null = null;
+    let continuity: ContinuitySummary | undefined;
     if (serverHead !== null && serverHead !== state.lastSyncedHead) {
       const remote = await this.#api.getManifest(serverHead);
       const mismatch = this.#modeError(remote, serverHead);
       if (mismatch !== null) {
         return { head: serverHead, pull: [], push: [], skipped: [], guard: null, halted: mismatch };
       }
+      // Same ordering rule as the pass: decrypting the head is what authenticates its
+      // envelope, so the walk below reads a verified parent link.
       remoteFiles = await this.#remoteFiles(remote);
+      // Preview is read-only, so this reports rather than asks — but it must report, or the
+      // window a cautious user opens *before* syncing is the one place that stays quiet.
+      // Nothing has been applied by definition here, hence the zero.
+      if (state.lastSyncedHead !== null) {
+        continuity = (await this.#verifyDescent(remote, state.lastSyncedHead, 0)) ?? undefined;
+      }
       remoteDevice = remote.device;
     }
 
@@ -1447,6 +1559,7 @@ export class SyncEngine {
         push: diffSnapshot(remoteSnapshotFiles, finalFiles),
         skipped: local.skipped,
         guard: null,
+        continuity,
       };
     }
 
@@ -1494,6 +1607,7 @@ export class SyncEngine {
       push: this.#mode === "pull-only" ? [] : push,
       skipped: local.skipped,
       guard: massChangeSummary(plan, local.files, this.#protectPercent),
+      continuity,
     };
   }
 
@@ -1506,6 +1620,132 @@ export class SyncEngine {
       this.#isExcluded(path) ||
       (this.#hasOnlyPaths && !this.#isIncluded(path))
     );
+  }
+
+  /**
+   * Records what this pass has already absorbed, when it stops to ask something after an
+   * earlier turn of the loop already applied a verified remote to disk.
+   *
+   * Without this, a pass that absorbed R1, lost the head race, and then stopped on R2 would
+   * leave the vault holding R1's files while persisted state still named R0 — and the next
+   * pass would read everything it had just pulled as new local work. Saving the absorbed base
+   * is also what makes the question re-raise against the right snapshot. A no-op when nothing
+   * was absorbed, which is the usual case.
+   *
+   * `inventory` is deliberately dropped: files were just written underneath the discovery
+   * cache, so the next pass has to be a full scan.
+   */
+  async #persistAbsorbed(
+    originalHead: string | null,
+    baseHead: string | null,
+    baseFiles: Record<string, FileEntry>,
+    baseLines: LineCounts | undefined,
+    keyId: string | null,
+    outcome: MergeOutcome
+  ): Promise<void> {
+    if (baseHead === originalHead) return;
+    this.#state = {
+      lastSyncedHead: baseHead,
+      files: baseFiles,
+      keyId,
+      lines: carryLineCounts(baseFiles, applyLineDeltas(baseLines, outcome.pulledChanges), {}),
+    };
+    await this.#store.save(this.#state);
+  }
+
+  /**
+   * True when this manifest's envelope — `parent` included — is bound to its ciphertext by
+   * AES-GCM AAD under *this device's* key. False when the format cannot prove it (v1, v2) or
+   * the key cannot (a snapshot from before an encryption migration).
+   *
+   * A predicate, not a verification: the caller is responsible for having decrypted the
+   * manifest, which is what actually performs the check.
+   */
+  #envelopeIsAuthenticated(m: Manifest): m is ManifestV3 {
+    return m.v === 3 && this.#crypto !== null && m.keyId === this.#crypto.keyId;
+  }
+
+  /**
+   * Confirms that `remote` grew out of the snapshot this device last absorbed, by walking its
+   * parent links back until `lastHead` turns up. Returns null when it does — the ordinary "we
+   * are behind" case — and otherwise says why it could not be found.
+   *
+   * This is the no-crypto half of rollback detection. `lastSyncedHead` is a local monotonic
+   * checkpoint: a server that serves an older snapshot, or a different history altogether,
+   * cannot make this device's own record of what it published go away.
+   *
+   * **What the walk trusts is the parent links, so it verifies every one it follows.** A v3
+   * manifest binds its envelope — `parent` included — to its ciphertext under the vault key,
+   * and `#remoteFiles` has already decrypted the head by the time this runs. Each ancestor is
+   * decrypted here for the same reason. Without that, an id check alone is no defence: the
+   * server can answer a request for an authenticated ancestor id with a forged v1 envelope
+   * carrying that id and a `parent` pointing at `lastHead`, and the walk would report
+   * continuity for a chain nobody signed.
+   *
+   * The walk therefore runs in one of two grades, decided by the head:
+   *
+   * - **Authenticated** (v3 under our key). Every link is verified. Reaching a manifest that
+   *   cannot be — an older version, or a key from before a migration — ends the walk as
+   *   `unauthenticated` rather than silently finishing the proof on the server's word.
+   * - **Best effort** (v1 plaintext, or v2, which never bound its header). Nothing here can be
+   *   verified, so nothing pretends to be: the check still catches accident — a restored
+   *   bucket, a reset Durable Object, a mistaken reroot — but not a forging server, and it
+   *   does not raise `unauthenticated` questions it has no evidence behind.
+   *
+   * A repeated id is corruption around the one-use rule rather than an ambiguity, so it throws
+   * instead of asking anyone: the walk cannot terminate and no answer would be safe. So does a
+   * v3 ancestor under our own key whose envelope fails to authenticate — that is tampering, not
+   * a question for the user.
+   */
+  async #verifyDescent(
+    remote: Manifest,
+    lastHead: string,
+    alreadyApplied: number
+  ): Promise<ContinuitySummary | null> {
+    const seen = new Set<string>([remote.id]);
+    let parent = remote.parent;
+    let walked = 1;
+    // Non-null exactly when the head's own envelope is authenticated, which is what decides
+    // the grade for the whole walk. Held as the key itself so every ancestor is verified with
+    // the one the head was verified under.
+    const verifier = this.#envelopeIsAuthenticated(remote) ? this.#crypto : null;
+    const gap = (reason: ContinuityReason): ContinuitySummary => ({
+      head: remote.id,
+      lastHead,
+      reason,
+      walked,
+      alreadyApplied,
+    });
+
+    for (;;) {
+      if (parent === lastHead) return null;
+      if (parent === null) return gap("replaced");
+      if (seen.has(parent)) {
+        throw new Error(
+          `the remote snapshot chain loops back to ${parent}; refusing to sync against it`
+        );
+      }
+      if (walked >= MAX_DESCENT_STEPS) return gap("limit");
+      seen.add(parent);
+      let ancestor: Manifest;
+      try {
+        ancestor = await this.#api.getManifest(parent);
+      } catch (e) {
+        // Only "that snapshot is gone" ends the walk. A transport or auth failure is this
+        // pass failing, not evidence about the remote's history, and must not be dressed up
+        // as one — the scheduler's retry policy exists for exactly that difference.
+        if (!(e instanceof ApiError) || e.status !== 404) throw e;
+        return gap("truncated");
+      }
+      if (verifier !== null) {
+        if (!this.#envelopeIsAuthenticated(ancestor)) return gap("unauthenticated");
+        // The decryption IS the check: AES-GCM authenticates the AAD, and `manifestAad`
+        // covers `parent`. Throws on failure, which is the correct answer to a forgery.
+        await verifier.decryptJson(ancestor.enc, manifestAad(ancestor));
+      }
+      parent = ancestor.parent;
+      walked++;
+    }
   }
 
   /**

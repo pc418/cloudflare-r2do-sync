@@ -13,5 +13,12 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VaultLock"] }],
   "r2_buckets": [{ "binding": "VAULT", "bucket_name": "obsidian-log-sync" }],
+  // Retention. Deploy-time configuration, read by scripts/deploy.mjs and shipped as plain-text
+  // bindings, so these values are what a deployed sweep actually applies. Strings on purpose:
+  // the REST binding type is plain_text, and a number here would give the local test runtime a
+  // different type than production. Shrinking either one widens the window in which a device
+  // that has been away loses its merge base (conflict copies instead of clean diff3) and
+  // cannot verify that a served head descends from the one it last absorbed.
+  "vars": { "GC_KEEP_DAYS": "30", "GC_KEEP_COUNT": "50" },
   "triggers": { "crons": ["0 4 * * *"] }
 }

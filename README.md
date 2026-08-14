@@ -229,6 +229,13 @@ curl -X POST "$WORKER_URL/api/tokens" -H "authorization: Bearer $ADMIN_TOKEN" \
   Unattended syncs never decide for you.
 - **First sync asks once** per device to confirm you have a copy of the vault; until
   answered the status reads `CONFIRM FIRST SYNC` rather than pretending to be up to date.
+- **Continuity check.** Before merging a snapshot it has not seen, a device traces it back to
+  the one it last synced. Usually that is the snapshot's own parent and costs nothing. If the
+  trail runs out — the history was rebuilt, or this device has been away longer than the
+  server keeps history — the pass stops and asks instead of merging a history it cannot
+  place. Unattended syncs never answer it, and stopping publishes nothing. On an encrypted
+  vault every link the check follows is authenticated with the vault key, so the trail
+  cannot be forged by whoever serves it.
 - **Preview, history, log.** **Preview sync** shows what a pass would change without
   changing anything; **Snapshot history** browses and restores past snapshots; **Sync log**
   exports recent passes to a note. **Sync hotkey** in settings binds "Sync now" (`⇧⌘S`
@@ -282,7 +289,11 @@ unreadable.
 - 100,000 files per snapshot.
 - Merge granularity is a line; two edits inside one line conflict.
 - Nightly garbage collection (04:00 UTC) keeps the last 50 snapshots **or** 30 days of
-  them, whichever reaches further back, plus every blob they reference.
+  them, whichever reaches further back, plus every blob they reference. Both numbers are
+  `GC_KEEP_COUNT` / `GC_KEEP_DAYS` in `worker/wrangler.jsonc`; edit them and redeploy.
+  Retained snapshots restate the whole path map, so this — not file content — is usually
+  what a vault's storage is spent on. Shrinking it also shortens how long a device can be
+  offline and still merge cleanly against a shared base.
 - One vault per deployment.
 
 ## Development
@@ -291,9 +302,9 @@ unreadable.
 # All commands are run from the repository root.
 npm --prefix worker install && npm --prefix plugin install
 
-npm --prefix worker test             # 135 tests, real workerd via vitest-pool-workers
-npm --prefix plugin test             # 773 tests, incl. rendered settings-tab/modal coverage
-node --test scripts/*.test.mjs       # 50 tests: deploy/setup/release/token helpers
+npm --prefix worker test             # 156 tests, real workerd via vitest-pool-workers
+npm --prefix plugin test             # 814 tests, incl. rendered settings-tab/modal coverage
+node --test scripts/*.test.mjs       # 56 tests: deploy/setup/release/token helpers
 npm --prefix plugin run lint         # typed lint; the baseline is zero, so any finding is new
 npm --prefix worker run lint
 

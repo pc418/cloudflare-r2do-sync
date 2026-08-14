@@ -43,6 +43,7 @@ export async function deployViaRest({ log = console.log, confirm = null, adoptBu
     durableObjectClass: DO_CLASS,
     migrationTag: MIGRATION_TAG,
     cron: CRON,
+    vars: VARS,
   } = loadWorkerDeployConfig();
 
   const fileEnv = loadEnvFile(ROOT);
@@ -106,6 +107,9 @@ export async function deployViaRest({ log = console.log, confirm = null, adoptBu
     bindings: [
       { type: "r2_bucket", name: "VAULT", bucket_name: BUCKET },
       { type: "durable_object_namespace", name: DO_BINDING, class_name: DO_CLASS },
+      // Retention. Every upload restates them, so wrangler.jsonc is the single source of
+      // truth: there is no way for a deployed Worker to keep a value the tree no longer has.
+      ...Object.entries(VARS).map(([name, text]) => ({ type: "plain_text", name, text })),
     ],
   };
 
@@ -120,6 +124,7 @@ export async function deployViaRest({ log = console.log, confirm = null, adoptBu
         scriptName: SCRIPT_NAME,
         bucket: BUCKET,
         bucketOwned: ownedClaim === bucketOwnershipClaim(ACCOUNT_ID, BUCKET),
+        retention: VARS,
       })
     );
     if (!proceed) throw new Error("cancelled — nothing was deployed");
@@ -132,6 +137,8 @@ export async function deployViaRest({ log = console.log, confirm = null, adoptBu
     adopt: adoptBucket,
   });
   log(`R2 bucket "${BUCKET}": ${bucket.status}`);
+  // Stated even with --yes, which skips the confirmation screen that would otherwise say it.
+  log(`GC retention: ${VARS.GC_KEEP_DAYS} day(s), newest ${VARS.GC_KEEP_COUNT} snapshot(s)`);
 
   let sub = await cf(`/workers/subdomain`);
   let subdomain = sub.body?.result?.subdomain ?? null;

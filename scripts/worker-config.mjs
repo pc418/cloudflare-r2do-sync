@@ -15,6 +15,41 @@ function requiredString(value, field) {
   return value;
 }
 
+/**
+ * Retention is the storage lever for this design — retained snapshots restate the whole path
+ * map, so history, not blob content, is most of the bucket. It is validated here as well as in
+ * the Worker so a typo is refused before it is uploaded, rather than at 04:00 by a sweep that
+ * then deletes nothing until someone reads the logs.
+ */
+export const GC_RETENTION_VARS = {
+  GC_KEEP_DAYS: { max: 3650 },
+  GC_KEEP_COUNT: { max: 10_000 },
+};
+
+function retentionVars(vars) {
+  if (vars !== undefined && (typeof vars !== "object" || vars === null || Array.isArray(vars))) {
+    throw new Error("worker config vars must be an object");
+  }
+  const out = {};
+  for (const [name, { max }] of Object.entries(GC_RETENTION_VARS)) {
+    const raw = vars?.[name];
+    // Strings only, matching the plain_text binding the deploy uploads. A JSON number here
+    // would give the local test runtime a different type than the deployed Worker sees.
+    if (typeof raw !== "string" || raw.trim() === "") {
+      throw new Error(`worker config requires vars.${name} as a non-empty string`);
+    }
+    // Plain decimal digits only. `Number()` alone would quietly accept "1e3" and "0x10",
+    // which is not a spelling anyone intends for a retention window.
+    const trimmed = raw.trim();
+    const value = /^\d+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
+    if (!Number.isInteger(value) || value < 1 || value > max) {
+      throw new Error(`worker config vars.${name} must be an integer from 1 to ${max}, not "${raw}"`);
+    }
+    out[name] = String(value);
+  }
+  return out;
+}
+
 /** Validates and selects the wrangler fields used by the REST deployment path. */
 export function parseWorkerDeployConfig(source) {
   const errors = [];
@@ -56,6 +91,7 @@ export function parseWorkerDeployConfig(source) {
     durableObjectClass,
     migrationTag,
     cron: requiredString(crons[0], "triggers.crons[0]"),
+    vars: retentionVars(config?.vars),
   };
 }
 

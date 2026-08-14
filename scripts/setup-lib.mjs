@@ -377,7 +377,7 @@ export async function waitForHealth({
  * shown — enough to tell two accounts apart on sight, without writing the whole identifier
  * into a terminal transcript.
  */
-export function renderRestDeployCheck({ accountId, scriptName, bucket, bucketOwned }) {
+export function renderRestDeployCheck({ accountId, scriptName, bucket, bucketOwned, retention }) {
   return [
     "",
     THIN,
@@ -386,6 +386,11 @@ export function renderRestDeployCheck({ accountId, scriptName, bucket, bucketOwn
     `  Account    ${String(accountId).slice(0, 8)}… (from CLOUDFLARE_ACCOUNT_ID)`,
     `  Worker     ${scriptName}`,
     `  R2 bucket  ${bucket}${bucketOwned ? " (created by this checkout)" : ""}`,
+    // Retention is the one deploy-time setting that decides what gets deleted, so it belongs
+    // on the same screen as the bucket it deletes from.
+    ...(retention
+      ? [`  Retention  ${retention.GC_KEEP_DAYS} day(s), and at least the newest ${retention.GC_KEEP_COUNT} snapshot(s)`]
+      : []),
     "",
     bucketOwned
       ? "  This is a redeploy onto storage this checkout provisioned."

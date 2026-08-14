@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { ALL_SCOPES, VaultLock, isTokenScope, type TokenScope } from "./vault-lock";
 import { MAX_CHECK_BODY_BYTES, checkBlobs, getBlob, putBlob } from "./blobs";
-import { runGc } from "./gc";
+import { gcRetention, runGc } from "./gc";
 import { ULID_RE } from "./manifest";
 import { logPhase } from "./timing";
 import {
@@ -18,6 +18,9 @@ export interface Env {
   VAULT: R2Bucket;
   VAULT_LOCK: DurableObjectNamespace<VaultLock>;
   ADMIN_TOKEN: string;
+  /** Retention window, as deployed. Strings because they arrive as plain-text bindings. */
+  GC_KEEP_DAYS: string;
+  GC_KEEP_COUNT: string;
 }
 
 type AppEnv = { Bindings: Env; Variables: { tokenId: string; scopes: TokenScope[] } };
@@ -175,6 +178,16 @@ app.post("/api/gc", adminAuth, async (c) => {
   const manifests = indexChunkOf(c);
   if (manifests === undefined) {
     return c.json(errJson("invalid_manifests", "manifests must be an integer from 1 to 1000"), 422);
+  }
+  // Named separately from any other 500: "this deployment's retention vars are unusable" is an
+  // operator's own misconfiguration and should say so rather than read as a Worker fault.
+  try {
+    gcRetention(c.env);
+  } catch (error) {
+    return c.json(
+      errJson("gc_misconfigured", error instanceof Error ? error.message : String(error)),
+      500
+    );
   }
   const report = await runGc(c.env, manifests === null ? {} : { indexChunk: manifests });
   console.log(JSON.stringify({ event: "gc_report", trigger: "manual", ...report }));
@@ -370,7 +383,20 @@ app.notFound((c) => c.json(errJson("not_found", "no such route"), 404));
 export default {
   fetch: app.fetch,
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
-    const report = await runGc(env);
-    console.log(JSON.stringify({ event: "gc_report", ...report }));
+    try {
+      const report = await runGc(env);
+      console.log(JSON.stringify({ event: "gc_report", ...report }));
+    } catch (error) {
+      // Nobody is watching a cron's stack trace. Emit the same structured shape the reports
+      // use so a failed nightly sweep is greppable next to the ones that worked, then rethrow
+      // so the invocation itself is still recorded as an error.
+      console.error(
+        JSON.stringify({
+          event: "gc_failed",
+          message: error instanceof Error ? error.message : String(error),
+        })
+      );
+      throw error;
+    }
   },
 };

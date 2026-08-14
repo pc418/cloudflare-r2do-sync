@@ -120,6 +120,17 @@ test("the REST deploy check names the target without printing the whole account 
   assert.match(redeploy, /created by this checkout/);
 });
 
+test("the deploy check states the retention the sweep will delete by", () => {
+  const text = renderRestDeployCheck({
+    accountId: "0123456789abcdef0123456789abcdef",
+    scriptName: "obsidian-log-sync",
+    bucket: "obsidian-log-sync",
+    bucketOwned: true,
+    retention: { GC_KEEP_DAYS: "7", GC_KEEP_COUNT: "5" },
+  });
+  assert.match(text, /Retention\s+7 day\(s\), and at least the newest 5 snapshot\(s\)/);
+});
+
 // --- which account gets the worker -------------------------------------------
 
 test("explicit --token requires both REST credentials", () => {

@@ -1,7 +1,7 @@
 import { sha256Hex } from "../src/hash";
 import { blobKey, type Manifest, type ManifestV1, type ManifestV2, type ManifestV3 } from "../src/types";
 import type { StateStore, SyncState, VaultAdapter, VaultFile } from "../src/types";
-import { MissingBlobError, StaleHeadError } from "../src/api";
+import { ApiError, MissingBlobError, StaleHeadError } from "../src/api";
 import type { SyncApiLike } from "../src/sync";
 
 /** In-memory vault. Paths map to string or binary content. */
@@ -105,7 +105,9 @@ export class FakeServer implements SyncApiLike {
 
   async getManifest(id: string): Promise<Manifest> {
     const m = this.manifests.get(id);
-    if (!m) throw new Error(`unknown manifest ${id}`);
+    // The Worker answers a collected snapshot with a 404, and the difference matters: code
+    // that walks history has to tell "that snapshot is gone" apart from "the request failed".
+    if (!m) throw new ApiError(`unknown manifest ${id}`, 404, "not_found");
     return m;
   }
 

@@ -3,9 +3,9 @@ import { logPhase } from "./timing";
 
 export interface GcOptions {
   now?: number;
-  /** Latest N manifests on the head chain always survive. */
+  /** Latest N manifests on the head chain always survive. Defaults to `GC_KEEP_COUNT`. */
   keepCount?: number;
-  /** Manifests younger than this many days always survive. */
+  /** Manifests younger than this many days always survive. Defaults to `GC_KEEP_DAYS`. */
   keepDays?: number;
   /** Objects uploaded within this window are never deleted (in-flight commit safety). */
   minAgeMs?: number;
@@ -24,12 +24,54 @@ export interface GcReport {
   deletedBlobs: number;
   /** Why the run deleted nothing, or null when it ran to completion. */
   skipped: string | null;
+  /** The window this run actually applied. Reported so a sweep's log says what it kept by. */
+  retention: GcRetention;
 }
 
 const DAY = 24 * 60 * 60 * 1000;
 /** Generous against a full sweep of this bucket, short enough that a killed run unblocks
  *  commits again long before the next daily trigger. */
 const DEFAULT_LEASE_TTL_MS = 5 * 60 * 1000;
+
+/** How long history may be kept, in days. Ten years is already far past any real intent. */
+const MAX_KEEP_DAYS = 3650;
+/** Snapshots retained by count. Above this the retained union stops fitting a plan anyway. */
+const MAX_KEEP_COUNT = 10_000;
+
+export interface GcRetention {
+  keepDays: number;
+  keepCount: number;
+}
+
+/**
+ * The retention window this deployment was configured with.
+ *
+ * Deliberately has no defaults: retention decides what a sweep deletes, so a missing or
+ * malformed binding is a deployment fault, not a reason to silently apply a number nobody
+ * chose. `scripts/deploy.mjs` validates the same values before upload, so reaching this
+ * error means the Worker was deployed by some other path.
+ */
+export function gcRetention(env: Pick<Env, "GC_KEEP_DAYS" | "GC_KEEP_COUNT">): GcRetention {
+  return {
+    keepDays: retentionValue(env.GC_KEEP_DAYS, "GC_KEEP_DAYS", MAX_KEEP_DAYS),
+    keepCount: retentionValue(env.GC_KEEP_COUNT, "GC_KEEP_COUNT", MAX_KEEP_COUNT),
+  };
+}
+
+function retentionValue(raw: unknown, name: string, max: number): number {
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new Error(`${name} is not configured; redeploy with a retention value`);
+  }
+  // Plain decimal digits only, matching `scripts/worker-config.mjs`. `Number()` alone would
+  // quietly accept "1e3" and "0x10", which is not a spelling anyone intends here.
+  const trimmed = raw.trim();
+  const value = /^\d+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    throw new Error(`${name} must be an integer from 1 to ${max}, not ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
+
 async function collectDead(
   env: Env,
   prefix: string,
@@ -86,8 +128,11 @@ async function collectDead(
 export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
   const gcStartedAt = performance.now();
   const now = opts.now ?? Date.now();
-  const keepCount = opts.keepCount ?? 50;
-  const keepDays = opts.keepDays ?? 30;
+  // Read before anything else touches the vault: an unusable retention setting must stop the
+  // run while it is still a no-op, not after it has planned a deletion against a guessed one.
+  const configured = gcRetention(env);
+  const keepCount = opts.keepCount ?? configured.keepCount;
+  const keepDays = opts.keepDays ?? configured.keepDays;
   const minAgeMs = opts.minAgeMs ?? DAY;
   const ageCutoff = now - keepDays * DAY;
 
@@ -97,6 +142,7 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
     retainedBlobs: 0,
     deletedBlobs: 0,
     skipped: null,
+    retention: { keepDays, keepCount },
   };
 
   const lock = env.VAULT_LOCK.getByName("default");

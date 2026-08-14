@@ -13,8 +13,19 @@ const VALID = `
   },
   "migrations": [{ "tag": "v7", "new_sqlite_classes": ["VaultLock"] }],
   "r2_buckets": [{ "binding": "VAULT", "bucket_name": "sync-bucket" }],
+  "vars": { "GC_KEEP_DAYS": "30", "GC_KEEP_COUNT": "50" },
   "triggers": { "crons": ["0 4 * * *"] }
 }`;
+
+/** The valid config with one `vars` entry replaced, for the retention validation cases. */
+function withVar(name, value) {
+  const vars = { GC_KEEP_DAYS: "30", GC_KEEP_COUNT: "50", [name]: value };
+  if (value === undefined) delete vars[name];
+  return VALID.replace(
+    '"vars": { "GC_KEEP_DAYS": "30", "GC_KEEP_COUNT": "50" }',
+    `"vars": ${JSON.stringify(vars)}`
+  );
+}
 
 test("wrangler JSONC is the single deploy metadata source", () => {
   assert.deepEqual(parseWorkerDeployConfig(VALID), {
@@ -26,6 +37,7 @@ test("wrangler JSONC is the single deploy metadata source", () => {
     durableObjectClass: "VaultLock",
     migrationTag: "v7",
     cron: "0 4 * * *",
+    vars: { GC_KEEP_DAYS: "30", GC_KEEP_COUNT: "50" },
   });
 });
 
@@ -34,6 +46,38 @@ test("missing required deployment metadata fails loudly", () => {
     () => parseWorkerDeployConfig('{ "name": "incomplete" }'),
     /compatibility_date/
   );
+});
+
+test("retention has to be a usable integer before anything is uploaded", () => {
+  // Every one of these would deploy a Worker whose nightly sweep either throws or deletes
+  // history nobody agreed to lose. The deploy path is the last place to catch it cheaply.
+  for (const bad of ["0", "-1", "1.5", "thirty", "", "  ", "1e3"]) {
+    assert.throws(
+      () => parseWorkerDeployConfig(withVar("GC_KEEP_DAYS", bad)),
+      /GC_KEEP_DAYS must be an integer from 1 to 3650|requires vars.GC_KEEP_DAYS/,
+      `expected "${bad}" to be refused`
+    );
+  }
+  assert.throws(() => parseWorkerDeployConfig(withVar("GC_KEEP_DAYS", "3651")), /1 to 3650/);
+  assert.throws(() => parseWorkerDeployConfig(withVar("GC_KEEP_COUNT", "10001")), /1 to 10000/);
+  assert.throws(
+    () => parseWorkerDeployConfig(withVar("GC_KEEP_COUNT", undefined)),
+    /requires vars.GC_KEEP_COUNT/
+  );
+  // A JSON number would give the local test runtime a different type than the deployed
+  // plain_text binding, so it is refused rather than coerced.
+  assert.throws(
+    () => parseWorkerDeployConfig(withVar("GC_KEEP_COUNT", 50)),
+    /requires vars.GC_KEEP_COUNT as a non-empty string/
+  );
+  assert.throws(() => parseWorkerDeployConfig(VALID.replace('"vars"', '"unused"')), /vars\./);
+});
+
+test("valid retention survives the round trip as normalized strings", () => {
+  assert.deepEqual(parseWorkerDeployConfig(withVar("GC_KEEP_DAYS", " 7 ")).vars, {
+    GC_KEEP_DAYS: "7",
+    GC_KEEP_COUNT: "50",
+  });
 });
 
 test("bucket preflight creates only a missing bucket", async () => {

@@ -146,6 +146,29 @@ describe("entryFromResult", () => {
     expect(e.detail).toContain("75%");
     expect(e.detail).toContain("3");
   });
+
+  it("records both heads when the remote's ancestry could not be confirmed", () => {
+    // The pair of ids is the whole diagnostic value: without them, "could not confirm" is a
+    // sentence nobody can act on days later.
+    const e = entryFromResult(
+      {
+        status: "needs-continuity",
+        continuity: {
+          head: "01NEW",
+          lastHead: "01OURS",
+          reason: "truncated",
+          walked: 4,
+          alreadyApplied: 0,
+        },
+        ...base,
+      },
+      1
+    );
+    expect(e.status).toBe("needs-continuity");
+    expect(e.detail).toContain("01NEW");
+    expect(e.detail).toContain("01OURS");
+    expect(e.detail).toContain("truncated");
+  });
 });
 
 describe("entryFromError", () => {
@@ -272,6 +295,34 @@ describe("announcePass", () => {
     expect(
       announcePass({ notifyOnSync: true, onlyChanged: false, interactive: true, result: halted })
     ).toBe(false);
+  });
+
+  it("leaves an unanswered question to its own notice too", () => {
+    // The summary line would read "up to date" directly above a notice saying the pass was
+    // paused and nothing was done. Both cannot be true, and only one of them is.
+    const pending = [
+      {
+        status: "needs-decision",
+        summary: { deletes: [], overwrites: [], localFileCount: 1, percent: 100, threshold: 50 },
+        ...base,
+      },
+      {
+        status: "needs-continuity",
+        continuity: {
+          head: "01NEW",
+          lastHead: "01OURS",
+          reason: "replaced",
+          walked: 1,
+          alreadyApplied: 0,
+        },
+        ...base,
+      },
+    ] as SyncResult[];
+    for (const result of pending) {
+      expect(
+        announcePass({ notifyOnSync: true, onlyChanged: false, interactive: true, result })
+      ).toBe(false);
+    }
   });
 });
 
