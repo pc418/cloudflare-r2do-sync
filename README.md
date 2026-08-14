@@ -1,22 +1,50 @@
 # R2DO Sync
 
-Two-way Obsidian vault sync on **your own** Cloudflare account. Every sync publishes a
-content-addressed snapshot of the whole vault to R2 behind a Worker; the plugin pulls,
-merges, and only then commits. Files are encrypted on the device — the server stores
-ciphertext and an opaque path map, and never sees a filename or a key.
+Two-way Obsidian vault sync on **your own** Cloudflare account — no third-party service, no
+subscription, end-to-end encrypted with a master key that never leaves your devices. The
+free plan is enough for a text vault.
 
-Built for the daily-log case: two devices appending to the same note on the same day merge
-into one note, in date order, instead of fighting over it.
+What makes it different is not the hosting. It is that syncing is built like version
+control, not like a file copier — and that is why it does not lose notes.
 
-- No third-party service, no subscription. Cloudflare's free plan is enough for a text vault.
-- End-to-end encrypted with a master key that never leaves your devices.
-- Conflicts never lose data: unmergeable pairs keep **both** sides side by side.
+## Built like version control
+
+Most sync plugins walk both sides, compare timestamps and sizes, consult a private "what I
+saw last time" database, and guess. Newer wins, so one side is silently discarded.
+Deletions are inferred, not observed. A wrong mtime — which their own docs admit happens —
+reads as a change or hides one. And when two devices upload at once, nothing orders them:
+the results interleave. There is no shared history, so there is nothing to merge against
+and nothing to restore.
+
+R2DO Sync keeps a commit log instead:
+
+- **Every sync publishes a commit** — a complete snapshot of the vault, as an encrypted
+  manifest naming every file by the hash of its content, plus the id of the snapshot it
+  grew from.
+- **One authority orders the commits.** A Durable Object holds the current head and accepts
+  a commit only if its parent is still that head. When two devices publish at once, exactly
+  one wins; the other pulls, merges, and retries. The history is linear by construction —
+  no device can clobber another's work, because the server refuses the commit that would.
+- **Pull → merge → commit, never the other way.** Before a device may publish, it absorbs
+  the current head and three-way merges (diff3) against the snapshot both sides actually
+  share — a real common ancestor, not a heuristic. Two devices appending to the same daily
+  note both keep their lines, in order, and both compute the same result.
+- **Decisions come from content hashes, never clocks.** A bad timestamp cannot fake a
+  change or hide one. Deletions are stated by the snapshot, not inferred from a side
+  database that can go stale.
+- **Content addressing keeps it cheap.** Each unique (encrypted) content is stored once; a
+  commit uploads only what changed. History costs metadata, not copies of your notes.
+- **History is real.** Any snapshot restores — one file or the whole vault — and nightly
+  garbage collection trims old ones on your schedule.
+
+Cloudflare's pieces map onto this exactly: the **Worker** is the API, **R2** stores the
+encrypted blobs and manifests, and the **Durable Object** is the single point where commits
+serialize. All of it runs in your account; the server stores ciphertext and an opaque path
+map, and never sees a filename or a key.
 
 ## What you need
 
-- A Cloudflare account (free plan).
-- Node.js 20+ and Obsidian.
-- 5 minutes.
+- A Cloudflare account (free plan), Node.js 20+, Obsidian, 5 minutes.
 
 ## Setup
 
@@ -27,18 +55,12 @@ node scripts/setup.mjs
 ```
 
 Log in first, if you have not already, with the wrangler this repo pins —
-`./worker/node_modules/.bin/wrangler login` (that is why the install above comes first).
-Setup uses only that copy and never fetches one on the fly, and it never logs you in or out,
-so the account it uses is always one you chose. It prints **which account** it is about
-to deploy to and waits for you to confirm, then creates the R2 bucket, deploys the Worker,
-sets the admin secret, schedules the nightly garbage collection, smoke-tests `/health`, and
-issues your access token. Every step is idempotent, so re-running it after a failure resumes
-instead of duplicating.
-
-It ends by printing the only two values you handle yourself — the ones you type into
-Obsidian. **Every run ends with a fresh access token**, first setup or redeploy alike: the
-server-side admin credential that issues it is managed for you in `.env` (gitignored),
-reused while it still works and rotated when it does not.
+`./worker/node_modules/.bin/wrangler login`. Setup uses only that copy and never logs you
+in or out. It prints **which account** it is about to deploy to and waits for you to
+confirm, then creates the R2 bucket, deploys the Worker, sets the admin secret, schedules
+nightly garbage collection, smoke-tests `/health`, and issues your access token. Every step
+is idempotent — re-running after a failure resumes. Every run ends with a fresh access
+token; the admin credential behind it lives in gitignored `.env`, managed for you.
 
 ```
 ════════════════════════════════════════════════════════════════════
@@ -50,10 +72,9 @@ reused while it still works and rotated when it does not.
   ...
 ```
 
-Then install the plugin and finish in the app. Once the community listing is live you can
-instead install **R2DO Sync** from Settings → Community plugins → Browse and skip to step 1
-below — the Worker above is yours to deploy either way, because there is no service behind
-this plugin other than your own Cloudflare account.
+Then install the plugin (or, once the community listing is live, install **R2DO Sync** from
+Settings → Community plugins — the Worker is yours to deploy either way, because there is
+no service behind this plugin other than your own account):
 
 ```bash
 cd plugin && node build.mjs && cd ..
@@ -61,150 +82,104 @@ node scripts/install-plugin.mjs "/path/to/Your Vault"
 ```
 
 1. Obsidian → Settings → Community plugins → enable **R2DO Sync**.
-2. A device with no credentials opens on a **Set up sync** panel naming the two ways in and
-   what self-hosting puts on you. This is the first device, so use the fields under it: the
-   **Server URL** and **Access token** from the printed block, plus a **Device name** (any
-   label you like — it is what conflict copies are named after). **Test connection**, beside
-   those two fields, checks them against the server before anything syncs. The rest of the
-   settings page appears once both are in — nothing there can act without them.
+2. The **Set up sync** panel takes the printed **Server URL** and **Access token**, plus a
+   **Device name** (conflict copies are named after it). **Test connection** checks them
+   before anything syncs.
 3. R2DO Sync generates a random vault master key before the first upload and opens the
    required backup window. Copy the key into your password manager and press **I saved
-   it**; sync stays disabled until you do. Then press **Sync now**.
+   it** — sync stays disabled until you do. Then press **Sync now**.
 
 The random key is recommended. **Set from passphrase** derives the same 256-bit key on any
-device using PBKDF2-SHA256 (600,000 iterations) and a per-vault public salt, but a weak
-passphrase is vulnerable to offline guessing. Only the derived key is stored; the
-passphrase is discarded.
+device (PBKDF2-SHA256, 600,000 iterations, public per-vault salt), but a weak passphrase is
+open to offline guessing. Only the derived key is stored.
 
 ### Adding another device
 
-On the configured device, open **Set up another device**. It exports the same payload — the
-server URL, the token and the master key — two ways, and nothing is ever typed by hand:
+On the configured device, open **Set up another device**. It exports the server URL, token
+and master key two ways — **Show QR** for a phone (the code is an `obsidian://` link the
+camera app opens directly) and **Copy setup link** for anything else, pasted into the new
+device with **Apply a setup link**. Nothing is typed by hand.
 
-- **Show QR**, for a phone. Scan it with the phone's own camera app; the code encodes an
-  `obsidian://` link, so Obsidian opens directly.
-- **Copy setup link**, for anything that cannot scan a code — a second computer, most
-  obviously. Paste it into the new device with **Apply a setup link**.
+**Set the new device up before its first sync.** Typing the URL and token in manually
+cannot work on an encrypted vault — neither carries the master key, so the device would
+generate its own and be rejected. It halts and offers the paste box instead; that halt is
+the safety net working.
 
-Either button also puts the link itself on screen, selectable, with its own **Copy link**
-button — so you can read it, check it, or copy it again without redrawing the export.
-
-**Set the new device up before its first sync.** Without the master key it cannot read the
-vault, and it will stop rather than guess — that halt is the safety net working.
-
-Typing the server URL and access token into a new device by hand **cannot** work on an
-encrypted vault: neither of them carries the master key, so the device generates one of its
-own and is rejected. The **Set up sync** panel says this before you try and offers **Paste
-setup link** beside the warning; if you type them in anyway, the same offer reappears at the
-top of the settings page once the device is refused — that is the whole fix.
-
-**Apply a setup link → Paste link** on the new device (or the "Apply a setup link (paste)"
-command) takes the whole `obsidian://…` link or just its payload, and refuses anything it
-cannot use instead of half-configuring the device. Use it with a copied link, and also when
-a phone's scanner opens the link in a browser instead of Obsidian — copy it from the address
-bar and paste it here.
-
-A new device that already holds a copy of the vault (or part of one) is fine: identical
-files are recognised by content hash and do nothing, notes that both sides created merge,
-and anything ambiguous keeps both copies. Nothing local is deleted on a first sync.
+A new device that already holds a copy of the vault is fine: identical files match by
+content hash, notes both sides created merge, and anything ambiguous keeps both copies.
+Nothing local is deleted on a first sync.
 
 ### On a phone
 
-**Getting the plugin onto the phone manually** (for example, before the community listing
-appears; phones cannot run the install script): let a computer do it once. Set the vault up
-on a desktop first — plugin installed, synced, working — then copy the whole vault folder
-to the phone: zip it, send it over (AirDrop, USB, any file transfer), and unzip it inside
-Obsidian's folder on the phone, then open it as a vault. The hidden `.obsidian` folder
-travels inside the zip even on iOS, where the Files app refuses to show it — which is also
-why creating the folders by hand only works on Android. The copy carries the plugin, the
-server settings and the keys, so there is nothing to scan or type; just change **Device
-name** in settings afterwards so conflict copies name the right device. (On Android you can
-instead copy the three files from `plugin/dist/` into
-`YourVault/.obsidian/plugins/cloudflare-rdo-sync/` and set it up by QR or link as usual.)
+Before the community listing appears, let a computer do the install once: set the vault up
+on a desktop, then zip the whole vault folder, transfer it, and unzip it inside Obsidian's
+folder on the phone. The hidden `.obsidian` folder travels inside the zip even on iOS. The
+copy carries plugin, settings and keys — just change **Device name** afterwards. (Android
+can instead copy the three `plugin/dist/` files into
+`YourVault/.obsidian/plugins/cloudflare-rdo-sync/` and set up by QR as usual.)
 
-Once it runs: there is no status bar on mobile, so the **ribbon icon** is the sync button —
-tap it to sync, and its tooltip carries the same state the desktop status bar shows. Every
-pass ends in a notice — background ones too, and including "up to date" — so a tap is never
-silently ignored and a quiet plugin is never mistaken for a working one. Three toggles under
-**Notices** shape that: turn notices off entirely, narrow them to passes that changed
-something, or have them name each changed file. The command palette has the same actions
-("Sync now", "Preview sync", "Browse snapshot history").
-
-Two things happen on their own: a device configured by QR or pasted link **starts its first
-sync immediately** (after the one-time "back up this vault first" confirmation), and on
-mobile, **returning to the app counts as startup** — phones
-suspend Obsidian rather than close it, so when the app becomes visible again and the last
-pass is older than your sync interval, a sync runs (obeys **Sync on startup**).
+Once running, the **ribbon icon** is the sync button — its tooltip carries the same state
+the desktop status bar shows. Every pass ends in a notice, background ones and "up to date"
+included, so a tap is never silently ignored; the **Notices** toggles narrow or silence
+them. A device configured by QR or link starts its first sync immediately after the
+one-time backup confirmation, and returning to the app counts as startup — if the last
+pass is older than your sync interval, a sync runs.
 
 ### Deploying without wrangler
 
-For CI, or a machine whose wrangler is signed in to a different account, use the REST path:
-copy `.env.example` to `.env`, fill in `CLOUDFLARE_TOKEN` (scopes: *Workers Scripts:Edit*,
-*Workers R2 Storage:Edit*) and `CLOUDFLARE_ACCOUNT_ID`, then run `node scripts/setup.mjs
---token`. With both credentials present that path is chosen automatically. The two paths
-can be two different accounts, so the script never silently switches between them.
+For CI, or a machine whose wrangler is signed in to a different account: copy
+`.env.example` to `.env`, fill in `CLOUDFLARE_TOKEN` (scopes: *Workers Scripts:Edit*,
+*Workers R2 Storage:Edit*) and `CLOUDFLARE_ACCOUNT_ID`, then `node scripts/setup.mjs
+--token`. With both credentials present this path is chosen automatically; the script never
+silently switches accounts.
 
 ## Security model
 
 - **Encryption happens on the device.** Contents and paths are AES-256-GCM encrypted with
-  keys derived from one 256-bit master key (HKDF). The server sees blob hashes and an
-  encrypted path map.
-- **The master key never leaves your devices.** It is not in `.env`, not on the server, not
-  recoverable by anyone including you. Lose every device that has it and the backup is
-  unreadable — keep the key (Settings → copy master key) somewhere safe.
-- A passphrase-derived key uses a public per-vault salt. The salt is shared through setup
-  links and the settings document; it is not secret. A conflicting salt is rejected rather
-  than silently deriving a different key.
-- Blob names are `sha256(ciphertext)`, so the server can still verify integrity without
-  being able to read anything.
-- Plugin settings (`<config folder>/plugins/cloudflare-rdo-sync/**`) and `workspace*.json` are
-  never synced: `data.json` holds this device's access token and master key in plaintext.
-  The old `plugins/obsidian-log-sync/**` credential directory is also
-  permanently skipped so a leftover legacy `data.json` can never enter a snapshot. The config
-  folder is whatever your vault uses — if you renamed it under *Settings → About → Override
-  config folder*, both that folder and `.obsidian` are skipped, since a rename leaves the
-  old copy on disk.
+  keys derived (HKDF) from one 256-bit master key. The server sees blob hashes and an
+  encrypted path map. Blob names are `sha256(ciphertext)`, so it can verify integrity
+  without reading anything.
+- **The master key never leaves your devices** — not in `.env`, not on the server, not
+  recoverable by anyone including you. Keep a copy (Settings → copy master key) somewhere
+  safe.
+- A passphrase-derived key uses a public per-vault salt, shared through setup links; a
+  conflicting salt is rejected rather than silently deriving a different key.
+- Plugin settings (`<config folder>/plugins/cloudflare-rdo-sync/**`, the legacy
+  `plugins/obsidian-log-sync/**`) and `workspace*.json` are never synced — `data.json`
+  holds this device's token and master key in plaintext. A renamed config folder is skipped
+  along with `.obsidian`, since the rename leaves the old copy on disk.
 - **Installed plugins, themes and CSS snippets are never synced**, even with config-folder
-  sync switched on. Obsidian executes those, so syncing them would mean anyone who can write
-  to your vault can run code on all your devices — and `plugins/<id>/data.json` is where your
-  *other* plugins keep their credentials. Obsidian's own settings files still sync.
-- **What the server can still tell about an encrypted vault:** how many files a snapshot has
-  and roughly how big they are, when you sync, your device names, and that two paths hold
-  identical content (that is what makes deduplication work). Not the contents, and not the
-  paths.
-- **Other software on your device is trusted.** The master key and access token sit in the
-  plugin's `data.json` in plaintext, because the plugin needs them to decrypt anything. Any
-  other Obsidian plugin can read them. "Encrypted" here means the *server* cannot read your
-  notes — it is not a sandbox against what runs on your own machine.
-- **Setup links and QR codes contain the key**, base64-encoded, not encrypted. Treat one like
-  the key itself, and remember the clipboard is not private storage (macOS Universal Clipboard
-  forwards it over iCloud).
+  sync on: Obsidian executes those, so syncing them would let anyone who can write to your
+  vault run code on all your devices — and `plugins/<id>/data.json` is where your *other*
+  plugins keep credentials. Obsidian's own settings files still sync.
+- **What the server can still tell:** file count, rough sizes, sync times, device names,
+  and that two paths hold identical content (that is what deduplication is). Not contents,
+  not paths.
+- **Other software on your device is trusted.** The key and token sit in the plugin's
+  `data.json` in plaintext because the plugin needs them; any other plugin can read them.
+  "Encrypted" means the *server* cannot read your notes, not a sandbox on your own machine.
+- **Setup links and QR codes contain the key**, base64-encoded. Treat one like the key
+  itself, and remember the clipboard is not private storage.
 - **Snapshot history is not a backup.** It protects against your own mistakes, not against
-  losing the account, the bucket, or the key — all of which take every snapshot at once. Keep
-  an independent export and test it occasionally: `scripts/restore.mjs` decrypts a snapshot to
-  a plain directory and re-implements the crypto on purpose, so restoring does not depend on
-  the plugin still working.
-- **Your data stays your responsibility.** Nothing here is a service: there is no operator
-  and no support channel that can read your notes back to you or restore them on your
-  behalf. Your own backups and your own master key are part of running this, and the plugin
-  is provided as-is under the PolyForm Small Business 1.0.0 license, without warranty. The
-  first-run panel and the first-sync prompt both say so, and the prompt has to be answered
-  before anything uploads.
+  losing the account, bucket, or key — those take every snapshot at once. Keep an
+  independent export: `scripts/restore.mjs` decrypts a snapshot without the plugin.
+- **Your data stays your responsibility.** There is no operator who can read your notes
+  back or restore them for you. The plugin is provided as-is under the PolyForm Small
+  Business 1.0.0 license, without warranty; the first-run panel and first-sync prompt both
+  say so.
 
 ## Tokens
 
-There are no device accounts to manage — just two credentials, deliberately separate:
+Two credentials, deliberately separate — there are no device accounts:
 
 | | what it does | where it lives |
 |---|---|---|
 | **Access token** | read/write the vault | every device, in plugin settings and QR codes |
-| **Admin token** | issue and revoke access tokens; cannot read the vault | `.env`, managed by the scripts — you never handle it |
+| **Admin token** | issue and revoke access tokens; cannot read the vault | `.env`, managed by the scripts |
 
-One access token shared by all devices is the normal setup — that is what the QR does. The
-split is what makes recovery cheap: if a device is lost or the token leaks, one command
-revokes it. No redeploy, and nothing for you to keep in a password manager — if `.env` is
-ever lost or stale, re-running `node scripts/setup.mjs` rotates the admin credential and
-carries on (existing access tokens are unaffected by that rotation).
+One access token shared by all devices is the normal setup. The split makes recovery cheap:
+a lost device or leaked token is one revocation, no redeploy. If `.env` is lost, re-running
+setup rotates the admin credential without touching access tokens.
 
 ```bash
 node scripts/access-token.mjs                  # issue it — replaces the existing one
@@ -212,16 +187,16 @@ node scripts/access-token.mjs --list           # active tokens (no token materia
 node scripts/access-token.mjs --rotate         # fresh token, revokes ALL others
 node scripts/access-token.mjs --name phone     # an extra token, revocable on its own
 node scripts/access-token.mjs --revoke <id>
-node scripts/access-token.mjs --out token.json # write it to a 0600 file instead of the screen
+node scripts/access-token.mjs --out token.json # 0600 file instead of the screen
 ```
 
-A token is printed only to a terminal. Piped into a file or a CI log it refuses instead, since
-that is a vault-wide credential landing somewhere nobody chose — pass `--out` for a `0600`
-file, or `--print-token` if stdout really is where you want it.
+A token prints only to a terminal; piped into a file or CI log it refuses (use `--out` or
+`--print-token`). Replacing a token kills the old one immediately — devices holding it stop
+syncing until they get the new one, which is the point of re-issuing.
 
-An access token can be issued with less than full authority. Rebuilding remote history is the
-only action that makes remote content stop existing, so it is a separate power a token can be
-issued without, and a token can be given an expiry date:
+A token can also be issued with less than full authority — without the `reroot` scope
+(rebuilding remote history is the only action that makes remote content stop existing) or
+with an expiry:
 
 ```bash
 curl -X POST "$WORKER_URL/api/tokens" -H "authorization: Bearer $ADMIN_TOKEN" \
@@ -229,128 +204,66 @@ curl -X POST "$WORKER_URL/api/tokens" -H "authorization: Bearer $ADMIN_TOKEN" \
   -d '{"name":"phone","scopes":["sync"],"expiresAt":"2027-01-01T00:00:00Z"}'
 ```
 
-Tokens issued without either field keep full authority and no expiry, so nothing that already
-works changes.
-
-Running the issue command twice replaces the token rather than leaving two live ones, so
-there is no state to clean up if you lose track. Either way the old token dies immediately:
-devices still holding it stop syncing until you paste the new one (or scan a fresh QR).
-That is the point of re-issuing — you do it because the old token is no longer trusted.
-
-These commands read `ADMIN_TOKEN` from `.env`, where setup put it; nothing is typed and
-nothing appears in shell history. (Prefer keeping it out of `.env`? Delete the line — the
-commands then ask for it with hidden input.)
-
 ## How syncing behaves
 
-- **Snapshots, not diffs.** Each commit is a whole-vault manifest with a parent; the Worker
-  accepts it only if the parent is still the head (compare-and-set in a Durable Object).
-- **Pull → merge → commit, never the other way round.** Notes merge line by line (diff3).
-  Two devices appending to the same note at the same point keep both additions, ordered by
-  text — for dated log lines that is date order, and both devices compute the same result.
+- **Merges are line by line** (diff3). Two devices appending to the same note at the same
+  point keep both additions, ordered by text — for dated log lines that is date order.
 - **Conflicts keep both sides, then let you choose.** The remote copy lands beside yours as
-  `note.conflict-<device>-<yymmdd-HHmm>.md`; nothing is overwritten in place. Every conflict is
-  announced — a window when you started the sync, a notice otherwise — and that window shows
-  the **line-by-line difference** between the two versions with four choices per file: keep
-  this device's, keep the other device's, keep both as separate files, or **combine them into
-  one file** with the disagreements marked for you to edit. The newer edit is labelled
-  `LATEST` and its button is the default. Nothing is decided for you and nothing is decided
-  during a background sync: the copy is parked first, so the choice waits as long as you like.
-  **Review and resolve conflicts** (command palette, or **Conflicts → Unresolved conflicts**)
-  reopens the latest batch any time.
-- **Combining is the only thing that writes markers into a note**, and only for the file you
-  asked. Lines the two versions agree on appear once; each disagreement is wrapped in
-  `<<<<<<< this device` / `=======` / `>>>>>>> other device`, with `(newer)` on whichever side
-  was edited last. Ordinary sync never writes a marker.
-- **Optional: let conflicts overwrite.** **Conflict handling** (under Conflicts) can switch
-  from "Keep both" to *newest wins* or *largest wins*: every device picks the same winner
-  and the loser is discarded instead of parked. Changing it asks for a second
-  confirmation, because a losing local edit that was never synced is gone for good — the
-  remote side always remains in snapshot history.
+  `note.conflict-<device>-<yymmdd-HHmm>.md`; nothing is overwritten in place. A window (on a
+  sync you started; a notice otherwise) shows the line-by-line difference with four choices:
+  keep this device's, keep the other's, keep both files, or **combine into one** with the
+  disagreements marked (`<<<<<<< this device` / `>>>>>>> other device`, `(newer)` labelled)
+  for you to edit — the only case where markers are ever written. Background syncs park the
+  copy and wait; **Review and resolve conflicts** reopens the latest batch any time.
+- **Optional: let conflicts overwrite.** *Newest wins* or *largest wins* picks the same
+  winner on every device and discards the loser (the remote side stays in snapshot
+  history). Enabling either asks for a second confirmation.
 - **Edits beat deletes** in both directions — a deletion is easy to redo, an edit is not.
-- **A keystroke can start a sync.** R2DO Sync claims no key of its own — plugins that do
-  collide with yours — so **Sync hotkey** (under **How and when it syncs**, desktop only) shows what
-  "Sync now" is bound to and offers `⇧⌘S` (`Ctrl+Shift+S` off macOS) in one click, but only
-  when nothing else uses it. Otherwise **Choose** opens Obsidian's Hotkeys page filtered to
-  this plugin, where every R2DO Sync action — preview, history, conflict review — can take a
-  key too.
-- **Every pass says what it moved.** "3 files, +35 lines" going out, "1 file, -7 lines"
-  coming in — a net line count, so five lines replaced by five others reads as 0 and the file
-  count is what shows the work. Binary files have no count. Turning on **List the changed
-  files in the notice** names them individually with the snapshot id.
-- **A file you edit mid-sync does not fail the sync.** The pass notices the file no longer
-  matches what it was about to publish, rescans, and publishes what you actually have. Only a
-  file changing continuously across several rescans gives up, and then nothing is published.
+- **Every pass says what it moved** — "3 files, +35 lines" out, "1 file, -7 lines" in; an
+  optional toggle names each file with the snapshot id.
+- **A file you edit mid-sync does not fail the sync.** The pass notices, rescans, and
+  publishes what you actually have; only a file changing continuously across several
+  rescans gives up, publishing nothing.
 - **Mass-change guard.** A pull that would delete more than half of this device's files
-  (**Ask before large changes (%)** in settings) stops and asks: apply remote, keep local,
-  or decide later. Unattended syncs never decide for you; they park and wait.
-- **First sync asks once.** Before a device's very first pass, R2DO Sync says plainly that
-  the pass reconciles two collections of real files and asks you to confirm you have a copy
-  of the vault. Answered once per device; until it is answered the status reads
-  `CONFIRM FIRST SYNC` rather than pretending to be up to date.
-- **History and restore** are in the plugin: **Preview sync** shows what a sync would
-  change without changing anything, **Snapshot history** browses past snapshots and
-  restores a file or the whole vault, and **Sync log** exports recent passes to a note.
-- **Forcing a direction, when one side is simply wrong.** Two actions under **Safety and
-  recovery** skip the
-  merge. **Pull remote over local** makes this vault match the current remote snapshot;
-  changes this device never published are kept as `.conflict-…` copies, so nothing you
-  authored is destroyed. **Push local over remote** publishes this device's files as the new
-  snapshot without merging what other devices added, and never touches local files. Both
-  first show the file counts and names they will touch, then require a typed confirmation
-  (`PULL REMOTE` / `PUSH LOCAL`). The snapshot being replaced stays in **Snapshot history**.
-- **Selective and one-way policies.** **Only sync matching paths** is an optional allow-list
-  of globs. **Pull-only** applies remote changes but never commits; **Push-only (backup)**
-  never writes local files, and preserves a racing remote edit as a conflict entry in the
-  new snapshot. Paths outside the allow-list remain carried remotely rather than deleted.
-- Your config folder (`.obsidian/**` unless you renamed it) is local by default. **Sync
-  Obsidian configuration directory** requires a
-  typed `SYNC CONFIG` confirmation; even then R2DO Sync's current and legacy credential
-  folders plus every `workspace*.json` remain hard-skipped. Explicit excludes still win.
-- Changing the encryption mode or key is a separate `REKEY` operation. It authenticates
-  and transforms the complete remote snapshot in one compare-and-set commit; ordinary
-  sync halts on a key/mode mismatch instead of mixing ciphertext and plaintext.
+  (threshold in settings) stops and asks: apply remote, keep local, or decide later.
+  Unattended syncs never decide for you.
+- **First sync asks once** per device to confirm you have a copy of the vault; until
+  answered the status reads `CONFIRM FIRST SYNC` rather than pretending to be up to date.
+- **Preview, history, log.** **Preview sync** shows what a pass would change without
+  changing anything; **Snapshot history** browses and restores past snapshots; **Sync log**
+  exports recent passes to a note. **Sync hotkey** in settings binds "Sync now" (`⇧⌘S`
+  offered when free).
+- **Forcing a direction**, when one side is simply wrong: **Pull remote over local** makes
+  this vault match the remote head, keeping unpublished local changes as `.conflict-…`
+  copies; **Push local over remote** publishes this device's files without merging. Both
+  preview what they will touch and require a typed confirmation, and the replaced snapshot
+  stays in history.
+- **Selective and one-way policies.** An optional allow-list of globs; **Pull-only**
+  applies remote changes but never commits; **Push-only (backup)** never writes local
+  files. Paths outside the allow-list are carried remotely, not deleted.
+- Your config folder is local by default; syncing it requires a typed `SYNC CONFIG`
+  confirmation, and the credential folders and `workspace*.json` stay hard-skipped even then.
+- Changing the encryption mode or key is a separate `REKEY` operation that transforms the
+  complete remote snapshot in one commit; ordinary sync halts on a key/mode mismatch
+  instead of mixing ciphertext and plaintext.
 
 ### Tuning
 
-The defaults suit a typical vault. Each knob sits in the section for the part of the plugin
-it tunes, and each states what it trades:
-
-| Setting | Default | What it costs |
+| Setting | Default | Trade |
 |---|---|---|
-| **Parallel lanes** (How and when it syncs) | 4 | Files read, encrypted, uploaded and downloaded at once. Higher finishes a large vault sooner but uses more memory and can overwhelm a phone or a slow link; 1 is the old one-at-a-time behaviour. |
-| **Sync log length** (Troubleshooting) | 50 | Passes kept for troubleshooting. They live in the plugin's data file. |
-| **Report folder** (Troubleshooting) | vault root | Where **Export** writes its note. Created if missing; it syncs like any other note unless excluded. |
-| **Snapshots listed in history** (Safety and recovery) | 40 | How far back the history browser walks. Each one is a request. |
-| **Automatic retries** (How and when it syncs) | 3 | Retries after a failed pass (1s, 4s, 15s, 1m, 5m). A *halted* sync is never retried — it needs a person. |
-| **Sync settings between devices** (This device) | on | Shares the vault-wide settings above through the server, encrypted like your notes. The most recent change on any device wins. |
+| **Parallel lanes** | 4 | Files processed at once; higher is faster but heavier on a phone or slow link |
+| **Sync log length** | 50 | Passes kept for troubleshooting |
+| **Snapshots listed in history** | 40 | Each one is a request |
+| **Automatic retries** | 3 | Backoff after a failed pass; a *halted* sync is never retried — it needs a person |
+| **Sync settings between devices** | on | Shares vault-wide settings through the server, encrypted like notes; most recent change wins |
 
-The three toggles in **Notices** decide what a pass says: **Notice when a sync runs** (on —
-"syncing…" while a sync you started is working, then a summary of files moved each way and
-the net line change; on a phone it is the only confirmation you get), **Only notice syncs
-that changed something** (off — a sync you start yourself still always answers), and **List
-the changed files in the notice** (off — each file by name with its line change and the
-snapshot id).
-
-Numbers are stored when you leave the field or press Enter, not while you type: a value the
-setting cannot use is refused out loud and the field goes back to what is stored, rather than
-saving each digit on the way to the one you meant. Both glob fields show how many of the
-files Obsidian has indexed the current lists keep, updated as you type.
-
-Vault-wide settings — excludes, the safety threshold, debounce and sync intervals, the
-allow-list, sync direction, log/history/retry knobs, the report folder, notices, and the
-public vault salt — sync between devices: change one anywhere and every device picks it up
-before its next pass. Config-directory opt-in deliberately stays per-device because each
-device must confirm that its own plugin settings may contain secrets. Credentials and these
-other settings also stay per-device:
-credentials (a device needs them *before* it can sync, and they are the same for every
-device anyway), **Device name** (its whole point is to differ), and **Parallel lanes** (a
-desktop on fibre and a phone on mobile data want different values).
+Vault-wide settings (excludes, thresholds, intervals, direction, notices, the public salt…)
+sync between devices. Credentials, **Device name**, **Parallel lanes**, and config-folder
+consent deliberately stay per-device.
 
 ## Restore outside Obsidian
 
-`scripts/restore.mjs` decrypts any snapshot to a directory using the master key, with no
-Obsidian and no plugin involved:
+`scripts/restore.mjs` decrypts any snapshot to a plain directory — no Obsidian, no plugin:
 
 ```bash
 node scripts/restore.mjs --out ./restored              # current head
@@ -359,12 +272,9 @@ node scripts/restore.mjs --out ./restored --passphrase --salt <public-vault-salt
 ```
 
 It prompts for the access token and master key (or reads `ACCESS_TOKEN` / `MASTER_KEY`), so
-neither lands in your shell history. Passphrase mode reads `VAULT_PASSPHRASE` or prompts
-without echo; its non-secret salt can come from `--salt` or `VAULT_SALT`. Never put the
-passphrase itself after `--passphrase`.
-
-It re-implements the crypto independently of the plugin on purpose, and a test keeps the
-two byte-compatible — so a bug in the plugin cannot make your backups unreadable.
+neither lands in shell history. It re-implements the crypto independently on purpose, and a
+test keeps the two byte-compatible — a bug in the plugin cannot make your backups
+unreadable.
 
 ## Limits
 
@@ -372,7 +282,7 @@ two byte-compatible — so a bug in the plugin cannot make your backups unreadab
 - 100,000 files per snapshot.
 - Merge granularity is a line; two edits inside one line conflict.
 - Nightly garbage collection (04:00 UTC) keeps the last 50 snapshots **or** 30 days of
-  them, whichever reaches further back, plus every blob those snapshots reference.
+  them, whichever reaches further back, plus every blob they reference.
 - One vault per deployment.
 
 ## Development
@@ -399,10 +309,12 @@ A release is cut by pushing a tag equal to the `manifest.json` version:
 ## License
 
 [PolyForm Small Business 1.0.0](https://polyformproject.org/licenses/small-business/1.0.0) —
-see [LICENSE](LICENSE). The source is public and you may read, run, modify and redistribute
-it; use *for the benefit of a company* is permitted only for small businesses, as the license
-defines them (fewer than 100 people, under 1,000,000 USD prior-year revenue). Personal use is
-unrestricted. This is a source-available license, not an OSI open-source one.
+see [LICENSE](LICENSE). Personal use is unrestricted; use *for the benefit of a company* is
+permitted only for small businesses as the license defines them. Source-available, not OSI
+open source. Releases up to and including 0.2.1 were published under MIT and stay MIT; the
+PolyForm terms apply from 0.3.0 onward.
 
-Releases up to and including 0.2.1 were published under the MIT license and stay MIT — that
-grant cannot be withdrawn. The PolyForm terms apply from 0.3.0 onward.
+## Support
+
+If this plugin replaced a sync subscription for you, you can keep a fraction of the
+difference flowing: [ko-fi.com/pc418](https://ko-fi.com/pc418) ☕
