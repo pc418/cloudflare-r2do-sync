@@ -326,6 +326,6 @@ open source.
 
 ## Support
 
-Your privacy, now verified. How much does it worth?
+Your privacy, now verifiable. How much does it worth?
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/F1F11WRQDT)
