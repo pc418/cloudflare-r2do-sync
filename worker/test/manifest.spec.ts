@@ -79,6 +79,21 @@ describe("validateManifest", () => {
     expect(validateManifest({ ...base, surprise: true }).ok).toBe(false);
   });
 
+  it("accepts an optional line count, and still rejects a nonsense one", () => {
+    const withCount = makeManifest({ files: { "a.md": { h: HASH } } }) as {
+      files: Record<string, Record<string, unknown>>;
+    };
+    withCount.files["a.md"].lines = 42;
+    expect(validateManifest(withCount).ok).toBe(true);
+
+    // The count is shown to a user as fact, so a broken one is a broken commit, not a
+    // field to shrug at.
+    for (const bad of [-1, 1.5, "12", null]) {
+      withCount.files["a.md"].lines = bad;
+      expect(validateManifest(withCount).ok, `lines: ${JSON.stringify(bad)}`).toBe(false);
+    }
+  });
+
   it("rejects manifests containing an invalid path", () => {
     const m = makeManifest({ files: { "../evil.md": { h: HASH } } });
     const r = validateManifest(m);

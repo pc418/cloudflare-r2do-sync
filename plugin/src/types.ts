@@ -7,6 +7,17 @@ export interface FileEntry {
   mtime: number;
   /** sha256 of the ciphertext — the R2 blob key. Present iff the vault is encrypted. */
   c?: string;
+  /**
+   * Lines the file's text held when this snapshot was committed. Absent for binary content,
+   * and for every snapshot written before this field existed.
+   *
+   * Recorded in the snapshot — not only in the device-local cache `lines.ts` keeps — so the
+   * history browser can say what a snapshot changed without downloading both versions of
+   * every file. In an encrypted vault it lives inside the encrypted path map, so the server
+   * never sees it. The figure is per-file and absolute; a *delta* built from two snapshots is
+   * net, with the caveat `lines.ts` spells out: replacing five lines with five others is zero.
+   */
+  lines?: number;
 }
 
 /** The R2 key a file's bytes are stored under, encrypted or not. */
@@ -69,7 +80,11 @@ function isFileEntry(value: unknown): value is FileEntry {
     Number.isFinite(e.size) &&
     typeof e.mtime === "number" &&
     Number.isFinite(e.mtime) &&
-    (e.c === undefined || (typeof e.c === "string" && HASH_RE.test(e.c)))
+    (e.c === undefined || (typeof e.c === "string" && HASH_RE.test(e.c))) &&
+    // Optional, because every snapshot older than the field lacks it and stays valid. A
+    // present-but-nonsense count is still rejected: it is reported to the user as fact.
+    (e.lines === undefined ||
+      (typeof e.lines === "number" && Number.isInteger(e.lines) && e.lines >= 0))
   );
 }
 

@@ -32,6 +32,12 @@ export const fileEntrySchema = z
     h: z.string().regex(HASH_RE, "h must be a lowercase sha256 hex digest"),
     size: z.number().int().nonnegative(),
     mtime: z.number().int().nonnegative(),
+    // Lines of text the file held, so the client's history browser can diff two snapshots
+    // without downloading both versions. Optional: every snapshot older than the field lacks
+    // it. Only a plaintext vault sends it here at all — an encrypted one keeps it inside
+    // `enc`, where the server never sees it, and a plaintext vault has already disclosed
+    // every path and content hash, so a line count discloses nothing further.
+    lines: z.number().int().nonnegative().optional(),
   })
   .strict();
 

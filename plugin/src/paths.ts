@@ -144,6 +144,36 @@ export function pathError(path: string): string | null {
   return null;
 }
 
+/**
+ * Splits a vault path into everything before the extension and the extension itself.
+ *
+ * A dot that opens the basename belongs to the name — `.gitignore` is not an extension — so a
+ * suffix added by the helpers below lands before `.md` but after `.gitignore`.
+ */
+function splitExtension(path: string): [string, string] {
+  const slash = path.lastIndexOf("/");
+  const dot = path.lastIndexOf(".");
+  if (dot <= slash + 1) return [path, ""];
+  return [path.slice(0, dot), path.slice(dot)];
+}
+
+/**
+ * Where a restored copy goes when the live file must not be touched: beside the original,
+ * tagged with the date of the snapshot it came from, so restoring the same note from two
+ * different snapshots produces two distinguishable files rather than one overwriting the other.
+ */
+export function restoreCopyPath(path: string, createdAt: string): string {
+  const [stem, ext] = splitExtension(path);
+  const date = /^\d{4}-\d{2}-\d{2}/.exec(createdAt)?.[0];
+  return `${stem} (restored ${date ?? "unknown date"})${ext}`;
+}
+
+/** `Note.md` → `Note (2).md`. Used to step past an occupied restore destination. */
+export function numberedPath(path: string, n: number): string {
+  const [stem, ext] = splitExtension(path);
+  return `${stem} (${n})${ext}`;
+}
+
 /** Glob support limited to what vault excludes need: `**`, `*`, `?`. */
 export function globToRegExp(glob: string): RegExp {
   let out = "";

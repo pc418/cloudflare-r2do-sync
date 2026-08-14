@@ -103,7 +103,19 @@ export class FakeServer implements SyncApiLike {
     return this.head;
   }
 
+  /** Every manifest asked for, so a test can assert what a walk cost as well as what it found. */
+  readonly manifestFetches: string[] = [];
+
+  /**
+   * Per-id failures, so a test can distinguish "that snapshot is gone" from "this request
+   * failed". Code that walks history must not collapse the two.
+   */
+  readonly failManifest = new Map<string, Error>();
+
   async getManifest(id: string): Promise<Manifest> {
+    this.manifestFetches.push(id);
+    const failure = this.failManifest.get(id);
+    if (failure) throw failure;
     const m = this.manifests.get(id);
     // The Worker answers a collected snapshot with a 404, and the difference matters: code
     // that walks history has to tell "that snapshot is gone" apart from "the request failed".
@@ -130,10 +142,18 @@ export class FakeServer implements SyncApiLike {
     this.blobs.set(hash, bytes.slice());
   }
 
+  /**
+   * Runs while a download is notionally in flight, so a test can change the vault underneath a
+   * caller that already decided where the bytes were going. That window is real: a restore
+   * picks its destination, then waits on the network.
+   */
+  beforeGetBlob: ((hash: string) => void) | null = null;
+
   async getBlob(hash: string): Promise<Uint8Array> {
     const bytes = this.blobs.get(hash);
     if (!bytes) throw new Error(`unknown blob ${hash}`);
     this.downloads.push(hash);
+    this.beforeGetBlob?.(hash);
     return bytes;
   }
 

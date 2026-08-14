@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { SyncEngine } from "../src/sync";
 import { FakeServer, FakeStore, FakeVault } from "./fakes";
+import { ApiError } from "../src/api";
 import { VaultCrypto } from "../src/crypto";
 
 let vault: FakeVault;
@@ -109,6 +110,249 @@ describe("SyncEngine.listHistory", () => {
   });
 });
 
+describe("SyncEngine.listHistory with changes", () => {
+  /** `a.md` grows by two lines, `b.md` arrives, `c.md` goes. */
+  async function edits(engine: SyncEngine): Promise<string[]> {
+    const heads: string[] = [];
+    vault.set("a.md", ["one", "two"].join("\n"));
+    vault.set("c.md", "doomed");
+    await engine.sync();
+    heads.push(server.head!);
+
+    vault.set("a.md", ["one", "two", "three", "four"].join("\n"), 1_754_000_100_000);
+    vault.set("b.md", "bee", 1_754_000_200_000);
+    vault.delete("c.md");
+    await engine.sync();
+    heads.push(server.head!);
+    return heads;
+  }
+
+  it("says what each snapshot added, removed and modified", async () => {
+    const engine = makeEngine();
+    const heads = await edits(engine);
+
+    const history = await engine.listHistory(10, { changes: true });
+
+    const changes = history[0].changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
+    expect(history[0].id).toBe(heads[1]);
+    expect(changes.added).toBe(1);
+    expect(changes.removed).toBe(1);
+    expect(changes.modified).toBe(1);
+    expect(changes.files.map((f) => [f.path, f.kind])).toEqual([
+      // Most recently edited first: b.md (200000) then a.md (100000) then the removed c.md.
+      ["b.md", "added"],
+      ["a.md", "modified"],
+      ["c.md", "removed"],
+    ]);
+  });
+
+  it("splits the line counts by sign instead of letting files cancel out", async () => {
+    const engine = makeEngine();
+    await edits(engine);
+
+    const changes = (await engine.listHistory(10, { changes: true }))[0].changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
+
+    // a.md +2, b.md +1 arriving, c.md -1 leaving.
+    expect(changes.linesAdded).toBe(3);
+    expect(changes.linesRemoved).toBe(1);
+    expect(changes.linesUnknown).toBe(0);
+    expect(changes.files.find((f) => f.path === "a.md")?.lines).toBe(2);
+    expect(changes.files.find((f) => f.path === "c.md")?.lines).toBe(-1);
+  });
+
+  it("counts a binary file as unattributable rather than as zero lines", async () => {
+    const engine = makeEngine();
+    vault.set("a.md", "text");
+    await engine.sync();
+    vault.set("shot.png", new Uint8Array([0x89, 0x00, 0x01]), 1_754_000_100_000);
+    await engine.sync();
+
+    const changes = (await engine.listHistory(10, { changes: true }))[0].changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
+    expect(changes.added).toBe(1);
+    expect(changes.linesUnknown).toBe(1);
+    expect(changes.linesAdded).toBe(0);
+    expect(changes.files[0].lines).toBeNull();
+    // Bytes still work, which is what makes the figure useful for pre-`lines` history.
+    expect(changes.bytes).toBe(3);
+  });
+
+  it("calls a modified file unattributable when one side has no count", async () => {
+    const engine = makeEngine();
+    // A snapshot from before `lines` existed: seven lines, no recorded count.
+    const legacy = await server.seedRemoteCommit({
+      "old.md": ["1", "2", "3", "4", "5", "6", "7"].join("\n"),
+    });
+    const manifest = server.manifests.get(legacy)!;
+    if (manifest.v !== 1) throw new Error("expected plaintext manifest");
+    expect(manifest.files["old.md"].lines).toBeUndefined();
+    await engine.sync();
+    vault.set("old.md", ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"].join("\n"), 1_754_000_100_000);
+    await engine.sync();
+
+    const changes = (await engine.listHistory(10, { changes: true }))[0].changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
+    const change = changes.files.find((f) => f.path === "old.md")!;
+    // Reporting +10 here would be a fabricated figure: the true delta is +3, and this device
+    // has no way to know that. Unknown is the only honest answer.
+    expect(change.kind).toBe("modified");
+    expect(change.lines).toBeNull();
+    expect(changes.linesUnknown).toBe(1);
+    expect(changes.linesAdded).toBe(0);
+  });
+
+  it("calls a text file turned binary, and the reverse, unattributable", async () => {
+    const engine = makeEngine();
+    vault.set("a.md", ["1", "2", "3", "4"].join("\n"));
+    vault.set("b.md", new Uint8Array([0x00, 0x01, 0x02]));
+    await engine.sync();
+    // a.md becomes binary; b.md becomes text. Neither delta can be attributed.
+    vault.set("a.md", new Uint8Array([0x00, 0xff]), 1_754_000_100_000);
+    vault.set("b.md", ["x", "y"].join("\n"), 1_754_000_100_000);
+    await engine.sync();
+
+    const changes = (await engine.listHistory(10, { changes: true }))[0].changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
+    expect(changes.files.map((f) => f.lines)).toEqual([null, null]);
+    expect(changes.linesUnknown).toBe(2);
+    expect(changes.linesAdded).toBe(0);
+    expect(changes.linesRemoved).toBe(0);
+  });
+
+  it("counts a modification when both sides carry a count", async () => {
+    const engine = makeEngine();
+    vault.set("a.md", ["1", "2", "3"].join("\n"));
+    await engine.sync();
+    vault.set("a.md", ["1", "2", "3", "4", "5"].join("\n"), 1_754_000_100_000);
+    await engine.sync();
+
+    const changes = (await engine.listHistory(10, { changes: true }))[0].changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
+    expect(changes.files[0].lines).toBe(2);
+    expect(changes.linesUnknown).toBe(0);
+  });
+
+  it("treats the vault's first snapshot as all additions, not as unknown", async () => {
+    const engine = makeEngine();
+    const heads = await edits(engine);
+
+    const history = await engine.listHistory(10, { changes: true });
+    const oldest = history[history.length - 1];
+
+    expect(oldest.id).toBe(heads[0]);
+    const changes = oldest.changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
+    expect(changes.initial).toBe(true);
+    expect(changes.added).toBe(2);
+    expect(changes.removed).toBe(0);
+  });
+
+  it("diffs the oldest listed snapshot by reading one manifest past the limit", async () => {
+    const engine = makeEngine();
+    await edits(engine);
+
+    const history = await engine.listHistory(1, { changes: true });
+
+    expect(history).toHaveLength(1);
+    const changes = history[0].changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
+    expect(changes.initial).toBe(false);
+    expect(changes.modified).toBe(1);
+  });
+
+  it("costs no extra fetch when diffs were not asked for", async () => {
+    const engine = makeEngine();
+    await edits(engine);
+    const before = server.manifestFetches.length;
+
+    await engine.listHistory(1);
+
+    expect(server.manifestFetches.length - before).toBe(1);
+    expect((await engine.listHistory(1))[0].changes).toBeUndefined();
+  });
+
+  it("says the parent is missing rather than reporting an empty diff", async () => {
+    const engine = makeEngine();
+    const heads = await edits(engine);
+    server.manifests.delete(heads[0]);
+
+    const history = await engine.listHistory(10, { changes: true });
+
+    expect(history.map((h) => h.id)).toEqual([heads[1]]);
+    expect(history[0].changes).toEqual({ unknown: "parent-missing" });
+  });
+
+  it("propagates a server failure instead of calling it retention", async () => {
+    const engine = makeEngine();
+    const heads = await edits(engine);
+    // A 503 says nothing about whether the vault still holds that snapshot. Reporting it as
+    // "no longer retained" turns an actionable error into a false fact about the user's history.
+    server.failManifest.set(heads[0], new ApiError("upstream is busy", 503, "server_error"));
+
+    await expect(engine.listHistory(10, { changes: true })).rejects.toThrow(/busy/);
+  });
+
+  it("propagates a failure on the extra parent fetch the diff needs", async () => {
+    const engine = makeEngine();
+    const heads = await edits(engine);
+    server.failManifest.set(heads[0], new ApiError("rate limited", 429, "rate_limited"));
+
+    // The limit-1 walk never lists heads[0]; it reads it only to diff the row above.
+    await expect(engine.listHistory(1, { changes: true })).rejects.toThrow(/rate limited/);
+  });
+
+  it("propagates a transport failure rather than reporting an empty history", async () => {
+    const engine = makeEngine();
+    const heads = await edits(engine);
+    server.failManifest.set(heads[1], new Error("network unreachable"));
+
+    await expect(engine.listHistory(10)).rejects.toThrow(/network unreachable/);
+  });
+
+  it("refuses to call a head that 404s an empty vault", async () => {
+    const engine = makeEngine();
+    const heads = await edits(engine);
+    // The server's own pointer names a snapshot it no longer has. Saying "no snapshots yet"
+    // would tell the user their vault is new.
+    server.manifests.delete(heads[1]);
+
+    await expect(engine.listHistory(10, { changes: true })).rejects.toThrow(/unknown manifest/);
+  });
+
+  it("marks a snapshot it cannot decrypt, and the child that has nothing to compare to", async () => {
+    const engine = makeEngine();
+    vault.set("a.md", "one");
+    await engine.sync();
+    server.seedRemoteEncryptedCommit({ keyId: "not-our-key" });
+    // A readable snapshot on top, whose parent is the unreadable one.
+    await server.seedRemoteCommit({ "a.md": "one", "later.md": "later" });
+
+    const history = await engine.listHistory(10, { changes: true });
+
+    expect(history[0].changes).toEqual({ unknown: "parent-unreadable" });
+    expect(history[1].changes).toEqual({ unknown: "unreadable" });
+  });
+
+  it("reports no changes as an empty diff, not as unknown", async () => {
+    const engine = makeEngine();
+    vault.set("a.md", "one");
+    await engine.sync();
+    const first = server.head!;
+    // A second snapshot holding exactly the same files, as a forced push would produce.
+    await server.seedRemoteCommit({ "a.md": "one" });
+
+    const history = await engine.listHistory(10, { changes: true });
+
+    expect(history[0].parent).toBe(first);
+    const changes = history[0].changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
+    expect(changes.files).toEqual([]);
+    expect(changes.added + changes.removed + changes.modified).toBe(0);
+  });
+});
+
 describe("SyncEngine.snapshotFiles", () => {
   it("lists the paths a snapshot held", async () => {
     const engine = makeEngine();
@@ -130,13 +374,223 @@ describe("SyncEngine.restoreFile", () => {
     expect(vault.text("b.md")).toBe("bee");
   });
 
-  it("replaces current content when restoring over a live file", async () => {
+  it("writes a numbered copy instead of overwriting live content", async () => {
     const engine = makeEngine();
     const heads = await threeCommits(engine);
 
-    await engine.restoreFile(heads[0], "a.md");
+    const out = await engine.restoreFile(heads[0], "a.md");
 
+    expect(out).toEqual({ kind: "copied", path: "a (2).md", requested: "a.md" });
+    // The live file is what matters here: restoring must never be the reason work vanishes.
+    expect(vault.text("a.md")).toBe("three");
+    expect(vault.text("a (2).md")).toBe("one");
+  });
+
+  it("writes nothing when the live file is already that content", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    vault.writes.length = 0;
+
+    const out = await engine.restoreFile(heads[2], "a.md");
+
+    expect(out).toEqual({ kind: "identical", path: "a.md", requested: "a.md" });
+    expect(vault.writes).toEqual([]);
+    expect(server.downloads).toEqual([]);
+  });
+
+  it("writes in place when nothing is at the path", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+
+    const out = await engine.restoreFile(heads[1], "b.md");
+
+    expect(out).toEqual({ kind: "written", path: "b.md", requested: "b.md" });
+    expect(vault.text("b.md")).toBe("bee");
+  });
+
+  it("restores to a destination the caller chose", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+
+    const out = await engine.restoreFile(heads[0], "a.md", { destination: "old/a.md" });
+
+    expect(out).toEqual({ kind: "written", path: "old/a.md", requested: "old/a.md" });
+    expect(vault.text("old/a.md")).toBe("one");
+    expect(vault.text("a.md")).toBe("three");
+  });
+
+  it("steps past a numbered copy that is already taken by other content", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    vault.set("a (2).md", "something else entirely");
+
+    const out = await engine.restoreFile(heads[0], "a.md");
+
+    expect(out.path).toBe("a (3).md");
+    expect(vault.text("a (2).md")).toBe("something else entirely");
+    expect(vault.text("a (3).md")).toBe("one");
+  });
+
+  it("stops at a numbered copy that already holds exactly this content", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    await engine.restoreFile(heads[0], "a.md");
+    vault.writes.length = 0;
+
+    // Clicking Restore twice must not litter the vault with identical copies.
+    const out = await engine.restoreFile(heads[0], "a.md");
+
+    expect(out).toEqual({ kind: "identical", path: "a (2).md", requested: "a.md" });
+    expect(vault.writes).toEqual([]);
+  });
+
+  it("refuses a chosen destination this device would never sync", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+
+    await expect(
+      engine.restoreFile(heads[0], "a.md", { destination: ".obsidian/sneaky.md" })
+    ).rejects.toThrow(/not synced/);
+    expect(vault.files.has(".obsidian/sneaky.md")).toBe(false);
+  });
+
+  it("refuses an overwrite that does not name the version it replaces", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+
+    // Unbounded approval is the bug: it applies to whatever happens to be there on arrival.
+    await expect(engine.restoreFile(heads[0], "a.md", { overwrite: true })).rejects.toThrow(
+      /must name the version it replaces/
+    );
+    expect(vault.text("a.md")).toBe("three");
+  });
+
+  it("refuses an overwrite whose file changed since it was approved", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    const approved = await engine.inspectRestore(heads[0], "a.md");
+    // The confirmation sits open while the note is edited — by the user, another plugin, or a
+    // filesystem process. That edit must survive the click.
+    vault.set("a.md", "written while the dialog was open", 1_754_000_400_000);
+
+    await expect(
+      engine.restoreFile(heads[0], "a.md", {
+        overwrite: true,
+        expectedHash: approved.currentHash,
+      })
+    ).rejects.toThrow(/changed while the restore was being confirmed/);
+    expect(vault.text("a.md")).toBe("written while the dialog was open");
+  });
+
+  it("overwrites when the file is still the version that was approved", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    const approved = await engine.inspectRestore(heads[0], "a.md");
+
+    const out = await engine.restoreFile(heads[0], "a.md", {
+      overwrite: true,
+      expectedHash: approved.currentHash,
+    });
+
+    expect(out.kind).toBe("replaced");
     expect(vault.text("a.md")).toBe("one");
+  });
+
+  it("refuses an in-place write when a file appeared where none was inspected", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    const approved = await engine.inspectRestore(heads[1], "b.md");
+    expect(approved.currentHash).toBeNull();
+    vault.set("b.md", "created after the decision", 1_754_000_400_000);
+
+    await expect(
+      engine.restoreFile(heads[1], "b.md", { expectedHash: approved.currentHash })
+    ).rejects.toThrow(/changed while the restore was being confirmed/);
+    expect(vault.text("b.md")).toBe("created after the decision");
+  });
+
+  it("refuses to write a copy onto a destination taken while the blob downloaded", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    // The free path is chosen before the fetch; the fetch is the window this exploits.
+    server.beforeGetBlob = () => {
+      vault.set("a (2).md", "someone else got there first", 1_754_000_400_000);
+    };
+
+    await expect(engine.restoreFile(heads[0], "a.md")).rejects.toThrow(
+      /changed while the restore was being confirmed/
+    );
+    expect(vault.text("a (2).md")).toBe("someone else got there first");
+  });
+
+  it("settles as identical when the destination became the wanted content mid-flight", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    const wanted = "one";
+    server.beforeGetBlob = () => {
+      vault.set("a (2).md", wanted, 1_754_000_400_000);
+    };
+
+    const out = await engine.restoreFile(heads[0], "a.md");
+
+    // Nothing to do and nothing lost — an error here would be noise, not safety.
+    expect(out).toEqual({ kind: "identical", path: "a (2).md", requested: "a.md" });
+  });
+
+  it("refuses a chosen destination that is not a valid vault path", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+
+    await expect(
+      engine.restoreFile(heads[0], "a.md", { destination: "../escape.md" })
+    ).rejects.toThrow(/not a valid vault path/);
+  });
+});
+
+describe("SyncEngine.inspectRestore", () => {
+  it("reports an absent file, with a copy suggestion named for the snapshot", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    const seen = await engine.inspectRestore(heads[1], "b.md");
+
+    expect(seen.current).toBe("absent");
+    expect(seen.unsyncedEdits).toBe(false);
+    expect(seen.suggestion).toMatch(/^b \(restored \d{4}-\d{2}-\d{2}\)\.md$/);
+  });
+
+  it("reports identical content without proposing anything be written", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+
+    expect((await engine.inspectRestore(heads[2], "a.md")).current).toBe("identical");
+  });
+
+  it("says the live file is safe when its bytes are the ones last synced", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    const seen = await engine.inspectRestore(heads[0], "a.md");
+
+    expect(seen.current).toBe("differs");
+    // "three" is the published head, so replacing it loses nothing permanently.
+    expect(seen.unsyncedEdits).toBe(false);
+  });
+
+  it("flags a live file edited since the last pass as the only copy there is", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    vault.set("a.md", "written just now, never synced", 1_754_000_300_000);
+
+    const seen = await engine.inspectRestore(heads[0], "a.md");
+
+    expect(seen.current).toBe("differs");
+    expect(seen.unsyncedEdits).toBe(true);
+  });
+
+  it("refuses a path the snapshot never held", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+
+    await expect(engine.inspectRestore(heads[2], "b.md")).rejects.toThrow(/not in snapshot/);
   });
 
   it("refuses a path the snapshot never held rather than writing nothing silently", async () => {

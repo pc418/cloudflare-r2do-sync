@@ -108,11 +108,21 @@ describe("what a pass reports it pushed", () => {
     expect(store.state?.lines).toEqual({ "a.md": 2 });
   });
 
-  it("keeps the counts out of the manifest, which other clients and the server read", async () => {
+  it("records the count in the manifest so history can be diffed without downloading blobs", async () => {
     vault.set("a.md", "1\n2");
     await engine.sync();
 
     const entry = plainFiles(server.manifests.get(server.head!)!)["a.md"];
+    expect(Object.keys(entry).sort()).toEqual(["h", "lines", "mtime", "size"]);
+    expect(entry.lines).toBe(2);
+  });
+
+  it("omits the count for binary content rather than claiming zero lines", async () => {
+    vault.set("shot.png", new Uint8Array([0x89, 0x50, 0x00, 0x01]));
+    await engine.sync();
+
+    const entry = plainFiles(server.manifests.get(server.head!)!)["shot.png"];
+    expect(entry.lines).toBeUndefined();
     expect(Object.keys(entry).sort()).toEqual(["h", "mtime", "size"]);
   });
 });

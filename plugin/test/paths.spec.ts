@@ -7,8 +7,10 @@ import {
   isConfigPath,
   makeExcluder,
   makeScopeFilter,
+  numberedPath,
   parseGlobs,
   pathError,
+  restoreCopyPath,
   selfDirs,
   DEFAULT_CONFIG_DIR,
   LEGACY_PLUGIN_DIR,
@@ -303,5 +305,46 @@ describe("configuration-directory code is never synced", () => {
     });
     expect(inScope(".obsidian/plugins/dataview/main.js")).toBe(false);
     expect(inScope(".obsidian/app.json")).toBe(true);
+  });
+});
+
+describe("restore destination names", () => {
+  it("puts the snapshot's date before the extension, not after it", () => {
+    expect(restoreCopyPath("Note.md", "2026-08-05T11:22:33Z")).toBe(
+      "Note (restored 2026-08-05).md"
+    );
+    expect(restoreCopyPath("a/b/Deep Note.md", "2026-01-31T00:00:00.000Z")).toBe(
+      "a/b/Deep Note (restored 2026-01-31).md"
+    );
+  });
+
+  it("handles names with no extension, and dotfiles whose dot is the name", () => {
+    expect(restoreCopyPath("README", "2026-08-05T00:00:00Z")).toBe(
+      "README (restored 2026-08-05)"
+    );
+    expect(restoreCopyPath("notes/.gitignore", "2026-08-05T00:00:00Z")).toBe(
+      "notes/.gitignore (restored 2026-08-05)"
+    );
+  });
+
+  it("keeps only the last extension of a multi-dot name", () => {
+    expect(restoreCopyPath("archive.tar.gz", "2026-08-05T00:00:00Z")).toBe(
+      "archive.tar (restored 2026-08-05).gz"
+    );
+  });
+
+  it("says so rather than inventing a date when the timestamp is unparseable", () => {
+    expect(restoreCopyPath("Note.md", "not a date")).toBe("Note (restored unknown date).md");
+  });
+
+  it("numbers a path before its extension", () => {
+    expect(numberedPath("Note.md", 2)).toBe("Note (2).md");
+    expect(numberedPath("a/b/Note.md", 7)).toBe("a/b/Note (7).md");
+    expect(numberedPath("README", 3)).toBe("README (3)");
+  });
+
+  it("produces paths the server would accept", () => {
+    expect(pathError(restoreCopyPath("Note.md", "2026-08-05T00:00:00Z"))).toBeNull();
+    expect(pathError(numberedPath("Note.md", 2))).toBeNull();
   });
 });

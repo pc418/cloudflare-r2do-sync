@@ -50,15 +50,21 @@ import {
 import { ObsidianVault } from "./obsidian-vault";
 import {
   SyncEngine,
+  type ChangesUnknown,
   type ConflictInfo,
   type ContinuityDecision,
   type ContinuitySummary,
   type MassChangeDecision,
   type MassChangeSummary,
+  type RestoreInspection,
+  type RestoreOutcome,
+  type SnapshotChange,
+  type SnapshotChanges,
   type SnapshotInfo,
   type SyncPreview,
   type SyncResult,
 } from "./sync";
+import type { FileEntry } from "./types";
 import { decodeText, type ConflictMode } from "./merge";
 import {
   LOG_ENTRIES_RANGE,
@@ -1079,7 +1085,16 @@ export default class LogSyncPlugin extends Plugin {
       new Notice("R2DO Sync: set the server URL and access token in settings first");
       return;
     }
-    new HistoryModal(this.app, this, this.#engine).open();
+    const engine = this.#engine;
+    new HistoryModal(this.app, {
+      listHistory: (limit, opts) => engine.listHistory(limit, opts),
+      snapshotFiles: (id) => engine.snapshotFiles(id),
+      inspectRestore: (id, path) => engine.inspectRestore(id, path),
+      restoreFile: (id, path, opts) => engine.restoreFile(id, path, opts),
+      restoreAll: (id) => engine.restoreAll(id),
+      historyLimit: this.settings.historyLimit,
+      syncNow: () => this.syncNow(),
+    }).open();
   }
 
   /**
@@ -2247,11 +2262,74 @@ class PreviewModal extends Modal {
 }
 
 /** Walks the snapshot chain so a past state can be inspected and restored. */
-class HistoryModal extends Modal {
+/**
+ * What the history windows need to do their job, narrowed to an interface so a test can drive
+ * them without a whole plugin behind them. `SyncEngine` supplies all but the last two.
+ */
+export interface HistoryDeps {
+  listHistory(limit: number, opts?: { changes?: boolean }): Promise<SnapshotInfo[]>;
+  snapshotFiles(id: string): Promise<Record<string, FileEntry>>;
+  inspectRestore(id: string, path: string): Promise<RestoreInspection>;
+  restoreFile(
+    id: string,
+    path: string,
+    opts?: { destination?: string; overwrite?: boolean }
+  ): Promise<RestoreOutcome>;
+  restoreAll(id: string): Promise<{ written: number; removed: number }>;
+  /** How many snapshots to list; each one is a manifest fetch. */
+  historyLimit: number;
+  /** Publishes a restored vault, so the snapshot the user chose becomes the new head. */
+  syncNow(): Promise<void>;
+}
+
+/** How many changed paths a history row previews before deferring to the snapshot window. */
+const CHANGE_PREVIEW = 5;
+
+const UNKNOWN_CHANGES: Record<ChangesUnknown, string> = {
+  unreadable: "changes unknown — this snapshot cannot be read with this device's key",
+  "parent-unreadable": "changes unknown — the previous snapshot cannot be read with this device's key",
+  "parent-missing": "changes unknown — the previous snapshot is no longer retained",
+};
+
+/** `+42 -7 lines`, or a byte figure for history committed before counts were recorded. */
+function fmtLineChange(c: SnapshotChanges): string | null {
+  if (c.files.length > c.linesUnknown) {
+    const counted = `+${c.linesAdded} -${c.linesRemoved} lines`;
+    return c.linesUnknown === 0 ? counted : `${counted} (${c.linesUnknown} not counted)`;
+  }
+  // Every changed file was binary, or predates `lines`. Bytes are the honest fallback.
+  if (c.bytes === 0) return null;
+  return `${fmtBytes(Math.abs(c.bytes))} ${c.bytes < 0 ? "smaller" : "larger"}`;
+}
+
+/** One snapshot's change summary as a single line. Never guesses: what it cannot state, it omits. */
+export function describeChanges(changes: SnapshotChanges | { unknown: ChangesUnknown }): string {
+  if ("unknown" in changes) return UNKNOWN_CHANGES[changes.unknown];
+  if (changes.files.length === 0) return "no file changes";
+  const counts: string[] = [];
+  if (changes.added > 0) counts.push(`${changes.added} added`);
+  if (changes.modified > 0) counts.push(`${changes.modified} changed`);
+  if (changes.removed > 0) counts.push(`${changes.removed} removed`);
+  const parts = [changes.initial ? `${counts.join(", ")} (first snapshot)` : counts.join(", ")];
+  const lines = fmtLineChange(changes);
+  if (lines !== null) parts.push(lines);
+  return parts.join(" · ");
+}
+
+/** One changed file as a line: what happened to it, and by how much. */
+export function describeChangedFile(c: SnapshotChange): string {
+  const verb = c.kind === "added" ? "added" : c.kind === "removed" ? "removed" : "changed";
+  const amount =
+    c.lines === null
+      ? fmtBytes(Math.abs(c.bytes))
+      : `${c.lines >= 0 ? "+" : ""}${c.lines} line${Math.abs(c.lines) === 1 ? "" : "s"}`;
+  return `${verb} · ${c.path} · ${amount}`;
+}
+
+export class HistoryModal extends Modal {
   constructor(
     app: App,
-    private readonly plugin: LogSyncPlugin,
-    private readonly engine: SyncEngine
+    private readonly deps: HistoryDeps
   ) {
     super(app);
   }
@@ -2264,7 +2342,7 @@ class HistoryModal extends Modal {
 
     let history: SnapshotInfo[];
     try {
-      history = await this.engine.listHistory(this.plugin.settings.historyLimit);
+      history = await this.deps.listHistory(this.deps.historyLimit, { changes: true });
     } catch (e) {
       status.setText(`Could not read history: ${message(e)}`);
       return;
@@ -2275,26 +2353,41 @@ class HistoryModal extends Modal {
       return;
     }
     status.setText(
-      `Newest first. Older snapshots are removed by the server's retention policy, so this ` +
-        `list can be shorter than the vault's full history.`
+      `Newest first, with what each one changed. Older snapshots are removed by the server's ` +
+        `retention policy, so this list can be shorter than the vault's full history.`
     );
 
     for (const snap of history) {
       const when = new Date(snap.createdAt).toLocaleString();
+      const summary = snap.changes === undefined ? null : describeChanges(snap.changes);
       const setting = new Setting(contentEl)
         .setName(`${when} — ${snap.device}`)
         .setDesc(
           snap.readable
-            ? `${snap.fileCount} file(s) · ${snap.id}`
+            ? `${summary ?? `${snap.fileCount} file(s)`} · ${snap.fileCount} file(s) total · ${snap.id}`
             : `unreadable with this device's key · ${snap.id}`
         );
       if (!snap.readable) continue;
       setting.addButton((b) =>
         b.setButtonText("Browse").onClick(() => {
           this.close();
-          new SnapshotModal(this.app, this.plugin, this.engine, snap).open();
+          new SnapshotModal(this.app, this.deps, snap).open();
         })
       );
+
+      // The changed paths themselves, capped: the whole point is seeing what moved without
+      // opening anything, but a window of forty snapshots cannot carry forty full file lists.
+      const changes = snap.changes;
+      if (changes === undefined || "unknown" in changes || changes.files.length === 0) continue;
+      const list = contentEl.createDiv();
+      for (const change of changes.files.slice(0, CHANGE_PREVIEW)) {
+        list.createEl("p", { text: describeChangedFile(change) });
+      }
+      if (changes.files.length > CHANGE_PREVIEW) {
+        list.createEl("p", {
+          text: `…and ${changes.files.length - CHANGE_PREVIEW} more — Browse to see them all.`,
+        });
+      }
     }
   }
 
@@ -2304,15 +2397,15 @@ class HistoryModal extends Modal {
 }
 
 /** One snapshot's contents, with per-file and whole-vault restore. */
-class SnapshotModal extends Modal {
-  #paths: string[] = [];
+export class SnapshotModal extends Modal {
+  /** Ranked most recently edited first, which is the order the file list is read in. */
+  #files: Array<{ path: string; entry: FileEntry }> = [];
   #filter = "";
   #listEl: HTMLElement | null = null;
 
   constructor(
     app: App,
-    private readonly plugin: LogSyncPlugin,
-    private readonly engine: SyncEngine,
+    private readonly deps: HistoryDeps,
     private readonly snap: SnapshotInfo
   ) {
     super(app);
@@ -2327,17 +2420,31 @@ class SnapshotModal extends Modal {
     });
 
     try {
-      this.#paths = Object.keys(await this.engine.snapshotFiles(this.snap.id)).sort();
+      const files = await this.deps.snapshotFiles(this.snap.id);
+      this.#files = Object.entries(files)
+        .map(([path, entry]) => ({ path, entry }))
+        // "What did I touch recently" is the question someone browsing history has; a path
+        // sort answers a different one. Ties break on path so the order is stable.
+        .sort((a, b) => b.entry.mtime - a.entry.mtime || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     } catch (e) {
       contentEl.createEl("p", { text: `Could not read this snapshot: ${message(e)}` });
       return;
     }
 
+    const changes = this.snap.changes;
+    if (changes !== undefined && !("unknown" in changes) && changes.files.length > 0) {
+      contentEl.createEl("h3", { text: `Changed in this snapshot (${changes.files.length})` });
+      for (const change of changes.files) {
+        contentEl.createEl("p", { text: describeChangedFile(change) });
+      }
+    }
+
     new Setting(contentEl)
       .setName("Restore the whole vault to this snapshot")
       .setDesc(
-        "Writes every file above and removes synced files this snapshot does not have. " +
-          "Your current state stays in the history and can be restored the same way."
+        "Writes every file below and removes synced files this snapshot does not have. " +
+          "Files whose current version was published stay recoverable from the history; " +
+          "edits this device has never synced would be lost."
       )
       .addButton((b) =>
         b
@@ -2362,41 +2469,84 @@ class SnapshotModal extends Modal {
     if (!list) return;
     list.empty();
 
-    const matches = this.#paths.filter((p) => p.toLowerCase().includes(this.#filter));
-    list.createEl("p", { text: `${matches.length} of ${this.#paths.length} file(s)` });
+    const matches = this.#files.filter((f) => f.path.toLowerCase().includes(this.#filter));
+    list.createEl("p", {
+      text: `${matches.length} of ${this.#files.length} file(s), most recently edited first`,
+    });
 
-    for (const path of matches.slice(0, 100)) {
-      new Setting(list).setName(path).addButton((b) =>
-        b.setButtonText("Restore").onClick(async () => {
-          try {
-            await this.engine.restoreFile(this.snap.id, path);
-            new Notice(`Restored ${path}`);
-          } catch (e) {
-            new Notice(`Could not restore ${path}: ${message(e)}`, 10_000);
-          }
-        })
-      );
+    for (const { path, entry } of matches.slice(0, 100)) {
+      new Setting(list)
+        .setName(path)
+        .setDesc(`edited ${new Date(entry.mtime).toLocaleString()} · ${fmtBytes(entry.size)}`)
+        .addButton((b) => b.setButtonText("Restore").onClick(() => this.#restore(path)));
     }
     if (matches.length > 100) {
       list.createEl("p", { text: `…and ${matches.length - 100} more. Narrow the filter to see them.` });
     }
   }
 
+  /**
+   * Restoring never overwrites the live file by accident.
+   *
+   * Content already identical is a no-op worth saying out loud; a free path is written in
+   * place, because there is nothing there to protect; anything else is the user's decision to
+   * make, with what is at stake spelled out first.
+   */
+  async #restore(path: string): Promise<void> {
+    let seen: RestoreInspection;
+    try {
+      seen = await this.deps.inspectRestore(this.snap.id, path);
+    } catch (e) {
+      new Notice(`Could not restore ${path}: ${message(e)}`, 10_000);
+      return;
+    }
+    if (seen.current === "identical") {
+      new Notice(`${path} is already identical to this snapshot — nothing to restore`);
+      return;
+    }
+    if (seen.current === "absent") {
+      // Bound to "nothing was there", so a file that appears in the meantime is not clobbered
+      // by a decision taken before it existed.
+      await this.#run(path, { expectedHash: seen.currentHash });
+      return;
+    }
+    new RestoreDestinationModal(this.app, {
+      path,
+      inspection: seen,
+      onRestore: (choice) => this.#run(path, choice),
+    }).open();
+  }
+
+  async #run(
+    path: string,
+    choice: { destination?: string; overwrite?: boolean; expectedHash?: string | null }
+  ): Promise<void> {
+    try {
+      const out = await this.deps.restoreFile(this.snap.id, path, choice);
+      new Notice(describeRestore(out));
+    } catch (e) {
+      new Notice(`Could not restore ${path}: ${message(e)}`, 10_000);
+    }
+  }
+
   #confirmRestoreAll(): void {
     new ConfirmModal(this.app, {
       title: "Restore the whole vault?",
-      body:
+      body: [
         `Every file this device syncs will be made to match snapshot ${this.snap.id}. Files ` +
-        `added since then will be moved to the trash. Nothing is lost permanently — the ` +
-        `current state remains in the snapshot history.`,
+          `added since then will be moved to the trash.`,
+        `Anything whose current version was published stays in the snapshot history and can ` +
+          `be restored the same way. Edits made since the last sync have never left this ` +
+          `device, and this will overwrite them. Sync first if you want them kept.`,
+      ],
       phrase: "RESTORE",
       onConfirm: async () => {
         const notice = new Notice("Restoring…", 0);
         try {
-          const { written, removed } = await this.engine.restoreAll(this.snap.id);
+          const { written, removed } = await this.deps.restoreAll(this.snap.id);
           new Notice(`Restored ${written} file(s), removed ${removed}. Syncing to publish it.`);
           this.close();
-          await this.plugin.syncNow();
+          await this.deps.syncNow();
         } catch (e) {
           new Notice(`Restore failed: ${message(e)}`, 10_000);
         } finally {
@@ -2404,6 +2554,111 @@ class SnapshotModal extends Modal {
         }
       },
     }).open();
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+/** What a finished restore did, in the words the user needs to find the file afterwards. */
+export function describeRestore(out: RestoreOutcome): string {
+  switch (out.kind) {
+    case "identical":
+      return `${out.path} already holds exactly that content — nothing was written`;
+    case "written":
+      return `Restored ${out.path}`;
+    case "replaced":
+      return `Replaced ${out.path} with the snapshot's version`;
+    case "copied":
+      return `${out.requested} already held different content, so the snapshot's version was saved as ${out.path}`;
+  }
+}
+
+/**
+ * Where a restored file should go, when something different is already at its original path.
+ *
+ * The default is a copy, because the alternative destroys work: the live file may hold edits
+ * that were never synced, and this window is the only place that difference is visible. The
+ * overwrite is still offered — it is a legitimate thing to want — but it is the second button
+ * and it says what it costs.
+ */
+export class RestoreDestinationModal extends Modal {
+  constructor(
+    app: App,
+    private readonly opts: {
+      path: string;
+      inspection: RestoreInspection;
+      onRestore: (choice: {
+        destination?: string;
+        overwrite?: boolean;
+        expectedHash?: string | null;
+      }) => void | Promise<void>;
+    }
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    const { path, inspection } = this.opts;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: `Restore ${path}` });
+    contentEl.createEl("p", {
+      text: `A different version of this file is at ${path} right now.`,
+    });
+    // Never promises the version being replaced is recoverable. Matching this device's last
+    // synced state does not prove any *retained* snapshot still references those bytes — the
+    // device may have been offline past the retention window, or the chain rerooted — and a
+    // safety claim that turns out to be false is what motivates an irreversible overwrite.
+    contentEl.createEl("p", {
+      text: inspection.unsyncedEdits
+        ? `That version has edits this device has never synced — it exists nowhere else, and ` +
+          `replacing it would destroy it.`
+        : `That version matches what this device last synced. Whether the remote still keeps a ` +
+          `snapshot holding it depends on the retention window, so replacing it may still be ` +
+          `permanent.`,
+    });
+
+    let destination = inspection.suggestion;
+    new Setting(contentEl)
+      .setName("Save the restored copy as")
+      .setDesc("Anywhere in the vault. A name already taken by different content gets numbered.")
+      .addText((t) =>
+        t.setValue(destination).onChange((v) => {
+          destination = v.trim();
+        })
+      );
+
+    new Setting(contentEl)
+      .addButton((b) =>
+        b
+          .setButtonText("Save a copy")
+          .setCta()
+          .onClick(async () => {
+            if (destination === "") {
+              new Notice("Give the restored copy a path");
+              return;
+            }
+            this.close();
+            await this.opts.onRestore({ destination });
+          })
+      )
+      .addButton((b) =>
+        b
+          .setButtonText("Replace current file")
+          .setWarning()
+          .onClick(async () => {
+            this.close();
+            // The version the paragraphs above described, not whatever is there by the time
+            // this write lands. The engine refuses the write if they differ.
+            await this.opts.onRestore({
+              overwrite: true,
+              expectedHash: inspection.currentHash,
+            });
+          })
+      )
+      .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
   }
 
   onClose(): void {

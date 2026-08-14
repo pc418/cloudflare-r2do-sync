@@ -19,7 +19,15 @@ import {
   netLines,
   type LineCounts,
 } from "./lines";
-import { alwaysSkip, DEFAULT_CONFIG_DIR, isConfigPath, makeExcluder, pathError } from "./paths";
+import {
+  alwaysSkip,
+  DEFAULT_CONFIG_DIR,
+  isConfigPath,
+  makeExcluder,
+  numberedPath,
+  pathError,
+  restoreCopyPath,
+} from "./paths";
 import { DEFAULT_LANES, clampLanes, mapPool } from "./pool";
 import { createUlidFactory } from "./ulid";
 import { isSyncMode, type SyncMode } from "./sync-policy";
@@ -197,6 +205,108 @@ export interface SyncPreview {
   continuity?: ContinuitySummary;
 }
 
+/** How far `restoreFile` steps past an occupied destination before it gives up loudly. */
+const MAX_RESTORE_COPIES = 50;
+
+/**
+ * The error that stops a restore whose approval has gone stale. Its own function so the two
+ * call sites cannot drift, and so a test can pin that nothing was written.
+ */
+function restoreRaceError(path: string): Error {
+  return new Error(
+    `"${path}" changed while the restore was being confirmed — nothing was written. ` +
+      `Look at the file and restore again.`
+  );
+}
+
+/** What restoring a file from a snapshot would meet at its original path. */
+export interface RestoreInspection {
+  /** The snapshot's own record of the file. */
+  entry: FileEntry;
+  /**
+   * sha256 of what was at the path when this ran, or null for nothing. Pass it back as
+   * `restoreFile`'s `expectedHash` so the write is bound to the version the user was shown.
+   */
+  currentHash: string | null;
+  /** What is at the original path right now, compared by content hash. */
+  current: "absent" | "identical" | "differs";
+  /**
+   * True when the bytes at the path are not the ones this device last synced — an edit made
+   * since the last pass, or a file never synced at all. Those exist nowhere else.
+   *
+   * False means only that they *match this device's last synced state*. It is **not** proof
+   * that any retained snapshot still references them: this device can have been offline past
+   * the retention window, the chain can have been rerooted, or the manifest that held them can
+   * have been collected. Never turn a false here into a promise that replacing them is
+   * recoverable.
+   */
+  unsyncedEdits: boolean;
+  /** A copy destination beside the original, named for the snapshot's date. */
+  suggestion: string;
+}
+
+/**
+ * Where a restore's bytes ended up.
+ *
+ * `identical` wrote nothing because the content was already there. `written` found the
+ * destination free. `replaced` overwrote differing content, which only an explicit
+ * `overwrite` can produce. `copied` stepped past occupied content to a numbered sibling —
+ * `path` is where it landed, `requested` is where the caller asked.
+ */
+export interface RestoreOutcome {
+  kind: "identical" | "written" | "replaced" | "copied";
+  path: string;
+  requested: string;
+}
+
+/** One file a snapshot changed, against its parent snapshot. */
+export interface SnapshotChange {
+  path: string;
+  kind: "added" | "removed" | "modified";
+  /** Byte size change: positive for growth, negative for shrinkage. */
+  bytes: number;
+  /**
+   * Net line change, or null when it cannot be attributed — binary content, or a snapshot
+   * committed before entries carried `lines`. Net, so a five-for-five rewrite reports zero.
+   */
+  lines: number | null;
+}
+
+/**
+ * What one snapshot changed against its parent.
+ *
+ * `linesAdded`/`linesRemoved` split the per-file net deltas by sign, which is the honest way
+ * to show a "+N −N" for a whole snapshot: a file that gained lines and one that lost them do
+ * not cancel out, even though neither file's own figure is a true insert/delete count.
+ */
+export interface SnapshotChanges {
+  /** Every changed path, most recently edited first. Empty for a snapshot that changed nothing. */
+  files: SnapshotChange[];
+  added: number;
+  removed: number;
+  modified: number;
+  /** Net byte change across the snapshot. Meaningful for history predating `lines`. */
+  bytes: number;
+  linesAdded: number;
+  linesRemoved: number;
+  /** Changed files whose line delta could not be attributed; excluded from the two sums. */
+  linesUnknown: number;
+  /** True when this snapshot has no parent, so everything it holds counts as added. */
+  initial: boolean;
+}
+
+/**
+ * Why a snapshot's changes could not be computed. Reported instead of an empty diff, because
+ * "nothing changed" and "we cannot tell" are different facts and only one of them is reassuring.
+ */
+export type ChangesUnknown =
+  /** This snapshot's own path map cannot be decrypted with this device's key. */
+  | "unreadable"
+  /** The parent's cannot, so there is nothing to compare against. */
+  | "parent-unreadable"
+  /** The parent is gone (retention), unfetchable, or the walk refused to follow the link. */
+  | "parent-missing";
+
 /** One entry in the snapshot chain, as shown in the history browser. */
 export interface SnapshotInfo {
   id: string;
@@ -206,6 +316,98 @@ export interface SnapshotInfo {
   /** Null when this device's key cannot open the snapshot. */
   fileCount: number | null;
   readable: boolean;
+  /**
+   * What this snapshot changed against its parent. Absent unless the caller asked for diffs;
+   * `{ unknown }` when they were asked for but could not be computed.
+   */
+  changes?: SnapshotChanges | { unknown: ChangesUnknown };
+}
+
+/**
+ * What changed between a parent snapshot's path map and its child's. A null parent means the
+ * child is the vault's first snapshot, so every file it holds is an addition.
+ *
+ * Both maps are already in memory when the history walk decrypts them, so this costs nothing
+ * beyond the comparison. Identity is `h`, the *plaintext* hash, which encrypted snapshots
+ * carry too — so a re-encryption or a key migration correctly reports no content change.
+ */
+export function diffSnapshots(
+  parent: Record<string, FileEntry> | null,
+  child: Record<string, FileEntry>
+): SnapshotChanges {
+  const files: SnapshotChange[] = [];
+  let bytes = 0;
+  let linesAdded = 0;
+  let linesRemoved = 0;
+  let linesUnknown = 0;
+
+  /**
+   * The line delta for one change, or null when it cannot be attributed.
+   *
+   * Attribution follows the *kind* of change, not `netLines`, whose `undefined` means "absent
+   * on this side". In a `modified` change both entries exist, so a missing `lines` means binary
+   * content or a snapshot written before the field existed — not a file that had zero lines.
+   * Reading it as zero would report the first edit of an old seven-line note as `+10`.
+   */
+  const lineDelta = (
+    kind: SnapshotChange["kind"],
+    before: FileEntry | undefined,
+    after: FileEntry | undefined
+  ): number | null => {
+    if (kind === "added") return after?.lines ?? null;
+    if (kind === "removed") return before?.lines === undefined ? null : -before.lines;
+    if (before?.lines === undefined || after?.lines === undefined) return null;
+    return after.lines - before.lines;
+  };
+
+  const record = (
+    path: string,
+    kind: SnapshotChange["kind"],
+    before: FileEntry | undefined,
+    after: FileEntry | undefined
+  ): void => {
+    const delta = lineDelta(kind, before, after);
+    const change: SnapshotChange = {
+      path,
+      kind,
+      bytes: (after?.size ?? 0) - (before?.size ?? 0),
+      lines: delta,
+    };
+    bytes += change.bytes;
+    if (delta === null) linesUnknown++;
+    else if (delta >= 0) linesAdded += delta;
+    else linesRemoved -= delta;
+    files.push(change);
+  };
+
+  const before = parent ?? pathMap<FileEntry>();
+  for (const [path, entry] of Object.entries(child)) {
+    const old = before[path];
+    if (old === undefined) record(path, "added", undefined, entry);
+    else if (old.h !== entry.h) record(path, "modified", old, entry);
+  }
+  for (const [path, entry] of Object.entries(before)) {
+    if (child[path] === undefined) record(path, "removed", entry, undefined);
+  }
+
+  // Most recently edited first, matching how a snapshot's own file list is ranked. A removed
+  // file is ranked by when it was last edited, which is the only date it has. Ties break on
+  // path so two devices render an identical list.
+  const mtimeOf = (c: SnapshotChange): number =>
+    (c.kind === "removed" ? before[c.path]?.mtime : child[c.path]?.mtime) ?? 0;
+  files.sort((a, b) => mtimeOf(b) - mtimeOf(a) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+
+  return {
+    files,
+    added: files.filter((c) => c.kind === "added").length,
+    removed: files.filter((c) => c.kind === "removed").length,
+    modified: files.filter((c) => c.kind === "modified").length,
+    bytes,
+    linesAdded,
+    linesRemoved,
+    linesUnknown,
+    initial: parent === null,
+  };
 }
 
 /** Historic name, kept so callers that only care about the shape keep compiling. */
@@ -1131,12 +1333,19 @@ export class SyncEngine {
 
   async #transformEntry(entry: FileEntry, targetCrypto: VaultCrypto | null): Promise<FileEntry> {
     const plain = await this.#fetchWithCrypto(entry, this.#crypto);
-    if (targetCrypto === null) return { h: entry.h, size: entry.size, mtime: entry.mtime };
+    // Re-encrypting changes the ciphertext, never a line of anyone's text, so the recorded
+    // count carries over unchanged. Dropping it would blank the history diff for every file
+    // a migration touched.
+    const carried = entry.lines === undefined ? {} : { lines: entry.lines };
+    if (targetCrypto === null) {
+      return { h: entry.h, size: entry.size, mtime: entry.mtime, ...carried };
+    }
     const cipher = await targetCrypto.encryptBlob(entry.h, plain);
     return {
       h: entry.h,
       size: entry.size,
       mtime: entry.mtime,
+      ...carried,
       c: await sha256Hex(cipher),
     };
   }
@@ -1754,38 +1963,79 @@ export class SyncEngine {
    * a snapshot this device's key cannot open, so one unreadable entry does not hide the
    * readable history behind it.
    */
-  async listHistory(limit: number): Promise<SnapshotInfo[]> {
+  async listHistory(limit: number, opts: { changes?: boolean } = {}): Promise<SnapshotInfo[]> {
+    const wantChanges = opts.changes === true;
     const out: SnapshotInfo[] = [];
     const seen = new Set<string>();
     let id = await this.#api.getHead();
 
-    while (id !== null && out.length < limit) {
+    // The snapshot listed last, held back until its parent's path map is in hand — which is
+    // the next turn of this same walk, so a diff costs no fetch of its own.
+    let pending: { info: SnapshotInfo; files: Record<string, FileEntry> | null } | null = null;
+    const settle = (
+      parent: { files: Record<string, FileEntry> } | { unknown: ChangesUnknown } | "initial"
+    ): void => {
+      if (pending === null) return;
+      const { info, files } = pending;
+      pending = null;
+      if (!wantChanges) return;
+      if (files === null) info.changes = { unknown: "unreadable" };
+      else if (parent === "initial") info.changes = diffSnapshots(null, files);
+      else if ("unknown" in parent) info.changes = parent;
+      else info.changes = diffSnapshots(parent.files, files);
+    };
+
+    for (;;) {
+      // Past the limit the walk continues for exactly one more manifest, and only to give the
+      // last listed snapshot something to diff against. Without diffs it stops at the limit.
+      const parentOnly = out.length >= limit;
+      if (parentOnly && !wantChanges) break;
+      if (id === null) {
+        settle("initial");
+        break;
+      }
       // The server refuses to reuse a manifest id, so a repeat means history was corrupted
       // around that rule. Stopping shows the readable prefix rather than listing the same
       // snapshots over and over until the limit is reached.
-      if (seen.has(id)) break;
+      if (seen.has(id)) {
+        settle({ unknown: "parent-missing" });
+        break;
+      }
       seen.add(id);
       let manifest: Manifest;
       try {
         manifest = await this.#api.getManifest(id);
-      } catch {
+      } catch (e) {
+        // Only "that snapshot is gone" is evidence about the vault's history. A 401, 429, 5xx,
+        // transport or parse failure is this request failing, and dressing it up as retention
+        // turns an actionable error into a false fact about the user's own history. Same rule
+        // the descent walk applies.
+        if (!(e instanceof ApiError) || e.status !== 404) throw e;
+        // A *head* that 404s is not retention either: it is a server whose own pointer names a
+        // snapshot it no longer has. Reporting an empty list would claim the vault is new.
+        if (out.length === 0) throw e;
+        settle({ unknown: "parent-missing" });
         break;
       }
-      let fileCount: number | null = null;
-      let readable = true;
+      let files: Record<string, FileEntry> | null;
       try {
-        fileCount = Object.keys(await this.#remoteFiles(manifest)).length;
+        files = await this.#remoteFiles(manifest);
       } catch {
-        readable = false;
+        files = null;
       }
-      out.push({
+      settle(files === null ? { unknown: "parent-unreadable" } : { files });
+      if (parentOnly) break;
+
+      const info: SnapshotInfo = {
         id: manifest.id,
         parent: manifest.parent,
         device: manifest.device,
         createdAt: manifest.createdAt,
-        fileCount,
-        readable,
-      });
+        fileCount: files === null ? null : Object.keys(files).length,
+        readable: files !== null,
+      };
+      out.push(info);
+      pending = { info, files };
       id = manifest.parent;
     }
     return out;
@@ -1796,14 +2046,133 @@ export class SyncEngine {
     return await this.#remoteFiles(await this.#api.getManifest(id));
   }
 
-  /** Writes one file back to its original path as it was in the given snapshot. */
-  async restoreFile(id: string, path: string): Promise<void> {
+  /**
+   * What restoring one file would run into, so the caller can ask before anything is written.
+   *
+   * Reads the vault; writes nothing. The comparison is by content hash, never `size+mtime`:
+   * a file edited back and forth to the same bytes is genuinely identical, and one edited to
+   * the same size is not.
+   */
+  async inspectRestore(id: string, path: string): Promise<RestoreInspection> {
+    this.#assertRestorable(path);
+    const manifest = await this.#api.getManifest(id);
+    const entry = (await this.#remoteFiles(manifest))[path];
+    if (entry === undefined) throw new Error(`"${path}" is not in snapshot ${id}`);
+
+    const local = await this.#localHash(path);
+    const state = this.#state ?? (await this.#store.load());
+    return {
+      entry,
+      currentHash: local,
+      current: local === null ? "absent" : local === entry.h ? "identical" : "differs",
+      unsyncedEdits: local !== null && local !== state?.files[path]?.h,
+      suggestion: restoreCopyPath(path, manifest.createdAt),
+    };
+  }
+
+  /**
+   * Writes one file from a snapshot back into the vault.
+   *
+   * Restoring never destroys unseen work by accident. Content already at the destination is
+   * compared by hash first: identical means nothing is written at all, and differing content
+   * is preserved by writing a numbered sibling instead — unless the caller passes `overwrite`,
+   * which is the explicit "replace what is there" the UI asks about separately.
+   */
+  async restoreFile(
+    id: string,
+    path: string,
+    opts: { destination?: string; overwrite?: boolean; expectedHash?: string | null } = {}
+  ): Promise<RestoreOutcome> {
+    const requested = opts.destination ?? path;
+    this.#assertRestorable(path);
+    if (requested !== path) this.#assertRestorable(requested);
+    // An overwrite is approval for destroying one specific version. Without naming it, the
+    // approval is unbounded and applies to whatever happens to be there when the click lands.
+    if (opts.overwrite === true && opts.expectedHash === undefined) {
+      throw new Error(
+        `refusing to overwrite "${requested}": an overwrite must name the version it replaces`
+      );
+    }
+
+    const entry = (await this.snapshotFiles(id))[path];
+    if (entry === undefined) throw new Error(`"${path}" is not in snapshot ${id}`);
+
+    const observed = await this.#localHash(requested);
+    if (opts.expectedHash !== undefined && observed !== opts.expectedHash) {
+      throw restoreRaceError(requested);
+    }
+    if (observed === entry.h) return { kind: "identical", path: requested, requested };
+
+    let target = requested;
+    // What the destination held when the decision was taken, re-checked below. Null for a
+    // numbered copy, which is chosen precisely because nothing is there.
+    let approved = observed;
+    let kind: RestoreOutcome["kind"];
+    if (observed === null) {
+      kind = "written";
+    } else if (opts.overwrite === true) {
+      kind = "replaced";
+    } else {
+      const spot = await this.#freeRestorePath(requested, entry.h);
+      if (spot.identical) return { kind: "identical", path: spot.path, requested };
+      target = spot.path;
+      approved = null;
+      kind = "copied";
+    }
+
+    // Fetched and verified before the vault is touched at all, which also puts the download's
+    // latency *before* the final check rather than between it and the write.
+    const bytes = await this.#fetch(entry);
+
+    // Everything above describes a moment that has now passed: a confirmation can sit open
+    // while the note is edited by the user, another plugin or a sync, and a free path can be
+    // taken while the blob downloads. A stale approval is not approval for bytes nobody saw.
+    const current = await this.#localHash(target);
+    if (current !== approved) {
+      if (current === entry.h) return { kind: "identical", path: target, requested };
+      throw restoreRaceError(target);
+    }
+    await this.#vault.write(target, bytes);
+    return { kind, path: target, requested };
+  }
+
+  /**
+   * The first destination from `requested` that is either empty or already holds `hash`.
+   *
+   * Finding the content already sitting at `Note (2).md` matters: it is what a second click on
+   * the same Restore button hits, and answering it with `Note (3).md` would litter the vault
+   * with identical copies.
+   */
+  async #freeRestorePath(
+    requested: string,
+    hash: string
+  ): Promise<{ path: string; identical: boolean }> {
+    for (let n = 2; n <= MAX_RESTORE_COPIES; n++) {
+      const candidate = numberedPath(requested, n);
+      if (this.#notScanned(candidate)) continue;
+      const existing = await this.#localHash(candidate);
+      if (existing === null) return { path: candidate, identical: false };
+      if (existing === hash) return { path: candidate, identical: true };
+    }
+    throw new Error(
+      `refusing to restore "${requested}": ${MAX_RESTORE_COPIES} numbered copies beside it are ` +
+        `already taken by different content`
+    );
+  }
+
+  /** sha256 of what is at `path` right now, or null when nothing is. */
+  async #localHash(path: string): Promise<string | null> {
+    if ((await this.#vault.stat(path)) === null) return null;
+    return await sha256Hex(await this.#vault.read(path));
+  }
+
+  /** Rejects a restore source or destination this device has no business touching. */
+  #assertRestorable(path: string): void {
+    const bad = pathError(path);
+    if (bad !== null) throw new Error(`"${path}" is not a valid vault path: ${bad}`);
     if (this.#notScanned(path)) {
       throw new Error(`"${path}" is not synced by this device — refusing to restore it`);
     }
-    const entry = (await this.snapshotFiles(id))[path];
-    if (entry === undefined) throw new Error(`"${path}" is not in snapshot ${id}`);
-    await this.#vault.write(path, await this.#fetch(entry));
   }
 
   /**
@@ -2295,14 +2664,17 @@ export class SyncEngine {
         };
       }
       const h = await sha256Hex(bytes);
+      // Counted here because this is the one place the bytes exist. Only the number is kept,
+      // so the memory bound stays "lanes worth of file", not "the whole vault".
+      const count = countLines(bytes);
       const common = {
         h,
         size: bytes.byteLength,
         mtime: Number.isFinite(file.mtime) ? file.mtime : 0,
+        // Absent rather than zero for binary content: the history diff reads a missing count
+        // as "cannot attribute", and a zero would report a confident, wrong "-40 lines".
+        ...(count === null ? {} : { lines: count }),
       };
-      // Counted here because this is the one place the bytes exist. Only the number is kept,
-      // so the memory bound stays "lanes worth of file", not "the whole vault".
-      const count = countLines(bytes);
       if (this.#crypto === null) {
         return { kind: "file", path: file.path, entry: common, lines: count };
       }

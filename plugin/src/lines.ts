@@ -1,14 +1,21 @@
 /**
  * Line accounting for sync messages.
  *
- * Counts are taken while a pass already holds a file's bytes and cached per path in the
- * device-local sync state — never in the manifest, which the server and other clients read.
- * That is what makes "+35 lines" free: the only other way to know how an edited note changed
- * is to re-download its previous version on every push.
+ * Counts are taken while a pass already holds a file's bytes, which is what makes "+35 lines"
+ * free: the only other way to know how an edited note changed is to re-download its previous
+ * version on every push.
  *
- * The consequence is that an edit reports its NET line change. Replacing five lines with five
- * others reports zero, and the file count is what shows the work. Reporting a true +5/-5 needs
- * both versions of the text, which this device does not have.
+ * They land in two separate places, and the distinction matters:
+ *
+ * - The `LineCounts` map here is the **device-local cache** in `SyncState`, used to describe
+ *   what a pass just did. It is not a manifest field and must never become one.
+ * - `FileEntry.lines` is the **per-file count recorded in the snapshot itself** (see
+ *   `types.ts`), so the history browser can diff two snapshots without downloading both
+ *   versions of every file. Absent there means binary or a pre-field snapshot, never zero.
+ *
+ * Either way an edit reports its NET line change. Replacing five lines with five others reports
+ * zero, and the file count is what shows the work. Reporting a true +5/-5 needs both versions
+ * of the text, which neither of these holds.
  */
 
 /** A NUL in the first few KB means "binary" here, the same cheap test git uses. */
