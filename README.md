@@ -344,10 +344,10 @@ A release is cut by pushing a tag equal to the `manifest.json` version:
 [PolyForm Small Business 1.0.0](https://polyformproject.org/licenses/small-business/1.0.0) —
 see [LICENSE](LICENSE). Personal use is unrestricted; use *for the benefit of a company* is
 permitted only for small businesses as the license defines them. Source-available, not OSI
-open source. 
+open source.
 
 ## Support
 
-Your privacy, now verifiable. How much does it worth?
+Your privacy, now verifiable. How much is it worth to you?
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/F1F11WRQDT)
