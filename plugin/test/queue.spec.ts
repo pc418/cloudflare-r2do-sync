@@ -126,6 +126,133 @@ describe("SyncScheduler concurrency", () => {
 
     expect(engine.calls).toBe(2);
   });
+
+  it("queues an exclusive vault operation behind the active pass", async () => {
+    engine.release = () => {};
+    let operationRan = false;
+    const running = scheduler.syncNow();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const operation = scheduler.runExclusive(async () => {
+      // The public sync promise's continuation and this callback are neighbouring
+      // microtasks; the actual invariant is that the engine has left the lane first.
+      expect(engine.inFlight).toBe(0);
+      operationRan = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(operationRan).toBe(false);
+
+    engine.release?.();
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.all([running, operation]);
+    expect(operationRan).toBe(true);
+  });
+
+  it("queues a sync requested during an exclusive vault operation behind it", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const order: string[] = [];
+    const operation = scheduler.runExclusive(async () => {
+      order.push("resolution-start");
+      await gate;
+      order.push("resolution-end");
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const running = scheduler.syncNow().then(() => order.push("sync"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(engine.calls).toBe(0);
+
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.all([operation, running]);
+    expect(engine.calls).toBe(1);
+    expect(order).toEqual(["resolution-start", "resolution-end", "sync"]);
+  });
+
+  it("starts an exclusive operation without reporting a wait when the lane is free", async () => {
+    const seen: string[] = [];
+
+    await scheduler.runExclusive(async () => seen.push("ran"), {
+      onQueued: () => seen.push("queued"),
+      onStart: () => seen.push("start"),
+    });
+
+    // No `queued`: nothing was ahead of it. A caller that showed "waiting" here would be
+    // describing a wait that did not happen.
+    expect(seen).toEqual(["start", "ran"]);
+  });
+
+  it("reports the wait synchronously, and the start only once the pass releases", async () => {
+    engine.release = () => {};
+    const seen: string[] = [];
+    const running = scheduler.syncNow();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const operation = scheduler.runExclusive(async () => seen.push("ran"), {
+      onQueued: () => seen.push("queued"),
+      onStart: () => seen.push("start"),
+    });
+    // Synchronous: the click that caused the wait and the label describing it are one tick.
+    expect(seen).toEqual(["queued"]);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual(["queued"]);
+
+    engine.release?.();
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.all([running, operation]);
+    expect(seen).toEqual(["queued", "start", "ran"]);
+  });
+
+  it("keeps a queued operation waiting across the running pass's retry backoff", async () => {
+    engine.results = [new ApiError("unavailable", 503)];
+    const seen: string[] = [];
+    const running = scheduler.syncNow();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const operation = scheduler.runExclusive(async () => {}, {
+      onQueued: () => seen.push("queued"),
+      onStart: () => seen.push("start"),
+    });
+    // Backoff belongs to the entry that is retrying, so the waiter stays a waiter through it
+    // rather than being told it started and then stalling.
+    await vi.advanceTimersByTimeAsync(999);
+    expect(seen).toEqual(["queued"]);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.all([running, operation]);
+    expect(seen).toEqual(["queued", "start"]);
+  });
+
+  it("never starts an operation that was still waiting when the scheduler stopped", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const first = scheduler.runExclusive(() => gate);
+    await vi.advanceTimersByTimeAsync(0);
+    const seen: string[] = [];
+    const queued = scheduler.runExclusive(async () => seen.push("ran"), {
+      onStart: () => seen.push("start"),
+    });
+
+    scheduler.stop();
+    release();
+    await expect(first).resolves.toBeUndefined();
+    await expect(queued).rejects.toThrow(/scheduler stopped/);
+    // Not merely un-run: a caller that saw `onStart` would report work that never touched
+    // the vault as having begun.
+    expect(seen).toEqual([]);
+  });
+
+  it("propagates an exclusive operation failure and keeps the lane usable", async () => {
+    const failed = scheduler.runExclusive(async () => {
+      throw new Error("resolution failed");
+    });
+
+    await expect(failed).rejects.toThrow(/resolution failed/);
+    await expect(scheduler.syncNow()).resolves.toEqual(expect.objectContaining({ head: "01X" }));
+    expect(engine.calls).toBe(1);
+  });
 });
 
 describe("SyncScheduler forced passes", () => {
@@ -267,6 +394,30 @@ describe("SyncScheduler retry", () => {
     engine.release?.();
     await vi.advanceTimersByTimeAsync(0);
     await Promise.allSettled([running, drain]);
+    expect(drained).toBe(true);
+  });
+
+  it("stopAndWait() drains a started exclusive operation and rejects work queued behind it", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const operation = scheduler.runExclusive(async () => {
+      await gate;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const queued = scheduler.runExclusive(async () => {
+      throw new Error("must not run");
+    });
+
+    let drained = false;
+    const drain = scheduler.stopAndWait().then(() => (drained = true));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(drained).toBe(false);
+
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(operation).resolves.toBeUndefined();
+    await expect(queued).rejects.toThrow(/scheduler stopped/);
+    await drain;
     expect(drained).toBe(true);
   });
 });

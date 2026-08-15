@@ -84,7 +84,7 @@ import {
 } from "./log";
 import { countInScope, parseGlobs, DEFAULT_CONFIG_DIR } from "./paths";
 import { DEFAULT_LANES, MAX_LANES, clampLanes, mapPool } from "./pool";
-import { SyncScheduler } from "./queue";
+import { SyncScheduler, type ExclusiveHooks } from "./queue";
 import {
   SETUP_ACTION,
   decodeSetupPayload,
@@ -338,6 +338,27 @@ const MIN_START_NOTICE_MS = 1500;
  * The command a hotkey is worth having. Named once because the hotkey manager keys bindings by
  * the *qualified* id (`<plugin id>:sync-now`), so a rename here would silently orphan a binding.
  */
+/**
+ * Why a conflict cannot be resolved while one of the three whole-vault rewrites runs.
+ *
+ * Each names the operation and what to do, because the alternative — queueing the choice
+ * behind work that can take minutes — is the unresponsive button this serialisation exists to
+ * remove. Each is shown to the user verbatim, so they are sentences, not codes.
+ */
+const ENCRYPTION_REWRITE_BLOCK =
+  "Encryption is being changed, which rewrites every file on the remote. Wait for it to " +
+  "finish, then resolve this conflict.";
+const FORCE_PULL_BLOCK =
+  "The remote is being pulled over this vault. Wait for it to finish, then resolve this " +
+  "conflict — the pull may already have settled it.";
+const RESTORE_ALL_BLOCK =
+  "A snapshot is being restored over this vault. Wait for it to finish, then resolve this " +
+  "conflict — the restore may already have settled it.";
+
+/** What a pressed conflict-choice button says while it waits, and while it works. */
+const QUEUED_LABEL = "Waiting for the current sync…";
+const RESOLVING_LABEL = "Resolving…";
+
 const SYNC_COMMAND = "sync-now";
 
 /**
@@ -384,6 +405,16 @@ export default class LogSyncPlugin extends Plugin {
   #engine: SyncEngine | null = null;
   #generation = 0;
   #schedulerDrain: Promise<void> = Promise.resolve();
+  /**
+   * Why a whole-vault rewrite currently forbids a conflict resolution, or null.
+   *
+   * The engine has its own one-operation-at-a-time mutex, but `restoreAll`, `forcePull` and
+   * `migrateEncryption` write the vault *through* it while a conflict choice writes through
+   * `ObsidianVault` directly — so that mutex cannot see the second writer, and the scheduler
+   * lane cannot either, because none of the three is a sync pass. This holds a sentence rather
+   * than a flag so the refusal names what is happening instead of leaking an internal error.
+   */
+  #vaultRewrite: string | null = null;
   #persistChain: Promise<void> = Promise.resolve();
   #stateServerUrl = "";
   #statusBar: HTMLElement | null = null;
@@ -1139,7 +1170,7 @@ export default class LogSyncPlugin extends Plugin {
       snapshotFiles: (id) => engine.snapshotFiles(id),
       inspectRestore: (id, path) => engine.inspectRestore(id, path),
       restoreFile: (id, path, opts) => engine.restoreFile(id, path, opts),
-      restoreAll: (id) => engine.restoreAll(id),
+      restoreAll: (id) => this.#withVaultRewrite(RESTORE_ALL_BLOCK, () => engine.restoreAll(id)),
       historyLimit: this.settings.historyLimit,
       syncNow: () => this.syncNow(),
     }).open();
@@ -1188,17 +1219,22 @@ export default class LogSyncPlugin extends Plugin {
         const notice = new Notice("R2DO Sync: pulling the remote over this vault…", 0);
         this.#interactive++;
         try {
-          // Pinned to the snapshot the confirmation described. A head published since was
-          // never in the counts the operator agreed to, and this action overwrites files.
-          const result = await engine.forcePull(summary.head);
-          notice.hide();
-          new Notice(
-            `R2DO Sync: wrote ${result.written} file(s), removed ${result.removed}` +
-              `${result.parked.length > 0 ? `, kept ${result.parked.length} local copy(s)` : ""}. ` +
-              "Publishing the result…",
-            8000
-          );
-          await this.syncNow();
+          // Held across the publish too: the whole sequence rewrites this vault, and a
+          // conflict choice landing between the write and the commit would publish a state
+          // neither the pull nor the user chose.
+          await this.#withVaultRewrite(FORCE_PULL_BLOCK, async () => {
+            // Pinned to the snapshot the confirmation described. A head published since was
+            // never in the counts the operator agreed to, and this action overwrites files.
+            const result = await engine.forcePull(summary.head);
+            notice.hide();
+            new Notice(
+              `R2DO Sync: wrote ${result.written} file(s), removed ${result.removed}` +
+                `${result.parked.length > 0 ? `, kept ${result.parked.length} local copy(s)` : ""}. ` +
+                "Publishing the result…",
+              8000
+            );
+            await this.syncNow();
+          });
         } catch (e) {
           notice.hide();
           new Notice(`R2DO Sync could not pull the remote over this device: ${message(e)}`, 0);
@@ -1543,26 +1579,36 @@ export default class LogSyncPlugin extends Plugin {
     }
 
     this.#pendingEncryptionTransition = target;
-    await this.#persist();
-    await scheduler.stopAndWait();
-    try {
-      const migrated = await engine.migrateEncryption(targetCrypto);
-      this.#activateEncryptionTarget(target);
-      this.#pendingEncryptionTransition = null;
-      // Force the settings document to be rewritten under the target mode/key.
-      this.#sharedSettings = null;
-      await this.saveSettings();
-      new Notice(
-        `R2DO Sync migrated ${migrated.files} file(s) to ${target.mode === "encrypted" ? "encrypted" : "plaintext"} storage.`,
-        10_000
-      );
-    } catch (error) {
-      this.#pendingEncryptionTransition = null;
+    // Held across the rebuild, not just the migration: the block is released by the `finally`
+    // only once a usable scheduler is installed again.
+    await this.#withVaultRewrite(ENCRYPTION_REWRITE_BLOCK, async () => {
       await this.#persist();
-      await this.rebuild();
-      new Notice(`Encryption migration failed: ${message(error)}`, 0);
-      throw error;
-    }
+      // Stopped, deliberately NOT retired. `#retireScheduler()` bumps `#generation`, and the
+      // engine's `StateStore` refuses every load and save from an older generation — so
+      // retiring here kills the migration this method is about to run, with "sync
+      // configuration changed". The stopped scheduler therefore stays installed for the
+      // duration, and `#vaultRewrite` above is what keeps a conflict choice from meeting it
+      // and being told "sync scheduler stopped".
+      await scheduler.stopAndWait();
+      try {
+        const migrated = await engine.migrateEncryption(targetCrypto);
+        this.#activateEncryptionTarget(target);
+        this.#pendingEncryptionTransition = null;
+        // Force the settings document to be rewritten under the target mode/key.
+        this.#sharedSettings = null;
+        await this.saveSettings();
+        new Notice(
+          `R2DO Sync migrated ${migrated.files} file(s) to ${target.mode === "encrypted" ? "encrypted" : "plaintext"} storage.`,
+          10_000
+        );
+      } catch (error) {
+        this.#pendingEncryptionTransition = null;
+        await this.#persist();
+        await this.rebuild();
+        new Notice(`Encryption migration failed: ${message(error)}`, 0);
+        throw error;
+      }
+    });
   }
 
   #activateEncryptionTarget(target: PendingEncryptionTransition): void {
@@ -1732,7 +1778,7 @@ export default class LogSyncPlugin extends Plugin {
       outstanding,
       {
         readText: (path) => this.#readTextIfPresent(path),
-        resolve: (info, choice) => this.resolveConflict(info, choice),
+        resolve: (info, choice, hooks) => this.resolveConflict(info, choice, hooks),
       },
       present
     ).open();
@@ -1777,10 +1823,55 @@ export default class LogSyncPlugin extends Plugin {
    * Nothing is committed. The next ordinary pass publishes the outcome, which keeps this off the
    * commit path entirely.
    */
-  async resolveConflict(info: ConflictInfo, choice: ConflictChoice): Promise<void> {
-    if (this.#phase === "syncing") {
-      throw new Error("a sync is running — wait for it to finish, then resolve this conflict");
+  async resolveConflict(
+    info: ConflictInfo,
+    choice: ConflictChoice,
+    hooks?: ExclusiveHooks
+  ): Promise<void> {
+    // Checked before anything is queued: these rewrites run for as long as they run, and a
+    // button that waits minutes is the dead-button complaint again rather than a fix for it.
+    if (this.#vaultRewrite !== null) throw new Error(this.#vaultRewrite);
+    const scheduler = this.#scheduler;
+    if (scheduler !== null) {
+      await scheduler.runExclusive(() => this.#resolveConflictOnDisk(info, choice), hooks);
+      return;
     }
+    // A rebuild hides its scheduler immediately, then drains the old one before installing
+    // the replacement. Waiting here avoids racing the old pass; re-checking afterwards lets
+    // the choice join the replacement's lane if configuration is still usable. With no
+    // scheduler after the drain, no pass can overlap a direct local resolution.
+    //
+    // Deliberately no `onQueued`: on a device that cannot sync at all — no server URL, no
+    // key — this is the ordinary path and the drain is already resolved, so announcing a wait
+    // for "the current sync" would describe a pass that does not exist.
+    await this.#schedulerDrain;
+    if (this.#vaultRewrite !== null) throw new Error(this.#vaultRewrite);
+    const replacement = this.#scheduler;
+    if (replacement !== null) {
+      await replacement.runExclusive(() => this.#resolveConflictOnDisk(info, choice), hooks);
+      return;
+    }
+    hooks?.onStart?.();
+    await this.#resolveConflictOnDisk(info, choice);
+  }
+
+  /**
+   * Holds the whole-vault-rewrite block for one operation.
+   *
+   * Restores the previous reason rather than clearing, so a rewrite that runs a sync inside
+   * itself — `forcePull` publishes its result — does not unblock halfway through.
+   */
+  async #withVaultRewrite<T>(reason: string, run: () => Promise<T>): Promise<T> {
+    const previous = this.#vaultRewrite;
+    this.#vaultRewrite = reason;
+    try {
+      return await run();
+    } finally {
+      this.#vaultRewrite = previous;
+    }
+  }
+
+  async #resolveConflictOnDisk(info: ConflictInfo, choice: ConflictChoice): Promise<void> {
     const vault = new ObsidianVault(this.app);
     const present = await this.#presentPaths([info]);
     const sides = conflictSides(info);
@@ -2773,13 +2864,24 @@ export class ConflictReportModal extends Modal {
   #conflicts: ConflictInfo[];
   /** One resolution at a time. A second click on a button mid-write resolves nothing twice. */
   #busy = false;
+  /**
+   * Every choice button currently on screen, rebuilt by each `#render()`.
+   *
+   * A resolution moves files that the *other* rows describe, so accepting one click has to
+   * take all of them out of service — not just the four in the row that was pressed.
+   */
+  #choiceButtons: Array<{ setDisabled(v: boolean): unknown }> = [];
 
   constructor(
     app: App,
     conflicts: readonly ConflictInfo[],
     private readonly actions: {
       readText: (path: string) => Promise<string | null>;
-      resolve: (info: ConflictInfo, choice: ConflictChoice) => Promise<void>;
+      resolve: (
+        info: ConflictInfo,
+        choice: ConflictChoice,
+        hooks?: ExclusiveHooks
+      ) => Promise<void>;
     } | null = null,
     /**
      * Which of the pairs' files are on disk right now. Empty means "not checked", which is
@@ -2804,6 +2906,8 @@ export class ConflictReportModal extends Modal {
   #render(): void {
     const { contentEl } = this;
     contentEl.empty();
+    // The old buttons are gone with the DOM; keeping references would disable nothing.
+    this.#choiceButtons = [];
     const outstanding = this.#conflicts;
     contentEl.createEl("h2", {
       text: `${outstanding.length} conflict${outstanding.length === 1 ? "" : "s"}`,
@@ -2910,6 +3014,7 @@ export class ConflictReportModal extends Modal {
       row.addButton((b) => {
         const blocked = this.#blocked(c, choice);
         if (blocked !== null) b.setDisabled(true).setTooltip(blocked);
+        this.#choiceButtons.push(b);
         b.setButtonText(text).onClick(async () => {
           // Belt and braces: the button is disabled, and the fake used in tests still fires
           // a disabled button's handler. A click that cannot succeed must not half-run.
@@ -2918,13 +3023,30 @@ export class ConflictReportModal extends Modal {
           // resolves an already-resolved pair and reports a failure for work that succeeded.
           if (this.#busy) return;
           this.#busy = true;
+          // Synchronously, in the same tick as the click: the wait can be a whole sync pass
+          // plus its retry backoff, and a window that looks identical before and after the
+          // press is how a working button gets reported as dead.
+          for (const other of this.#choiceButtons) other.setDisabled(true);
+          b.setButtonText(RESOLVING_LABEL);
           try {
-            await this.actions!.resolve(c, choice);
+            await this.actions!.resolve(c, choice, {
+              // Block bodies: a `Setting`/`ButtonComponent` is structurally thenable, so
+              // returning one from a void callback trips the promise lint.
+              onQueued: () => {
+                b.setButtonText(QUEUED_LABEL);
+              },
+              onStart: () => {
+                b.setButtonText(RESOLVING_LABEL);
+              },
+            });
             new Notice(`R2DO Sync: ${c.path} resolved`);
             this.#conflicts = this.#conflicts.filter((other) => other !== c);
             this.#render();
           } catch (e) {
             new Notice(`R2DO Sync could not resolve ${c.path}: ${message(e)}`, 10_000);
+            // Rebuilt rather than re-enabled one by one: `#render` is what decides which
+            // choices are possible at all, and a failure must not resurrect an impossible one.
+            this.#render();
           } finally {
             this.#busy = false;
           }

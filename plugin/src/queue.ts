@@ -9,6 +9,21 @@ export interface SchedulerOptions {
   onError?: (error: Error) => void;
 }
 
+/**
+ * Progress for one exclusive operation, so a caller can say which of the two waits it is in.
+ *
+ * Deliberately hooks rather than a `busy` flag the caller polls: "was the lane occupied when I
+ * clicked" is not the same question as "has my operation started", and only the second one can
+ * end a wait. Both are optional, and neither carries wording — the scheduler has no business
+ * knowing what a button says.
+ */
+export interface ExclusiveHooks {
+  /** Work was already in the lane, so this operation has to wait. Called synchronously. */
+  onQueued?: () => void;
+  /** This operation now owns the lane and is about to run. */
+  onStart?: () => void;
+}
+
 const DEFAULT_DEBOUNCE_MS = 2000;
 const DEFAULT_RETRIES_MS = [1000, 4000, 15_000];
 
@@ -36,6 +51,15 @@ export class SyncScheduler {
   readonly #onError?: (error: Error) => void;
 
   #timer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * The one lane for every operation that must not overlap a sync pass. Keeping this separate
+   * from `#running` preserves ordinary-pass coalescing: `#running` answers whether a sync has
+   * already been requested, while this tail also covers short local vault mutations queued
+   * before or after it.
+   */
+  #lane: Promise<void> = Promise.resolve();
+  /** Entries enqueued and not yet settled. Non-zero means the next one has to wait. */
+  #laneDepth = 0;
   #running: Promise<SyncResult> | null = null;
   #pending = false;
   #stopped = false;
@@ -88,16 +112,59 @@ export class SyncScheduler {
       }
       return this.#running;
     }
-    this.#running = this.#runWithRetry(opts);
+    this.#running = this.#enqueue(() => this.#runWithRetry(opts));
     try {
       return await this.#running;
     } finally {
+      // No identity check is needed: the early return above means nothing can install a
+      // different `#running` while this one is outstanding.
       this.#running = null;
       if (this.#pending) {
         this.#pending = false;
         this.#schedule();
       }
     }
+  }
+
+  /**
+   * Runs a local vault mutation in the same exclusive lane as sync passes.
+   *
+   * A conflict choice can therefore wait behind a pass instead of failing merely because the
+   * click landed during one. A later pass also waits behind the mutation, closing the race an
+   * `await currentPass` followed by an unguarded write would leave. Operation failures belong
+   * to their caller and are not reported as sync failures; either way, the lane stays usable.
+   *
+   * The wait can be long — a pass plus its retry backoff — so `hooks` report which wait the
+   * caller is in. Backoff is part of the running entry, so an operation queued behind a
+   * retrying pass stays "queued" for all of it, which is the truth.
+   */
+  runExclusive<T>(operation: () => Promise<T>, hooks?: ExclusiveHooks): Promise<T> {
+    return this.#enqueue(operation, hooks);
+  }
+
+  #enqueue<T>(operation: () => Promise<T>, hooks?: ExclusiveHooks): Promise<T> {
+    if (this.#stopped) return Promise.reject(new Error("sync scheduler stopped"));
+    // Before the increment, and synchronous, so a caller can paint "waiting" in the same tick
+    // as the click that caused it.
+    if (this.#laneDepth > 0) hooks?.onQueued?.();
+    this.#laneDepth++;
+    const queued = this.#lane.then(async () => {
+      try {
+        // Retirement lets an operation that already started drain, but work that was only
+        // waiting must never mutate through a scheduler whose configuration is obsolete.
+        if (this.#stopped) throw new Error("sync scheduler stopped");
+        hooks?.onStart?.();
+        return await operation();
+      } finally {
+        this.#laneDepth--;
+      }
+    });
+    // The tail itself never rejects: one failed operation cannot poison every later one.
+    this.#lane = queued.then(
+      () => {},
+      () => {}
+    );
+    return queued;
   }
 
   async #runWithRetry(opts: SyncPassOptions): Promise<SyncResult> {
@@ -154,13 +221,9 @@ export class SyncScheduler {
     }
   }
 
-  /** Retires this scheduler and waits until an already-running engine pass has settled. */
+  /** Retires this scheduler and waits until every already-started/queued lane entry settles. */
   async stopAndWait(): Promise<void> {
     this.stop();
-    try {
-      await this.#running;
-    } catch {
-      // Retirement deliberately rejects stopped work; the caller only needs it drained.
-    }
+    await this.#lane;
   }
 }
