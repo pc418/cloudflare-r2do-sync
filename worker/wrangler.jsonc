@@ -25,6 +25,10 @@
   // different type than production. Shrinking either one widens the window in which a device
   // that has been away loses its merge base (conflict copies instead of clean diff3) and
   // cannot verify that a served head descends from the one it last absorbed.
-  "vars": { "GC_KEEP_DAYS": "30", "GC_KEEP_COUNT": "50" },
+  // Raised from 30/50 on 2026-08-15: at ~50 commits on a busy day the count window was spent
+  // within that day, so it guaranteed no history at all and `keepDays` was the whole promise.
+  // The two answer different questions — count is the floor a vault keeps once it goes quiet
+  // (500 ≈ a week at that peak rate), days is the restore reach while it is active.
+  "vars": { "GC_KEEP_DAYS": "90", "GC_KEEP_COUNT": "500" },
   "triggers": { "crons": ["0 4 * * *"] }
 }

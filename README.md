@@ -304,9 +304,11 @@ unreadable.
 - 100 MiB per file (Workers request-body limit); larger files are skipped and reported.
 - 100,000 files per snapshot.
 - Merge granularity is a line; two edits inside one line conflict.
-- Nightly garbage collection (04:00 UTC) keeps the last 50 snapshots **or** 30 days of
-  them, whichever reaches further back, plus every blob they reference. Both numbers are
-  `GC_KEEP_COUNT` / `GC_KEEP_DAYS` in `worker/wrangler.jsonc`; edit them and redeploy.
+- Nightly garbage collection (04:00 UTC) keeps the last 500 snapshots **or** 90 days of
+  them, whichever reaches further back, plus every blob they reference. The two answer
+  different questions: on a vault that syncs often the count is spent within a day, so the
+  days figure is the real reach, and the count is what a vault keeps once it goes quiet.
+  Both are `GC_KEEP_COUNT` / `GC_KEEP_DAYS` in `worker/wrangler.jsonc`; edit them and redeploy.
   Retained snapshots restate the whole path map, so this — not file content — is usually
   what a vault's storage is spent on. Shrinking it also shortens how long a device can be
   offline and still merge cleanly against a shared base.

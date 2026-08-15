@@ -66,7 +66,7 @@ describe("gcRetention", () => {
       keepCount: 3,
     });
     // What this deployment actually ships, so a change to wrangler.jsonc is a visible edit here.
-    expect(gcRetention(env)).toEqual({ keepDays: 30, keepCount: 50 });
+    expect(gcRetention(env)).toEqual({ keepDays: 90, keepCount: 500 });
   });
 
   it("refuses a missing or nonsensical window instead of guessing one", () => {
@@ -92,10 +92,10 @@ describe("runGc retention configuration", () => {
     const now = Date.now() + 10 * DAY;
     const { old } = await twoSnapshots();
 
-    // 30/50 as deployed: a ten-day-old snapshot is well inside the window.
+    // 90/500 as deployed: a ten-day-old snapshot is well inside the window.
     const kept = await runGc(env, { now, minAgeMs: 0 });
     expect(kept.skipped).toBeNull();
-    expect(kept.retention).toEqual({ keepDays: 30, keepCount: 50 });
+    expect(kept.retention).toEqual({ keepDays: 90, keepCount: 500 });
     expect(kept.deletedManifests).toBe(0);
     expect(await env.VAULT.head(`manifests/${old}.json`)).not.toBeNull();
 
@@ -144,6 +144,6 @@ describe("POST /api/gc", () => {
     const res = await SELF.fetch(`${BASE}/api/gc`, authed(ADMIN, { method: "POST" }));
     expect(res.status).toBe(200);
     const report = (await res.json()) as { retention: { keepDays: number; keepCount: number } };
-    expect(report.retention).toEqual({ keepDays: 30, keepCount: 50 });
+    expect(report.retention).toEqual({ keepDays: 90, keepCount: 500 });
   });
 });
