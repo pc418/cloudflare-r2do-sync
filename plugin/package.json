@@ -6,7 +6,8 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
+    "test:live": "vitest run --config vitest.live.config.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/live",
     "lint": "eslint .",
     "build": "node build.mjs",
     "validate": "node ../scripts/release-validate.mjs"

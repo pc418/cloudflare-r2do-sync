@@ -541,6 +541,33 @@ export interface EncryptionMigrationResult {
   files: number;
 }
 
+/**
+ * Bounds on `SyncEngine.isEffectivelyEmpty`. Both exist so the check stays cheap on a vault
+ * that is obviously not empty: neither is a statement about what a user may keep, only about
+ * when to stop looking and answer "not empty".
+ */
+export const EMPTY_VAULT_MAX_FILES = 20;
+export const EMPTY_VAULT_MAX_BYTES = 4096;
+
+/**
+ * Whether these bytes carry nothing a person wrote: no bytes at all, or text that is entirely
+ * whitespace.
+ *
+ * Binary content is never blank, however small. A lone replacement character is how a failed
+ * UTF-8 decode shows up, and guessing that such a file is "empty enough not to publish" would
+ * quietly drop somebody's file — so anything that does not decode cleanly counts as content.
+ */
+export function isBlankContent(bytes: Uint8Array): boolean {
+  if (bytes.byteLength === 0) return true;
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return false;
+  }
+  return text.trim() === "";
+}
+
 export interface SyncPassOptions {
   /** Internal scheduler flag: startup/resume/manual/periodic passes are correctness audits. */
   fullScan?: boolean;
@@ -579,6 +606,22 @@ export interface SyncPassOptions {
    * — an ordinary `keepLocal` pass, which merges nothing but also promised nothing.
    */
   previewedHead?: string | null;
+  /**
+   * Run this ONE pass as if the direction were `pull-only`: absorb the remote, write nothing
+   * back, commit nothing.
+   *
+   * This exists for the first pass of a device whose vault holds nothing worth publishing — a
+   * fresh install that has just been handed a setup link. Such a device cannot damage the
+   * remote (a first sync has no base, so `planFile` has no deletion to reach), but it *can*
+   * publish the blank note the app created on its way in, and the ordinary first-sync gate
+   * promises "everything here is published", which is the wrong thing to tell someone whose
+   * device is empty.
+   *
+   * Only ever a downgrade, and only from `two-way`: an operator who chose `push-only` chose it,
+   * and refused rather than silently reversed. Rejected with `keepLocal`/`reroot`, which are
+   * publishes by definition.
+   */
+  pullOnly?: boolean;
 }
 
 /** What `forcePull` would do, so it can be shown before it is done. */
@@ -678,6 +721,13 @@ export class SyncEngine {
   #state: SyncState | null = null;
   readonly #dirtyPaths = new Set<string>();
   #dirtyRequiresFullScan = false;
+  /**
+   * The direction *this pass* runs in, which is `#mode` except when a caller downgrades one
+   * pass to `pull-only` (see `SyncPassOptions.pullOnly`). A field rather than a parameter
+   * because the pass is already serialised against itself — `sync()` refuses to start while
+   * `phase === "syncing"` — so there is never a second pass to read a value meant for this one.
+   */
+  #passMode: SyncMode = "two-way";
   status: SyncStatus = { phase: "idle" };
 
   constructor(opts: SyncEngineOptions) {
@@ -693,6 +743,7 @@ export class SyncEngine {
       throw new Error(`unknown sync mode ${String(opts.mode)}`);
     }
     this.#mode = opts.mode ?? "two-way";
+    this.#passMode = this.#mode;
     if (opts.syncConfigDir !== undefined && typeof opts.syncConfigDir !== "boolean") {
       throw new Error("syncConfigDir must be a boolean");
     }
@@ -747,6 +798,12 @@ export class SyncEngine {
           "files over the remote. Change the direction first."
       );
     }
+    if (opts.pullOnly === true && keepLocal) {
+      throw new Error("pullOnly cannot be combined with a forced push or a reroot");
+    }
+    // A downgrade only, and only from two-way. Applying it to `push-only` would reverse a
+    // direction the operator set on purpose, which is not this option's business.
+    this.#passMode = opts.pullOnly === true && this.#mode === "two-way" ? "pull-only" : this.#mode;
     if (this.status.phase === "halted") {
       return this.#result({ status: "halted", reason: this.status.message ?? "sync halted" });
     }
@@ -1029,7 +1086,7 @@ export class SyncEngine {
         baseBlobs = remoteBlobs;
       }
 
-      if (this.#mode === "pull-only") {
+      if (this.#passMode === "pull-only") {
         if (remoteFiles !== null) {
           this.#state = {
             lastSyncedHead: baseHead,
@@ -2590,6 +2647,45 @@ export class SyncEngine {
       throw new Error(`internal: ciphertext hash for "${path}" is ${cipherHash}, expected ${hash}`);
     }
     await this.#api.putBlob(hash, cipher);
+  }
+
+  /**
+   * Whether this vault holds nothing worth publishing.
+   *
+   * True for a vault with no syncable files at all, and for one whose every syncable file is
+   * empty or nothing but whitespace — which is what a fresh install looks like after the app
+   * has created its blank first note. Excluded, out-of-scope, hard-skipped and invalid paths
+   * are not counted, because none of them would be published either way.
+   *
+   * Deliberately cheap and deliberately conservative. It reads no file the listing has already
+   * settled, it never hashes or encrypts anything, and every uncertainty resolves to "not
+   * empty": treating a vault with real notes as empty would skip publishing them.
+   */
+  async isEffectivelyEmpty(): Promise<boolean> {
+    const candidates: VaultFile[] = [];
+    for (const file of await this.#vault.list()) {
+      if (alwaysSkip(file.path, this.#configDir)) continue;
+      // Invalid paths are reported and never published, so they say nothing about emptiness.
+      if (pathError(file.path) !== null) continue;
+      if (
+        (!this.#syncConfigDir && isConfigPath(file.path, this.#configDir)) ||
+        this.#isExcluded(file.path) ||
+        (this.#hasOnlyPaths && !this.#isIncluded(file.path))
+      ) {
+        continue;
+      }
+      // Settled by the listing: a file this large is content, whatever its bytes are. A
+      // non-finite Android stat is not evidence either way, so it falls through and is read.
+      if (Number.isFinite(file.size) && file.size > EMPTY_VAULT_MAX_BYTES) return false;
+      candidates.push(file);
+      // Past this many files it is not the brand-new device this exists for, and reading them
+      // all to prove they are blank would cost more than the question is worth.
+      if (candidates.length > EMPTY_VAULT_MAX_FILES) return false;
+    }
+    for (const file of candidates) {
+      if (!isBlankContent(await this.#vault.read(file.path))) return false;
+    }
+    return true;
   }
 
   async #buildSnapshot(options?: SnapshotBuildOptions): Promise<Snapshot> {

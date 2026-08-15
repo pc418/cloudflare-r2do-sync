@@ -93,6 +93,22 @@ The random key is recommended. **Set from passphrase** derives the same 256-bit 
 device (PBKDF2-SHA256, 600,000 iterations, public per-vault salt), but a weak passphrase is
 open to offline guessing. Only the derived key is stored.
 
+### What this creates in your Cloudflare account
+
+The plugin is **R2DO Sync**, but what setup creates on Cloudflare is named after this
+project's original name, `obsidian-log-sync`. That is what to look for in the dashboard:
+
+| Cloudflare | Name | Where |
+| --- | --- | --- |
+| Worker | `obsidian-log-sync` | Workers & Pages — serves `obsidian-log-sync.<your-subdomain>.workers.dev` |
+| R2 bucket | `obsidian-log-sync` | R2 — every snapshot and blob your vault has |
+| Durable Object | `VaultLock` | the Worker's bindings — holds the authoritative head |
+
+All three come from `worker/wrangler.jsonc`. Renaming them is a migration, not an edit: a new
+Worker name means a new, empty Durable Object, R2 buckets cannot be renamed at all, and a
+renamed class orphans the existing namespace unless the migration says `renamed_classes`.
+`scripts/deploy.mjs` refuses to deploy a rename it would fork rather than perform.
+
 ### Adding another device
 
 On the configured device, open **Set up another device**. It exports the server URL, token

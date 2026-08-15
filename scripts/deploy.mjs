@@ -12,7 +12,12 @@ import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { bucketOwnershipClaim, ensureR2Bucket, loadWorkerDeployConfig } from "./worker-config.mjs";
+import {
+  assertNoRenameFork,
+  bucketOwnershipClaim,
+  ensureR2Bucket,
+  loadWorkerDeployConfig,
+} from "./worker-config.mjs";
 import {
   loadEnvFile,
   renderRestDeployCheck,
@@ -33,7 +38,12 @@ export const WORKER_OBSERVABILITY = { enabled: true, head_sampling_rate: 0.01 };
  * a fresh one that replaced it. Rotation is safe — access tokens live in the Durable
  * Object — and it is what guarantees every run can issue tokens afterwards.
  */
-export async function deployViaRest({ log = console.log, confirm = null, adoptBucket = false } = {}) {
+export async function deployViaRest({
+  log = console.log,
+  confirm = null,
+  adoptBucket = false,
+  migrateRename = false,
+} = {}) {
   const {
     scriptName: SCRIPT_NAME,
     compatibilityDate: COMPAT_DATE,
@@ -117,6 +127,17 @@ export async function deployViaRest({ log = console.log, confirm = null, adoptBu
   // path has always named its target; this one used to create resources on whatever account
   // CLOUDFLARE_ACCOUNT_ID happened to hold. `confirm` is null when setup.mjs already asked.
   const ownedClaim = (process.env.VAULT_BUCKET_OWNED ?? fileEnv.VAULT_BUCKET_OWNED)?.trim() || null;
+
+  // Before the confirmation screen, not after: a fork is not something to be talked into.
+  assertNoRenameFork({
+    scriptName: SCRIPT_NAME,
+    bucket: BUCKET,
+    accountId: ACCOUNT_ID,
+    workerUrl: process.env.WORKER_URL ?? fileEnv.WORKER_URL ?? null,
+    bucketOwned: ownedClaim,
+    allowRename: migrateRename,
+  });
+
   if (confirm !== null) {
     const proceed = await confirm(
       renderRestDeployCheck({
@@ -253,11 +274,24 @@ if (invokedDirectly) {
     const argv = process.argv.slice(2);
     const adoptBucket = argv.includes("--adopt-bucket");
     const assumeYes = argv.includes("--yes") || argv.includes("-y");
-    const unknown = argv.find((a) => !["--adopt-bucket", "--yes", "-y"].includes(a));
-    if (unknown) throw new Error(`unknown option "${unknown}"\n\nusage: node scripts/deploy.mjs [--adopt-bucket] [--yes]`);
+    const migrateRename = argv.includes("--migrate-rename");
+    const known = ["--adopt-bucket", "--yes", "-y", "--migrate-rename"];
+    const unknown = argv.find((a) => !known.includes(a));
+    if (unknown) {
+      throw new Error(
+        `unknown option "${unknown}"\n\n` +
+          "usage: node scripts/deploy.mjs [--adopt-bucket] [--migrate-rename] [--yes]"
+      );
+    }
+    // --migrate-rename is never implied by --yes. Skipping the confirmation screen is a
+    // statement about typing; standing up a second deployment is not.
+    if (migrateRename && assumeYes) {
+      throw new Error("--migrate-rename cannot be combined with --yes: confirm the target by hand");
+    }
 
     const { url, adminToken, adminTokenKept, bucketClaim } = await deployViaRest({
       adoptBucket,
+      migrateRename,
       confirm: assumeYes ? null : askToProceed,
     });
     // The admin credential is never shown to a person — it lives in ./.env so the helper

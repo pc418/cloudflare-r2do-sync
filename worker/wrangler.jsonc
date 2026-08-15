@@ -3,6 +3,12 @@
 // test runtime bindings. NEVER deploy with the wrangler CLI — the local wrangler
 // login belongs to a DIFFERENT Cloudflare account. Deploys go through
 // scripts/deploy.mjs (REST API, token from ../.env).
+//
+// These names are LIVE. `name` is the deployed Worker and half of its workers.dev hostname;
+// `bucket_name` holds the vault; `class_name` owns the authoritative head. Renaming any of
+// them is a migration, not an edit — a new script name is a new, empty Durable Object, and a
+// renamed class needs `renamed_classes` or the existing namespace is orphaned. `deploy.mjs`
+// refuses the fork (`assertNoRenameFork`); see the runbook before changing one.
 {
   "name": "obsidian-log-sync",
   "main": "src/index.ts",

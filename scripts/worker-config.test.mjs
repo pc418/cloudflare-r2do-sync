@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { bucketOwnershipClaim, ensureR2Bucket, parseWorkerDeployConfig } from "./worker-config.mjs";
+import {
+  assertNoRenameFork,
+  bucketOwnershipClaim,
+  ensureR2Bucket,
+  parseWorkerDeployConfig,
+} from "./worker-config.mjs";
 
 const VALID = `
 // deployment config
@@ -134,6 +139,57 @@ test("bucket preflight fails instead of treating API errors as absence", async (
     ensureR2Bucket(async () => ({ status: 403, body: { error: "denied" } }), "sync-bucket"),
     /bucket preflight failed.*403/
   );
+});
+
+test("a rename in the config is refused as the fork it would be", () => {
+  const live = {
+    scriptName: "sync-test",
+    bucket: "sync-bucket",
+    accountId: "acct-1",
+    workerUrl: "https://sync-test.example.workers.dev",
+    bucketOwned: "acct-1:sync-bucket",
+  };
+
+  // The ordinary redeploy: everything agrees, nothing is reported.
+  assert.deepEqual(assertNoRenameFork(live), []);
+
+  // A renamed script would upload beside the live one, not over it.
+  assert.throws(
+    () => assertNoRenameFork({ ...live, scriptName: "sync-test-2" }),
+    /WORKER_URL is serving "sync-test".*config says "sync-test-2"/s
+  );
+  // A renamed bucket would be created empty and the vault would not move into it.
+  assert.throws(
+    () => assertNoRenameFork({ ...live, bucket: "other-bucket" }),
+    /provisioned "sync-bucket".*config says "other-bucket"/s
+  );
+  // Both at once, and the message still has to say the deploy would not rename anything.
+  assert.throws(
+    () => assertNoRenameFork({ ...live, scriptName: "s2", bucket: "b2" }),
+    /SECOND deployment/
+  );
+
+  // Deliberate migration proceeds, and still reports what it is about to diverge from.
+  assert.deepEqual(
+    assertNoRenameFork({ ...live, scriptName: "sync-test-2", allowRename: true }),
+    ['Worker: .env WORKER_URL is serving "sync-test", config says "sync-test-2"']
+  );
+});
+
+test("the rename guard only fires on evidence it actually has", () => {
+  const base = { scriptName: "sync-test", bucket: "sync-bucket", accountId: "acct-1" };
+
+  // First deploy from a fresh checkout: .env knows nothing yet.
+  assert.deepEqual(assertNoRenameFork(base), []);
+  assert.deepEqual(assertNoRenameFork({ ...base, workerUrl: "  ", bucketOwned: "" }), []);
+
+  // A custom domain does not carry the script name, so it is not evidence of a mismatch.
+  assert.deepEqual(assertNoRenameFork({ ...base, workerUrl: "https://sync.example.com" }), []);
+  // Neither is an unparseable one.
+  assert.deepEqual(assertNoRenameFork({ ...base, workerUrl: "not a url" }), []);
+
+  // A claim recorded against a different account says nothing about this one.
+  assert.deepEqual(assertNoRenameFork({ ...base, bucketOwned: "acct-9:old-bucket" }), []);
 });
 
 test("a caller that never opted into ownership tracking keeps the old behaviour", async () => {

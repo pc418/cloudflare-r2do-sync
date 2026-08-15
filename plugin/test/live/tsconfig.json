@@ -1,0 +1,26 @@
+{
+  // The live suite is the only code here that is Node, not Obsidian: it reads real files and
+  // opens real sockets. The root tsconfig deliberately withholds `@types/node` so nothing in
+  // `src/` can reach for a Node API that does not exist on mobile — a constraint worth
+  // keeping — so this project exists beside it rather than loosening it.
+  //
+  // `obsidian` is deliberately NOT aliased here, even though vitest aliases it at run time.
+  // Mapping it would drag `src/**` — reachable through every import — into being checked
+  // against the fake, and `src/` must keep type-checking against the real Obsidian API. The
+  // cost is that `LogSyncPlugin` shows the real Plugin base class, so the members the fake
+  // records (`persisted`, `saves`, `settingTabs`) are reached through `harness.recorded`,
+  // narrowed once, the way `plugin/test/lifecycle.spec.ts` has always done it.
+  //
+  // It is a `tsconfig.json`, not a `tsconfig.live.json`, so typescript-eslint's project
+  // service finds it by walking up from each file. A differently-named config would leave
+  // these files covered by no project, which fails the whole lint run rather than skipping
+  // them.
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["vitest/globals", "node"]
+  },
+  // `exclude` is inherited from the base, where it points at this very directory.
+  "exclude": [],
+  "include": ["./**/*.ts"]
+}

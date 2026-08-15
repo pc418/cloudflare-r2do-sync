@@ -10,5 +10,7 @@
     "isolatedModules": true,
     "types": ["vitest/globals"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  // `test/live` has its own project: it is Node code, and it needs the `obsidian` alias.
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["test/live/**"]
 }

@@ -249,6 +249,25 @@ export function firstSyncConsentBody(mode: EncryptionMode): readonly string[] {
 }
 
 /**
+ * The first-sync gate for a device that has nothing of its own yet — a fresh install that has
+ * just been handed a setup link or a scanned code.
+ *
+ * The ordinary gate above asks the user to weigh a merge of two real vaults and to take a
+ * backup first. Neither applies here: there is nothing on this device to lose, nothing of its
+ * own to publish, and the pass is downgraded to pull-only so that stays true. Asking the
+ * general question anyway would be describing a risk this case does not carry, which is how a
+ * dialog teaches people to click through dialogs.
+ */
+export function emptyVaultConsentBody(mode: EncryptionMode): readonly string[] {
+  return [
+    "This vault has no notes of its own yet, so this first sync only downloads: the vault's " +
+      "files are written here, and nothing on this device is published. Once it finishes, " +
+      "this device syncs in both directions like any other.",
+    dataResponsibility(mode),
+  ];
+}
+
+/**
  * No server URL or no access token means no engine can be built. The settings tab and
  * `#finishRebuild` share this so the page and the engine can never disagree about whether
  * this device is set up — a page claiming otherwise would send the user looking for a bug.
@@ -325,6 +344,15 @@ const SYNC_COMMAND = "sync-now";
  * (import the key from a working device) instead of only reporting the symptom.
  */
 class WrongVaultKeyError extends Error {}
+
+/**
+ * The answer to the first-sync gate: whether to run at all, and whether this one pass is a
+ * download. `pullOnly` is only ever true for the pass that immediately follows.
+ */
+interface FirstSyncConsent {
+  proceed: boolean;
+  pullOnly: boolean;
+}
 
 /** Obsidian's requestUrl bypasses CORS, which plain fetch cannot do on mobile. */
 const obsidianHttp: HttpClient = async (url, req) => {
@@ -587,6 +615,8 @@ export default class LogSyncPlugin extends Plugin {
     }
     if (!this.#scheduler) return; // an applied settings doc rebuilt into "unconfigured"
     try {
+      // Never downgraded: this path already returned above if the first-sync gate was still
+      // owed an answer, so an unattended pass is by definition not a device's first one.
       await this.#scheduler.syncNow({ fullScan: true });
     } catch {
       // reported through onError
@@ -967,7 +997,7 @@ export default class LogSyncPlugin extends Plugin {
    * Persisted with `#persist`, never `saveSettings` — the flag is device-local, and
    * saveSettings retires the scheduler, which would deadlock the pass that called this.
    */
-  async #confirmFirstSync(): Promise<boolean> {
+  async #confirmFirstSync({ mayPullOnly = false } = {}): Promise<FirstSyncConsent> {
     if (
       !needsFirstSyncConsent({
         acknowledged: this.settings.firstSyncAcknowledged,
@@ -979,7 +1009,7 @@ export default class LogSyncPlugin extends Plugin {
         this.settings.firstSyncAcknowledged = true;
         await this.#persist();
       }
-      return true;
+      return { proceed: true, pullOnly: false };
     }
     if (this.#interactive === 0 || this.#firstSyncModalOpen) {
       new Notice(
@@ -987,14 +1017,27 @@ export default class LogSyncPlugin extends Plugin {
           "or sync manually to answer it.",
         10_000
       );
-      return false;
+      return { proceed: false, pullOnly: false };
     }
+    // Only an ordinary pass can be downgraded, and only from two-way: a forced push asked to
+    // publish, and a direction the operator set is not this gate's to reverse. A vault this
+    // cannot inspect is one the pass could not have scanned either, so the error propagates
+    // rather than being read as "not empty" — a wrong answer here publishes a blank note into
+    // somebody else's vault.
+    const pullOnly =
+      mayPullOnly &&
+      this.settings.syncMode === "two-way" &&
+      this.#engine !== null &&
+      (await this.#engine.isEffectivelyEmpty());
+
     this.#firstSyncModalOpen = true;
     const accepted = await new Promise<boolean>((resolve) => {
       new ConfirmModal(this.app, {
-        title: "Back up this vault before the first sync",
-        body: firstSyncConsentBody(this.settings.encryptionMode),
-        confirmText: "I have a backup — sync",
+        title: pullOnly ? "Download the vault to this device?" : "Back up this vault before the first sync",
+        body: pullOnly
+          ? emptyVaultConsentBody(this.settings.encryptionMode)
+          : firstSyncConsentBody(this.settings.encryptionMode),
+        confirmText: pullOnly ? "Download the vault" : "I have a backup — sync",
         cancelText: "Not yet",
         onConfirm: () => resolve(true),
         onCancel: () => resolve(false),
@@ -1003,11 +1046,11 @@ export default class LogSyncPlugin extends Plugin {
     this.#firstSyncModalOpen = false;
     if (!accepted) {
       new Notice("R2DO Sync did not sync. It will ask again the next time you sync.", 8000);
-      return false;
+      return { proceed: false, pullOnly: false };
     }
     this.settings.firstSyncAcknowledged = true;
     await this.#persist();
-    return true;
+    return { proceed: true, pullOnly };
   }
 
   async syncNow(): Promise<void> {
@@ -1023,7 +1066,8 @@ export default class LogSyncPlugin extends Plugin {
     let started: Notice | null = null;
     const startedAt = Date.now();
     try {
-      if (!(await this.#confirmFirstSync())) return;
+      const consent = await this.#confirmFirstSync({ mayPullOnly: true });
+      if (!consent.proceed) return;
       this.#phase = "syncing";
       this.#renderStatus();
       if (announceStart({ notifyOnSync: this.settings.notifyOnSync, interactive: true })) {
@@ -1036,7 +1080,9 @@ export default class LogSyncPlugin extends Plugin {
         new Notice(`R2DO Sync: shared settings check failed: ${message(e)}`, 10_000);
       }
       if (!this.#scheduler) return;
-      await this.#scheduler.syncNow({ fullScan: true });
+      // `pullOnly` is set only for the first pass of a device with nothing of its own to
+      // publish, and `firstSyncAcknowledged` is true by now, so it can never repeat.
+      await this.#scheduler.syncNow({ fullScan: true, pullOnly: consent.pullOnly });
     } catch {
       // reported through onError
     } finally {
@@ -1115,7 +1161,7 @@ export default class LogSyncPlugin extends Plugin {
     this.#interactive++;
     let consented: boolean;
     try {
-      consented = await this.#confirmFirstSync();
+      consented = (await this.#confirmFirstSync()).proceed;
     } finally {
       this.#interactive--;
     }
@@ -1176,7 +1222,7 @@ export default class LogSyncPlugin extends Plugin {
     this.#interactive++;
     let consented: boolean;
     try {
-      consented = await this.#confirmFirstSync();
+      consented = (await this.#confirmFirstSync()).proceed;
     } finally {
       this.#interactive--;
     }
@@ -1237,7 +1283,7 @@ export default class LogSyncPlugin extends Plugin {
     this.#interactive++;
     let consented: boolean;
     try {
-      consented = await this.#confirmFirstSync();
+      consented = (await this.#confirmFirstSync()).proceed;
     } finally {
       this.#interactive--;
     }
@@ -2561,6 +2607,23 @@ export class SnapshotModal extends Modal {
   }
 }
 
+/**
+ * What replacing a file costs, said the same way wherever it is said.
+ *
+ * Never promises the version being replaced is recoverable. Matching this device's last synced
+ * state does not prove any *retained* snapshot still references those bytes — the device may
+ * have been offline past the retention window, or the chain rerooted — and a safety claim that
+ * turns out to be false is what motivates an irreversible overwrite.
+ */
+export function unsyncedWarning(unsyncedEdits: boolean): string {
+  return unsyncedEdits
+    ? "That version has edits this device has never synced — it exists nowhere else, and " +
+        "replacing it would destroy it."
+    : "That version matches what this device last synced. Whether the remote still keeps a " +
+        "snapshot holding it depends on the retention window, so replacing it may still be " +
+        "permanent.";
+}
+
 /** What a finished restore did, in the words the user needs to find the file afterwards. */
 export function describeRestore(out: RestoreOutcome): string {
   switch (out.kind) {
@@ -2607,18 +2670,7 @@ export class RestoreDestinationModal extends Modal {
     contentEl.createEl("p", {
       text: `A different version of this file is at ${path} right now.`,
     });
-    // Never promises the version being replaced is recoverable. Matching this device's last
-    // synced state does not prove any *retained* snapshot still references those bytes — the
-    // device may have been offline past the retention window, or the chain rerooted — and a
-    // safety claim that turns out to be false is what motivates an irreversible overwrite.
-    contentEl.createEl("p", {
-      text: inspection.unsyncedEdits
-        ? `That version has edits this device has never synced — it exists nowhere else, and ` +
-          `replacing it would destroy it.`
-        : `That version matches what this device last synced. Whether the remote still keeps a ` +
-          `snapshot holding it depends on the retention window, so replacing it may still be ` +
-          `permanent.`,
-    });
+    contentEl.createEl("p", { text: unsyncedWarning(inspection.unsyncedEdits) });
 
     let destination = inspection.suggestion;
     new Setting(contentEl)
@@ -2648,14 +2700,31 @@ export class RestoreDestinationModal extends Modal {
         b
           .setButtonText("Replace current file")
           .setWarning()
-          .onClick(async () => {
-            this.close();
-            // The version the paragraphs above described, not whatever is there by the time
-            // this write lands. The engine refuses the write if they differ.
-            await this.opts.onRestore({
-              overwrite: true,
-              expectedHash: inspection.currentHash,
-            });
+          .onClick(() => {
+            // Asked a second time because this is the one button here that destroys
+            // something: the copy path invents a new file, this one overwrites a note whose
+            // current contents may never have been synced anywhere. The window it sits in was
+            // raised by the restore, not chosen — so reaching it is not the same as meaning
+            // it. No typed phrase: this is one file, not the whole vault.
+            new ConfirmModal(this.app, {
+              title: "Replace the current file?",
+              body: [
+                `${this.opts.path} will be overwritten with the version from this snapshot. ` +
+                  "What is there now is replaced, not moved aside.",
+                unsyncedWarning(inspection.unsyncedEdits),
+              ],
+              confirmText: "Replace it",
+              cancelText: "Keep what is there",
+              onConfirm: async () => {
+                this.close();
+                // The version the paragraphs above described, not whatever is there by the
+                // time this write lands. The engine refuses the write if they differ.
+                await this.opts.onRestore({
+                  overwrite: true,
+                  expectedHash: inspection.currentHash,
+                });
+              },
+            }).open();
           })
       )
       .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
@@ -3814,6 +3883,28 @@ export class LogSyncSettingTab extends PluginSettingTab {
         this.plugin.hasSyncedSnapshot &&
         (!this.plugin.encryptionEnabled || key.trim() !== this.plugin.settings.masterKey.trim());
       if (!changesActive) {
+        // Nothing is synced yet, so no snapshot has to be migrated — but this device may
+        // already hold the vault's key, typed in from another device and not yet used. A new
+        // one would replace it silently, and the vault it opens would then be unreachable
+        // from here. Creating the FIRST key is not a replacement and is not interrupted: that
+        // is the onboarding path, and a confirmation there is noise.
+        const replacing = this.plugin.settings.masterKey.trim();
+        if (replacing !== "" && replacing !== key.trim()) {
+          new ConfirmModal(this.app, {
+            title: "Replace the key this device holds?",
+            body: [
+              "This device already has a vault master key. Replacing it with a new one points " +
+                "this device at a different vault, and anything encrypted under the old key " +
+                "stays readable only to whoever still has it.",
+              "If you have not saved the current key anywhere, copy it out first — this is the " +
+                "last moment it exists on this device.",
+            ],
+            confirmText: "Replace the key",
+            cancelText: "Keep the current key",
+            onConfirm: run,
+          }).open();
+          return;
+        }
         run();
         return;
       }
@@ -4203,6 +4294,15 @@ export class LogSyncSettingTab extends PluginSettingTab {
   #renderRecovery(containerEl: HTMLElement): void {
     this.#heading(containerEl, "Safety and recovery");
 
+    // First in the section, because it is the one thing here that is safe to press. Someone
+    // who has just lost a note opens this page to find it, and the buttons below are the ones
+    // that overwrite vaults — leading with those puts the destructive answers in front of the
+    // question most people are actually asking.
+    new Setting(containerEl)
+      .setName("Snapshot history")
+      .setDesc("Browse past snapshots and restore a file or the whole vault.")
+      .addButton((b) => b.setButtonText("Browse").onClick(() => void this.plugin.openHistory()));
+
     this.#number(containerEl, {
       name: "Ask before large changes (%)",
       desc:
@@ -4239,11 +4339,6 @@ export class LogSyncSettingTab extends PluginSettingTab {
       .setName("Preview sync")
       .setDesc("Shows what a sync would change, without changing anything.")
       .addButton((b) => b.setButtonText("Preview").onClick(() => void this.plugin.previewSync()));
-
-    new Setting(containerEl)
-      .setName("Snapshot history")
-      .setDesc("Browse past snapshots and restore a file or the whole vault.")
-      .addButton((b) => b.setButtonText("Browse").onClick(() => void this.plugin.openHistory()));
 
     new Setting(containerEl)
       .setName("Pull remote over local")

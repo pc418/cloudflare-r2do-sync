@@ -12,5 +12,8 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["test/**/*.spec.ts"],
+    // The live suite needs a deployed Worker and credentials. It is a separate project
+    // (vitest.live.config.ts) so `npm test` stays offline, deterministic, and the gate.
+    exclude: ["test/live/**"],
   },
 });

@@ -135,6 +135,21 @@ function emptyVault(app: LifecycleApp): void {
   } as never;
 }
 
+/**
+ * A vault holding one real note. The first-sync gate now inspects the vault to decide WHICH
+ * question to ask — a device with nothing of its own is offered a download rather than a
+ * merge — so a test about the general gate has to have something to merge.
+ */
+function vaultWithANote(app: LifecycleApp): void {
+  const bytes = new TextEncoder().encode("real content\n");
+  const file = { path: "note.md", size: bytes.byteLength, mtime: 1 };
+  app.vault.adapter = {
+    list: async () => ({ files: [file.path], folders: [] }),
+    stat: async () => ({ type: "file", size: file.size, mtime: file.mtime }),
+    readBinary: async () => bytes.buffer,
+  } as never;
+}
+
 function lastModal(): Modal & { opts?: Record<string, unknown> } {
   return Modal.shown[Modal.shown.length - 1] as Modal & { opts?: Record<string, unknown> };
 }
@@ -229,7 +244,8 @@ describe("first-sync consent", () => {
     );
 
   it("syncNow() reaches no network at all until the gate is answered", async () => {
-    const { plugin } = unconsented();
+    const { plugin, app } = unconsented();
+    vaultWithANote(app);
     await plugin.onload();
 
     const pass = plugin.syncNow();
@@ -247,7 +263,8 @@ describe("first-sync consent", () => {
   });
 
   it("dismissing the window is a refusal, not a hang", async () => {
-    const { plugin } = unconsented();
+    const { plugin, app } = unconsented();
+    vaultWithANote(app);
     await plugin.onload();
 
     const pass = plugin.syncNow();
@@ -273,6 +290,43 @@ describe("first-sync consent", () => {
     expect(lastSave(plugin).settings?.firstSyncAcknowledged).toBe(true);
     // Consent is what unblocks the network, so the pass got as far as talking to the server.
     expect(requestUrlMock.calls.length).toBeGreaterThan(0);
+  });
+
+  it("asks a device with nothing of its own to download rather than to merge", async () => {
+    const { plugin, app } = unconsented();
+    await plugin.onload();
+    emptyVault(app);
+    okServer();
+
+    const pass = plugin.syncNow();
+    await flush();
+
+    // A different question, because the general one describes a risk this case does not carry:
+    // there is nothing here to lose and nothing of its own to publish. A dialog that warns
+    // about both anyway is how people learn to click through dialogs.
+    const opts = lastModal().opts as { title?: string; confirmText?: string; body?: string[] };
+    expect(opts.title).toMatch(/download/i);
+    expect(opts.confirmText).toMatch(/download/i);
+    expect(opts.body?.[0]).toMatch(/nothing on this device is published/i);
+
+    answerConfirm(true);
+    await pass;
+    expect(plugin.settings.firstSyncAcknowledged).toBe(true);
+  });
+
+  it("still asks a device that has notes of its own to weigh the merge", async () => {
+    const { plugin, app } = unconsented();
+    vaultWithANote(app);
+    await plugin.onload();
+    okServer();
+
+    void plugin.syncNow();
+    await flush();
+
+    const opts = lastModal().opts as { title?: string; confirmText?: string };
+    expect(opts.title).toMatch(/back up/i);
+    expect(opts.confirmText).toMatch(/backup/i);
+    answerConfirm(false);
   });
 
   it("a device that already has a synced head is never asked", async () => {

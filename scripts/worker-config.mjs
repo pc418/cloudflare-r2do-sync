@@ -113,6 +113,74 @@ export function bucketOwnershipClaim(accountId, bucket) {
 }
 
 /**
+ * Refuses a deploy that would fork the live deployment instead of updating it.
+ *
+ * Renaming the Worker or the bucket in `wrangler.jsonc` is not an edit to the deployment —
+ * it is a *second* deployment. The upload creates a new script at a new workers.dev URL with
+ * an empty Durable Object, `ensureR2Bucket` finds the new name absent and cheerfully creates
+ * empty storage for it, and every existing device keeps talking to the old Worker, which is
+ * still there and still serving. Nothing errors. The failure is silent, and it looks like a
+ * successful deploy.
+ *
+ * `.env` is what remembers where the live deployment actually is: `WORKER_URL` was written by
+ * the last successful deploy, and `VAULT_BUCKET_OWNED` records which bucket this checkout
+ * provisioned. Either one disagreeing with the config is the signal.
+ *
+ * A custom domain carries no script name, so it is not evidence and is not treated as any.
+ */
+export function assertNoRenameFork({
+  scriptName,
+  bucket,
+  accountId,
+  workerUrl = null,
+  bucketOwned = null,
+  allowRename = false,
+}) {
+  const conflicts = [];
+
+  const url = workerUrl?.trim();
+  if (url) {
+    let host = null;
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      host = null;
+    }
+    // Only a workers.dev host names its script; anything else tells us nothing.
+    if (host?.endsWith(".workers.dev")) {
+      const deployed = host.slice(0, host.indexOf("."));
+      if (deployed !== scriptName) {
+        conflicts.push(`Worker: .env WORKER_URL is serving "${deployed}", config says "${scriptName}"`);
+      }
+    }
+  }
+
+  const owned = bucketOwned?.trim();
+  if (owned) {
+    const split = owned.lastIndexOf(":");
+    const ownedAccount = split === -1 ? null : owned.slice(0, split);
+    const ownedBucket = split === -1 ? owned : owned.slice(split + 1);
+    // A claim from a different account says nothing about this one.
+    if (ownedAccount === accountId && ownedBucket !== bucket) {
+      conflicts.push(`Bucket: this checkout provisioned "${ownedBucket}", config says "${bucket}"`);
+    }
+  }
+
+  if (conflicts.length === 0 || allowRename) return conflicts;
+
+  throw new Error(
+    `refusing to deploy: the configured names do not match the live deployment.\n\n` +
+      conflicts.map((c) => `  ${c}`).join("\n") +
+      `\n\nDeploying now would not rename anything. It would create a SECOND deployment —\n` +
+      `new URL, empty Durable Object, empty bucket — while your devices keep syncing to the\n` +
+      `old one, which stays up. The vault would not move with it.\n\n` +
+      `Renaming a live deployment means migrating it: stand the new one up, copy the bucket,\n` +
+      `re-point every device, then retire the old Worker. If that is what you are doing and\n` +
+      `you have read the runbook, re-run with --migrate-rename.`
+  );
+}
+
+/**
  * GET distinguishes an existing bucket from authorization/server failures before POST.
  *
  * An absent bucket is created and claimed. An existing one is used only when this repo's

@@ -67,7 +67,10 @@ function fakePlugin(over: Partial<Settings> = {}, keyMismatch: string | null = n
     async openHistory() {},
     async exportLog() {},
     async applySetup() {},
-    async requestEncryptionTarget() {},
+    requested: 0,
+    async requestEncryptionTarget() {
+      this.requested += 1;
+    },
     async forcePull() {},
     async forcePush() {},
     async rebuildHistory() {},
@@ -480,6 +483,45 @@ describe("settings tab rendering", () => {
   // reachable only from the command palette, or from the key-mismatch banner that appears
   // *after* a hand-configuration has already failed — the failure taught the user what the
   // page should have said first.
+  describe("the Generate key button", () => {
+    /** Renders and returns the tab's Generate button, plus the plugin it is wired to. */
+    function generateRow(over: Partial<Settings>): {
+      plugin: ReturnType<typeof fakePlugin>;
+      click: () => void;
+    } {
+      const plugin = fakePlugin({ encryptionMode: "encrypted", ...over });
+      const tab = newTab(plugin);
+      tab.display();
+      const log = logOf(tab);
+      const button = log.rows.flatMap((row) => row.buttons).find((b) => b.text === "Generate");
+      if (button === undefined) throw new Error("the encryption section rendered no Generate button");
+      return { plugin, click: () => void button.click() };
+    }
+
+    it("creates the first key without interrupting onboarding", () => {
+      const { plugin, click } = generateRow({ masterKey: "", masterKeyBackedUp: false });
+      click();
+      // Nothing is being replaced, so there is nothing to confirm — and this is the very
+      // path a new user is on. A dialog here would be noise that teaches people to dismiss
+      // dialogs; the mandatory backup window that follows is the real gate.
+      expect(Modal.shown.filter((m) => bodyOf(m).texts().join(" ").includes("Replace the key"))).toHaveLength(0);
+      expect(plugin.requested).toBe(1);
+    });
+
+    it("asks before replacing a key this device already holds", () => {
+      // No synced snapshot, so no migration is involved — but this key may have been typed in
+      // from another device and never used. Overwriting it silently strands this device.
+      const { plugin, click } = generateRow({ masterKey: "a".repeat(44), masterKeyBackedUp: true });
+      click();
+
+      expect(plugin.requested).toBe(0);
+      const confirm = Modal.shown.at(-1)!;
+      const text = bodyOf(confirm).texts().join(" ");
+      expect(text).toContain("Replace the key this device holds?");
+      expect(text).toContain("last moment it exists on this device");
+    });
+  });
+
   describe("first run", () => {
     const FRESH: Partial<Settings> = { serverUrl: "", accessToken: "" };
 

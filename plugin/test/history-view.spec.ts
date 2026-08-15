@@ -451,15 +451,35 @@ describe("the restore destination window", () => {
     expect(Notice.shown.at(-1)).toContain("path");
   });
 
-  it("offers the overwrite as a second, explicit choice", () => {
+  it("offers the overwrite as a second, explicit choice, and confirms it", () => {
     const { modal, choices } = open();
     const buttons = rowsOf(modal).at(-1)!.buttons;
     expect(buttons[1].text).toBe("Replace current file");
     buttons[1].click();
 
-    // The overwrite names the version the dialog described, so a stale approval cannot be
-    // spent on bytes nobody looked at.
+    // Pressing it asks rather than writing: this window was raised by the restore, not chosen,
+    // so reaching the red button is not the same as meaning it.
+    expect(choices).toEqual([]);
+    const confirm = Modal.shown.at(-1)!;
+    expect(contentOf(confirm).texts().join(" ")).toContain("Replace the current file?");
+    // The confirmation restates what it costs. A confirm that says nothing is decoration.
+    expect(contentOf(confirm).texts().join(" ")).toContain("may still be permanent");
+
+    const confirmButtons = rowsOf(confirm).at(-1)!.buttons;
+    expect(confirmButtons.map((b) => b.text)).toEqual(["Replace it", "Keep what is there"]);
+    confirmButtons[0].click();
+
+    // Only then, and still naming the version the dialog described, so a stale approval
+    // cannot be spent on bytes nobody looked at.
     expect(choices).toEqual([{ overwrite: true, expectedHash: "f".repeat(64) }]);
+  });
+
+  it("writes nothing when the overwrite confirmation is declined", () => {
+    const { modal, choices } = open();
+    rowsOf(modal).at(-1)!.buttons[1].click();
+    const confirm = Modal.shown.at(-1)!;
+    rowsOf(confirm).at(-1)!.buttons[1].click(); // "Keep what is there"
+    expect(choices).toEqual([]);
   });
 
   it("says an unsynced version exists nowhere else", () => {
