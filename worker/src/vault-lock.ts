@@ -43,7 +43,39 @@ interface ChainLink {
   uploadedAt: number;
   etag: string;
   hashes: Set<string>;
+  /** Clear-envelope fields, kept so a history listing never has to re-read the manifest. */
+  device: string;
+  createdAt: string;
 }
+
+/** One row of a history listing: everything a snapshot list shows that is not encrypted. */
+export interface HistoryEntry {
+  id: string;
+  parent: string | null;
+  uploadedAt: number;
+  /** Null on a row indexed before these columns existed and not yet topped up. */
+  device: string | null;
+  createdAt: string | null;
+}
+
+export interface HistoryPage {
+  entries: HistoryEntry[];
+  /**
+   * False when the walk stopped because the index does not reach that far, rather than
+   * because the chain ended or the limit was hit. The client must not read a short list as
+   * "this vault has no more history" — that is the same mistake as reading a 5xx as a 404.
+   */
+  complete: boolean;
+}
+
+/** Manifests one `advanceHistoryDetail` call reads before handing control back. */
+const DEFAULT_HISTORY_DETAIL_CHUNK = 25;
+
+/**
+ * Rows one listing request will answer with. The response is a few hundred bytes per row and
+ * costs no R2 read, so this is a sanity bound on an attacker-supplied number, not a budget.
+ */
+const MAX_HISTORY_PAGE = 500;
 
 /**
  * What an access token is allowed to do. `sync` is everything an ordinary device needs;
@@ -161,6 +193,7 @@ export class VaultLock extends DurableObject<Env> {
         );
       `);
       this.#addTokenColumns();
+      this.#addHistoryColumns();
     });
   }
 
@@ -185,6 +218,29 @@ export class VaultLock extends DurableObject<Env> {
     }
     if (!columns.has("expires_at")) {
       this.ctx.storage.sql.exec("ALTER TABLE devices ADD COLUMN expires_at TEXT");
+    }
+  }
+
+  /**
+   * Adds the clear-envelope columns a history listing needs, for vaults indexed before them.
+   *
+   * Nullable with no default, unlike the token columns: there is no value that would be true
+   * for an existing row, and inventing one would put a wrong device name in front of the user.
+   * Null means "not known yet" and `advanceHistoryDetail` fills it in; the listing route says
+   * so rather than guessing.
+   */
+  #addHistoryColumns(): void {
+    const columns = new Set(
+      this.ctx.storage.sql
+        .exec<{ name: string }>("PRAGMA table_info(manifest_index)")
+        .toArray()
+        .map((row) => row.name)
+    );
+    if (!columns.has("device")) {
+      this.ctx.storage.sql.exec("ALTER TABLE manifest_index ADD COLUMN device TEXT");
+    }
+    if (!columns.has("created_at")) {
+      this.ctx.storage.sql.exec("ALTER TABLE manifest_index ADD COLUMN created_at TEXT");
     }
   }
 
@@ -345,13 +401,22 @@ export class VaultLock extends DurableObject<Env> {
     this.#setMeta("gc_index_cursor", "");
   }
 
-  #writeIndexRow(link: { id: string; parent: string | null; uploadedAt: number; etag: string }): void {
+  #writeIndexRow(link: {
+    id: string;
+    parent: string | null;
+    uploadedAt: number;
+    etag: string;
+    device?: string;
+    createdAt?: string;
+  }): void {
     this.ctx.storage.sql.exec(
-      "INSERT INTO manifest_index (id, parent, uploaded_at, etag) VALUES (?, ?, ?, ?)",
+      "INSERT INTO manifest_index (id, parent, uploaded_at, etag, device, created_at) VALUES (?, ?, ?, ?, ?, ?)",
       link.id,
       link.parent,
       link.uploadedAt,
-      link.etag
+      link.etag,
+      link.device ?? null,
+      link.createdAt ?? null
     );
   }
 
@@ -401,6 +466,8 @@ export class VaultLock extends DurableObject<Env> {
       uploadedAt: object.uploaded.getTime(),
       etag: object.etag,
       hashes: new Set(manifestHashes(parsed.manifest)),
+      device: parsed.manifest.device,
+      createdAt: parsed.manifest.createdAt,
     };
   }
 
@@ -452,6 +519,113 @@ export class VaultLock extends DurableObject<Env> {
    * killed mid-walk indistinguishable from one that stopped at its bound: the next call
    * resumes from the last committed link instead of starting over.
    */
+  /**
+   * The snapshot chain from the head back, answered from SQLite alone.
+   *
+   * This exists because the client's own walk is a linked list over the network: a manifest's
+   * parent is only known once that manifest has been fetched AND decrypted, so N snapshots
+   * cost N sequential round trips carrying the whole encrypted path map — megabytes, to draw a
+   * list of dates. The index already stores the parent links; everything here is in the clear
+   * on the manifest envelope anyway, so no decryption is involved and none is possible.
+   *
+   * Reads no R2. A row the index does not reach ends the walk with `complete: false` rather
+   * than pretending the vault's history stops there.
+   */
+  listHistory(limit: number): HistoryPage {
+    const max = Math.max(1, Math.min(limit, MAX_HISTORY_PAGE));
+    const entries: HistoryEntry[] = [];
+    const seen = new Set<string>();
+    let id = this.#storedHead();
+
+    while (id !== null && entries.length < max) {
+      // The one-use rule makes a repeat impossible unless the index itself is corrupt, and a
+      // walk that trusted it anyway would spin until the limit. Same guard as the client's.
+      if (seen.has(id)) return { entries, complete: false };
+      seen.add(id);
+      const row = this.ctx.storage.sql
+        .exec<{
+          id: string;
+          parent: string | null;
+          uploaded_at: number;
+          device: string | null;
+          created_at: string | null;
+        }>(
+          "SELECT id, parent, uploaded_at, device, created_at FROM manifest_index WHERE id = ?",
+          id
+        )
+        .toArray()[0];
+      if (row === undefined) return { entries, complete: false };
+      entries.push({
+        id: row.id,
+        parent: row.parent,
+        uploadedAt: row.uploaded_at,
+        device: row.device,
+        createdAt: row.created_at,
+      });
+      id = row.parent;
+    }
+    return { entries, complete: true };
+  }
+
+  /**
+   * Fills `device` / `created_at` on rows indexed before those columns existed.
+   *
+   * Separate from `advanceGcIndex` because the two answer different questions: that one builds
+   * the blob-reference index and refuses to run once it is complete, while this one tops up
+   * columns on an index that is already complete and correct. Bounded and resumable for the
+   * same reason — it reads manifests from R2, which is cheap only because it happens inside
+   * Cloudflare rather than over the client's connection.
+   *
+   * Reads R2 but writes only these two columns, so it is safe beside a sweep: it cannot change
+   * what is retained, and an *ancestor* deleted underneath it simply ends the walk. A missing
+   * head is the one case that throws — see below.
+   */
+  async advanceHistoryDetail(opts: { maxManifests?: number } = {}): Promise<GcIndexProgress> {
+    const max = Math.max(1, opts.maxManifests ?? DEFAULT_HISTORY_DETAIL_CHUNK);
+    const run = this.#commitChain.then(async (): Promise<GcIndexProgress> => {
+      let indexed = 0;
+      const seen = new Set<string>();
+      const head = this.#storedHead();
+      let id = head;
+      while (id !== null) {
+        if (seen.has(id)) throw new Error(`manifest chain cycles at ${id}`);
+        seen.add(id);
+        const row = this.ctx.storage.sql
+          .exec<{ parent: string | null; created_at: string | null }>(
+            "SELECT parent, created_at FROM manifest_index WHERE id = ?",
+            id
+          )
+          .toArray()[0];
+        // Nothing indexed this far back; `advanceGcIndex` owns that, not this.
+        if (row === undefined) return { done: true, indexed, cursor: null };
+        if (row.created_at !== null) {
+          id = row.parent;
+          continue;
+        }
+        const link = await this.#readChainLink(id);
+        if (link === null) {
+          // An older ancestor can go missing legitimately — a sweep collects trimmed history,
+          // and that ends this walk. The HEAD cannot: it is the snapshot the authority itself
+          // points at, so its absence is index/R2 divergence. Returning `done` there would
+          // report a finished migration over a row that was never resolved.
+          if (id === head) throw new Error(`head manifest ${id} is missing from storage`);
+          return { done: true, indexed, cursor: null };
+        }
+        this.ctx.storage.sql.exec(
+          "UPDATE manifest_index SET device = ?, created_at = ? WHERE id = ?",
+          link.device,
+          link.createdAt,
+          id
+        );
+        id = row.parent;
+        if (++indexed >= max) return { done: false, indexed, cursor: id };
+      }
+      return { done: true, indexed, cursor: null };
+    });
+    this.#commitChain = run.catch(() => {});
+    return run;
+  }
+
   async advanceGcIndex(opts: { maxManifests?: number } = {}): Promise<GcIndexProgress> {
     if (this.#gcIndexReady()) return { done: true, indexed: 0, cursor: null };
     const max = Math.max(1, opts.maxManifests ?? DEFAULT_GC_INDEX_CHUNK);
@@ -625,13 +799,14 @@ export class VaultLock extends DurableObject<Env> {
     // reads this manifest off the head chain instead.
     if (!this.#gcIndexReady()) return;
     const next = new Set(manifestHashes(manifest));
-    this.ctx.storage.sql.exec(
-      "INSERT INTO manifest_index (id, parent, uploaded_at, etag) VALUES (?, ?, ?, ?)",
-      manifest.id,
-      manifest.parent,
+    this.#writeIndexRow({
+      id: manifest.id,
+      parent: manifest.parent,
       uploadedAt,
-      etag
-    );
+      etag,
+      device: manifest.device,
+      createdAt: manifest.createdAt,
+    });
     // A new root replaces the live set outright instead of differing from a parent.
     if (manifest.parent === null) this.ctx.storage.sql.exec("DELETE FROM current_blob_refs");
     const added = setDifference(next, parentHashes);

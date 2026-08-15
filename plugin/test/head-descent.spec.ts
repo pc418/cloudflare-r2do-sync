@@ -26,6 +26,7 @@ let beforeCommit: (() => void) | null;
 function recordingApi(): SyncApiLike {
   return {
     getHead: () => server.getHead(),
+    getHistory: (limit) => server.getHistory(limit),
     getManifest: async (id) => {
       fetched.push(id);
       return await server.getManifest(id);

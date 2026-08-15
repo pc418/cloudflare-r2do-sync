@@ -1,6 +1,6 @@
 import { sha256Hex } from "../src/hash";
 import { blobKey, type Manifest, type ManifestV1, type ManifestV2, type ManifestV3 } from "../src/types";
-import type { StateStore, SyncState, VaultAdapter, VaultFile } from "../src/types";
+import type { HistoryEntry, HistoryPage, StateStore, SyncState, VaultAdapter, VaultFile } from "../src/types";
 import { ApiError, MissingBlobError, StaleHeadError } from "../src/api";
 import type { SyncApiLike } from "../src/sync";
 
@@ -101,6 +101,38 @@ export class FakeServer implements SyncApiLike {
 
   async getHead(): Promise<string | null> {
     return this.head;
+  }
+
+  /**
+   * Off by default, which is a deliberate choice about what the rest of the suite tests.
+   *
+   * With this null the engine takes the manifest-by-manifest walk, so every existing history
+   * test goes on proving the fallback an older Worker still gets. Tests for the indexed path
+   * turn it on and assert the walk did NOT happen.
+   */
+  serveHistoryIndex = false;
+  /** Ids the index cannot reach, so a test can produce an honestly incomplete page. */
+  readonly unindexed = new Set<string>();
+  readonly historyRequests: number[] = [];
+
+  async getHistory(limit: number): Promise<HistoryPage | null> {
+    this.historyRequests.push(limit);
+    if (!this.serveHistoryIndex) return null;
+    const entries: HistoryEntry[] = [];
+    let id = this.head;
+    while (id !== null && entries.length < limit) {
+      const m = this.manifests.get(id);
+      if (m === undefined || this.unindexed.has(id)) return { entries, complete: false };
+      entries.push({
+        id: m.id,
+        parent: m.parent,
+        uploadedAt: 1_754_000_000_000 + entries.length,
+        device: m.device,
+        createdAt: m.createdAt,
+      });
+      id = m.parent;
+    }
+    return { entries, complete: true };
   }
 
   /** Every manifest asked for, so a test can assert what a walk cost as well as what it found. */

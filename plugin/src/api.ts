@@ -1,4 +1,4 @@
-import { parseManifest, type Manifest } from "./types";
+import { parseManifest, parseHistoryPage, type Manifest, type HistoryPage } from "./types";
 import type { SettingsDoc } from "./settings-doc";
 import { normalizeServerUrl } from "./setup-link";
 import { exactArrayBuffer } from "./buffer";
@@ -175,6 +175,27 @@ export class SyncApi {
   async getHead(): Promise<string | null> {
     const res = await this.#request("/api/head");
     return ((await res.json()) as { head: string | null }).head;
+  }
+
+  /**
+   * The snapshot chain in one request, or null when the server is too old to answer.
+   *
+   * Everything here is already in the clear on a manifest envelope, so this reveals nothing a
+   * walk would not — it removes the walk. Null rather than a throw for 404: an older Worker
+   * simply has no such route, and that is a reason to fall back, not to fail the window.
+   */
+  async getHistory(limit: number): Promise<HistoryPage | null> {
+    let res: HttpResponse;
+    try {
+      res = await this.#request(`/api/history?limit=${encodeURIComponent(String(limit))}`);
+    } catch (e) {
+      // Only "no such route" is evidence about the server's age. Anything else — 401, 429,
+      // 5xx, transport — is this request failing, and quietly walking 41 manifests instead
+      // would hide a real fault behind ten seconds of work.
+      if (e instanceof ApiError && e.status === 404) return null;
+      throw e;
+    }
+    return parseHistoryPage(await res.json());
   }
 
   async getManifest(id: string): Promise<Manifest> {

@@ -35,6 +35,8 @@ import {
   blobKey,
   isEmptyManifest,
   type FileEntry,
+  type HistoryEntry,
+  type HistoryPage,
   type Manifest,
   type ManifestV3,
   type StateStore,
@@ -47,6 +49,13 @@ import {
 
 export interface SyncApiLike {
   getHead(): Promise<string | null>;
+  /**
+   * The snapshot chain in one request, or null when this server has no such route.
+   *
+   * Null is a real answer, not an error: the route is newer than the oldest Workers this
+   * plugin talks to, and a client that cannot fall back would break those vaults outright.
+   */
+  getHistory(limit: number): Promise<HistoryPage | null>;
   getManifest(id: string): Promise<Manifest>;
   getBlob(hash: string): Promise<Uint8Array>;
   checkBlobs(hashes: string[]): Promise<string[]>;
@@ -717,6 +726,15 @@ export class SyncEngine {
   readonly #decideContinuity: ((s: ContinuitySummary) => Promise<ContinuityDecision>) | null;
   readonly #onProgress: SyncEngineOptions["onProgress"];
   readonly #lanes: number;
+  /**
+   * History rows already built this session, keyed by manifest id.
+   *
+   * Needs no invalidation, which is rare enough to be worth stating: a manifest id is
+   * permanent and used once, and a snapshot's parent link never moves — so neither the row nor
+   * its diff against that parent can ever change. Holds finished rows, never path maps, so
+   * forty entries cost kilobytes rather than the megabytes they were derived from.
+   */
+  readonly #historyRows = new Map<string, SnapshotInfo>();
 
   #state: SyncState | null = null;
   readonly #dirtyPaths = new Set<string>();
@@ -2021,6 +2039,134 @@ export class SyncEngine {
    * readable history behind it.
    */
   async listHistory(limit: number, opts: { changes?: boolean } = {}): Promise<SnapshotInfo[]> {
+    const page = await this.#api.getHistory(limit);
+    // Only a chain the server can vouch for end to end. A partial index would list fewer
+    // snapshots than the walk finds, and quietly showing less history than exists is worse
+    // than being slow — so anything short falls back rather than truncating what the user sees.
+    if (page !== null && page.complete && page.entries.length > 0) {
+      return await this.#listHistoryIndexed(page.entries, opts.changes === true);
+    }
+    return await this.#listHistoryByWalk(limit, opts);
+  }
+
+  /**
+   * A listing built from the server's chain, which turns the walk inside out.
+   *
+   * The walk is sequential because a parent is unknowable until its child has been fetched and
+   * decrypted. Given the chain up front, every manifest still needed can be fetched at once —
+   * and rows already computed this session are not fetched at all. Reopening the window
+   * normally costs one request plus the snapshots made since it was last open.
+   */
+  async #listHistoryIndexed(
+    entries: readonly HistoryEntry[],
+    wantChanges: boolean
+  ): Promise<SnapshotInfo[]> {
+    // A row built for a caller that did not want diffs has no `changes`, and handing it to one
+    // that does would report "no change recorded" for a snapshot nobody diffed. `rerootSummary`
+    // asks without diffs, so the two callers really do share this cache.
+    const usable = (id: string): SnapshotInfo | undefined => {
+      const row = this.#historyRows.get(id);
+      if (row === undefined) return undefined;
+      return !wantChanges || row.changes !== undefined ? row : undefined;
+    };
+
+    const needed = new Set<string>();
+    for (const entry of entries) {
+      if (usable(entry.id) !== undefined) continue;
+      needed.add(entry.id);
+      // One manifest past the last uncached row, and only to give it something to diff
+      // against — the same single extra fetch the walk pays.
+      if (wantChanges && entry.parent !== null) needed.add(entry.parent);
+    }
+
+    const ids = [...needed];
+    type Loaded =
+      | { files: Record<string, FileEntry> | null; manifest: Manifest }
+      // The 404 itself, not a marker: a head that is gone has to be re-thrown, and inventing
+      // a fresh error there would lose the status the caller decides on.
+      | { missing: ApiError };
+    const fetched = new Map<string, Loaded>();
+    const loaded = await mapPool(ids, this.#lanes, async (id): Promise<Loaded> => {
+      let manifest: Manifest;
+      try {
+        manifest = await this.#api.getManifest(id);
+      } catch (e) {
+        // Same rule the walk applies: only a typed 404 is evidence about history. Anything
+        // else is this request failing, and dressing it up as retention would turn a
+        // retryable error into a false claim about the user's own snapshots.
+        if (!(e instanceof ApiError) || e.status !== 404) throw e;
+        return { missing: e };
+      }
+      try {
+        return { files: await this.#remoteFiles(manifest), manifest };
+      } catch {
+        return { files: null, manifest };
+      }
+    });
+    ids.forEach((id, i) => fetched.set(id, loaded[i]));
+
+    const out: SnapshotInfo[] = [];
+    for (const entry of entries) {
+      const cached = usable(entry.id);
+      if (cached !== undefined) {
+        out.push(cached);
+        continue;
+      }
+      const got = fetched.get(entry.id);
+      if (got === undefined) break;
+      if ("missing" in got) {
+        // A 404 on the HEAD is not retention. It is a server whose own pointer names a
+        // snapshot it no longer has, and returning [] for it would tell the user their vault
+        // has no history at all. Only a missing ancestor is evidence that history was trimmed.
+        if (out.length === 0) throw got.missing;
+        break;
+      }
+      const manifest = got.manifest;
+      // The index is a convenience, never an authority. `parent`, `device` and `createdAt` are
+      // covered by `manifestAad` on a v3 envelope, so the fetched manifest is the version that
+      // has been authenticated — and a listing that disagreed with it would have this diff a
+      // snapshot against something that is not its parent, then cache the false answer.
+      if (manifest.parent !== entry.parent) {
+        throw new Error(
+          `server listed ${entry.id} with parent ${entry.parent ?? "none"}, but the snapshot ` +
+            `itself names ${manifest.parent ?? "none"}`
+        );
+      }
+      const info: SnapshotInfo = {
+        id: entry.id,
+        parent: manifest.parent,
+        device: manifest.device,
+        createdAt: manifest.createdAt,
+        fileCount: got.files === null ? null : Object.keys(got.files).length,
+        readable: got.files !== null,
+      };
+      if (wantChanges) info.changes = this.#changesFor(manifest, got.files, fetched);
+      out.push(info);
+      // Safe forever without invalidation: a manifest id is permanent and one-use, and a
+      // snapshot's parent link never moves, so neither its contents nor its diff can change.
+      this.#historyRows.set(entry.id, info);
+    }
+    return out;
+  }
+
+  /** Keyed off the manifest's own parent link, which is the one the envelope authenticates. */
+  #changesFor(
+    manifest: Manifest,
+    files: Record<string, FileEntry> | null,
+    fetched: ReadonlyMap<
+      string,
+      { files: Record<string, FileEntry> | null } | { missing: ApiError }
+    >
+  ): SnapshotChanges | { unknown: ChangesUnknown } {
+    if (files === null) return { unknown: "unreadable" };
+    if (manifest.parent === null) return diffSnapshots(null, files);
+    const parent = fetched.get(manifest.parent);
+    if (parent === undefined || "missing" in parent) return { unknown: "parent-missing" };
+    if (parent.files === null) return { unknown: "parent-unreadable" };
+    return diffSnapshots(parent.files, files);
+  }
+
+  async #listHistoryByWalk(limit: number, opts: { changes?: boolean } = {}): Promise<SnapshotInfo[]> {
     const wantChanges = opts.changes === true;
     const out: SnapshotInfo[] = [];
     const seen = new Set<string>();

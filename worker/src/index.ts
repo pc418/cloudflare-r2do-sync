@@ -245,6 +245,34 @@ app.get("/api/head", accessAuth, async (c) => {
   return c.json({ head: await vault(c.env).getHead() });
 });
 
+/**
+ * The snapshot chain, so a client does not have to discover it one manifest at a time.
+ *
+ * Everything returned is already in the clear on a manifest envelope — id, parent, device,
+ * createdAt — so this exposes nothing an access token could not read anyway, and the encrypted
+ * path map is neither read nor readable here. What it removes is the round trips: the client's
+ * own walk cannot know a parent without first downloading and decrypting its child.
+ */
+app.get("/api/history", accessAuth, async (c) => {
+  const raw = c.req.query("limit");
+  const limit = raw === undefined ? 50 : Number(raw);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+    return c.json(errJson("invalid_limit", "limit must be an integer from 1 to 500"), 422);
+  }
+  return c.json(await vault(c.env).listHistory(limit));
+});
+
+app.post("/api/history/index", adminAuth, async (c) => {
+  const manifests = indexChunkOf(c);
+  if (manifests === undefined) {
+    return c.json(errJson("invalid_manifests", "manifests must be an integer from 1 to 1000"), 422);
+  }
+  const progress = await vault(c.env).advanceHistoryDetail(
+    manifests === null ? {} : { maxManifests: manifests }
+  );
+  return c.json(progress);
+});
+
 app.get("/api/manifests/:id", accessAuth, async (c) => {
   const id = c.req.param("id") ?? "";
   if (!ULID_RE.test(id)) return c.json(errJson("bad_id", "manifest id must be a ULID"), 422);

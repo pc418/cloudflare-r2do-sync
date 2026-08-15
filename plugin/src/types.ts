@@ -175,3 +175,70 @@ export interface StateStore {
   load(): Promise<SyncState | null>;
   save(state: SyncState): Promise<void>;
 }
+
+/** One row of the server's snapshot listing: the clear envelope, and nothing else. */
+export interface HistoryEntry {
+  id: string;
+  parent: string | null;
+  uploadedAt: number;
+  /** Null on a snapshot the server has indexed but not yet described. */
+  device: string | null;
+  createdAt: string | null;
+}
+
+export interface HistoryPage {
+  entries: HistoryEntry[];
+  /**
+   * False when the server's index does not reach the end of the chain. A short list is then
+   * not evidence that the vault's history stops there, and must never be shown as if it were.
+   */
+  complete: boolean;
+}
+
+/**
+ * Validates a history listing.
+ *
+ * The chain is checked structurally here rather than trusted: a listing whose `parent` links
+ * do not actually join up would produce a diff between two snapshots that are not parent and
+ * child, which is a wrong answer presented as a fact about the user's own history.
+ */
+export function parseHistoryPage(value: unknown): HistoryPage {
+  const fail = (why: string): never => {
+    throw new Error(`invalid history from server: ${why}`);
+  };
+  if (typeof value !== "object" || value === null) return fail("not an object");
+  const page = value as Record<string, unknown>;
+  if (typeof page.complete !== "boolean") return fail("complete is missing");
+  if (!Array.isArray(page.entries)) return fail("entries is missing");
+
+  const entries: HistoryEntry[] = [];
+  const seen = new Set<string>();
+  for (const raw of page.entries as unknown[]) {
+    if (typeof raw !== "object" || raw === null) return fail("an entry is not an object");
+    const e = raw as Record<string, unknown>;
+    if (typeof e.id !== "string" || e.id === "") return fail("an entry has no id");
+    if (e.parent !== null && typeof e.parent !== "string") return fail(`${e.id}: bad parent`);
+    if (typeof e.uploadedAt !== "number" || !Number.isFinite(e.uploadedAt)) {
+      return fail(`${e.id}: bad uploadedAt`);
+    }
+    if (e.device !== null && typeof e.device !== "string") return fail(`${e.id}: bad device`);
+    if (e.createdAt !== null && typeof e.createdAt !== "string") return fail(`${e.id}: bad createdAt`);
+    // A manifest id is used once, ever. A repeat — including a row naming itself as its own
+    // parent — means the listing is not a chain, and a diff taken across it would compare a
+    // snapshot with itself and report "changed nothing".
+    if (seen.has(e.id) || e.parent === e.id) return fail(`${e.id} appears twice`);
+    const previous = entries[entries.length - 1];
+    if (previous !== undefined && previous.parent !== e.id) {
+      return fail(`${e.id} does not follow ${previous.id}`);
+    }
+    seen.add(e.id);
+    entries.push({
+      id: e.id,
+      parent: e.parent,
+      uploadedAt: e.uploadedAt,
+      device: e.device,
+      createdAt: e.createdAt,
+    });
+  }
+  return { entries, complete: page.complete };
+}

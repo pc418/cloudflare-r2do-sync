@@ -3,6 +3,7 @@ import { SyncEngine } from "../src/sync";
 import { FakeServer, FakeStore, FakeVault } from "./fakes";
 import { ApiError } from "../src/api";
 import { VaultCrypto } from "../src/crypto";
+import { parseHistoryPage } from "../src/types";
 
 let vault: FakeVault;
 let server: FakeServer;
@@ -708,5 +709,275 @@ describe("history with encryption on", () => {
 
     await engine.restoreFile(first, "b.md");
     expect(vault.text("b.md")).toBe("secret two");
+  });
+});
+
+// Listing history from the server's index instead of walking it.
+//
+// The walk is a linked list over the network: a parent is unknowable until its child has been
+// fetched AND decrypted, so N snapshots cost N sequential round trips carrying the whole
+// encrypted path map. Measured on the real vault that is 12.7 MiB over 41 round trips to draw
+// a list of dates. Given the chain up front the same rows cost bounded-parallel fetches, and on
+// a second open, almost nothing.
+describe("SyncEngine.listHistory over the server index", () => {
+  it("produces exactly what the walk produces", async () => {
+    const engine = makeEngine();
+    await threeCommits(engine);
+    const walked = await engine.listHistory(10, { changes: true });
+
+    // A different route to the same answer, or it is not a fast path — it is a second
+    // implementation of history with its own opinions.
+    server.serveHistoryIndex = true;
+    const indexed = await makeEngine().listHistory(10, { changes: true });
+
+    expect(indexed).toEqual(walked);
+  });
+
+  it("asks for the chain once and never walks it", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = true;
+
+    const fresh = makeEngine();
+    server.manifestFetches.length = 0;
+    const history = await fresh.listHistory(10, { changes: true });
+
+    expect(history.map((h) => h.id)).toEqual([heads[2], heads[1], heads[0]]);
+    expect(server.historyRequests).toEqual([10]);
+    // Every manifest still needed, but asked for as a set rather than one at a time — which
+    // is the whole difference, and is only possible because the chain arrived first.
+    expect([...server.manifestFetches].sort()).toEqual([...heads].sort());
+  });
+
+  it("reopens without refetching what it already built", async () => {
+    const engine = makeEngine();
+    await threeCommits(engine);
+    server.serveHistoryIndex = true;
+
+    const first = await engine.listHistory(10, { changes: true });
+    server.manifestFetches.length = 0;
+    const second = await engine.listHistory(10, { changes: true });
+
+    // A manifest id is permanent and one-use and its parent link never moves, so a row that
+    // has been built can never be wrong. Nothing to invalidate, nothing to refetch.
+    expect(second).toEqual(first);
+    expect(server.manifestFetches).toEqual([]);
+  });
+
+  it("fetches only the snapshots made since it was last open", async () => {
+    const engine = makeEngine();
+    await threeCommits(engine);
+    server.serveHistoryIndex = true;
+    await engine.listHistory(10, { changes: true });
+
+    vault.set("c.md", "sea", 1_754_000_300_000);
+    await engine.sync();
+    const newest = server.head!;
+    const parent = (await engine.listHistory(10))[1].id;
+    server.manifestFetches.length = 0;
+
+    const history = await engine.listHistory(10, { changes: true });
+
+    expect(history[0].id).toBe(newest);
+    expect(history[0].changes).toEqual(expect.objectContaining({ added: 1, removed: 0 }));
+    // The new snapshot, plus its parent — whose path map the diff needs and which the cached
+    // row does not carry. Two, not four.
+    expect([...server.manifestFetches].sort()).toEqual([newest, parent].sort());
+  });
+
+  it("falls back to the walk against a Worker that has no such route", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = false;
+
+    const history = await makeEngine().listHistory(10, { changes: true });
+
+    expect(history.map((h) => h.id)).toEqual([heads[2], heads[1], heads[0]]);
+  });
+
+  it("falls back rather than showing less history than the vault has", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = true;
+    // The oldest snapshot predates the server's index. Listing the two it can reach would be
+    // a quiet claim that the vault has two snapshots, which is a lie about the user's own
+    // history — worse than being slow.
+    server.unindexed.add(heads[0]);
+
+    const history = await makeEngine().listHistory(10, { changes: true });
+
+    expect(history.map((h) => h.id)).toEqual([heads[2], heads[1], heads[0]]);
+  });
+
+  it("stops at a snapshot the index lists but the bucket no longer holds", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = true;
+    server.manifests.delete(heads[0]);
+
+    const history = await makeEngine().listHistory(10, { changes: true });
+
+    // Retention trimmed it. The readable prefix is still shown, and the row that lost its
+    // parent says so rather than reporting a diff against nothing.
+    expect(history.map((h) => h.id)).toEqual([heads[2], heads[1]]);
+    expect(history[1].changes).toEqual({ unknown: "parent-missing" });
+  });
+
+  it("propagates a transport failure instead of calling it retention", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = true;
+    server.failManifest.set(heads[1], new ApiError("service unavailable", 503, "unavailable"));
+
+    // Only a typed 404 is evidence about history. Reporting a 503 as "no longer retained"
+    // turns a retryable error into a false fact about the user's snapshots.
+    await expect(makeEngine().listHistory(10, { changes: true })).rejects.toThrow(/unavailable/);
+  });
+
+  it("marks a snapshot this device's key cannot open, without hiding the rest", async () => {
+    const engine = makeEngine({ crypto: await VaultCrypto.fromText("A".repeat(43) + "=") });
+    vault.set("a.md", "one");
+    await engine.sync();
+    server.serveHistoryIndex = true;
+
+    const other = makeEngine({ crypto: await VaultCrypto.fromText("B".repeat(43) + "=") });
+    const history = await other.listHistory(10, { changes: true });
+
+    expect(history).toHaveLength(1);
+    expect(history[0].readable).toBe(false);
+    expect(history[0].fileCount).toBeNull();
+    expect(history[0].changes).toEqual({ unknown: "unreadable" });
+    // Still named, because the envelope is not encrypted and the row is what tells the user
+    // which device wrote a snapshot they cannot read.
+    expect(history[0].device).toBe("test-device");
+  });
+});
+
+// A listing is a chain, and the client checks that it is one. A page whose parent links do not
+// join up would have the engine diff two snapshots that are not parent and child — a wrong
+// answer presented as a fact about the user's own history.
+describe("parseHistoryPage", () => {
+  const row = (id: string, parent: string | null) => ({
+    id,
+    parent,
+    uploadedAt: 1,
+    device: "d",
+    createdAt: "2026-08-15T00:00:00.000Z",
+  });
+
+  it("accepts a well-formed chain", () => {
+    const page = parseHistoryPage({ complete: true, entries: [row("B", "A"), row("A", null)] });
+    expect(page.entries.map((e) => e.id)).toEqual(["B", "A"]);
+    expect(page.complete).toBe(true);
+  });
+
+  it("accepts rows the server has not described yet", () => {
+    const page = parseHistoryPage({
+      complete: true,
+      entries: [{ id: "A", parent: null, uploadedAt: 1, device: null, createdAt: null }],
+    });
+    expect(page.entries[0]).toEqual(expect.objectContaining({ device: null, createdAt: null }));
+  });
+
+  it("refuses a listing whose links do not join up", () => {
+    expect(() => parseHistoryPage({ complete: true, entries: [row("B", "A"), row("C", null)] })).toThrow(
+      /does not follow/
+    );
+  });
+
+  it("refuses a repeated id, which cannot be a chain", () => {
+    // A manifest id is used once, ever. A repeat means a loop, and a walk that trusted it
+    // would list the same snapshots until it hit the limit.
+    expect(() => parseHistoryPage({ complete: true, entries: [row("A", "A")] })).toThrow(/twice/);
+  });
+
+  it("refuses a page that is missing its completeness answer", () => {
+    // Defaulting it to true would turn "I could not reach the rest" into "there is no rest".
+    expect(() => parseHistoryPage({ entries: [] })).toThrow(/complete is missing/);
+  });
+
+  it("refuses malformed rows rather than passing them through", () => {
+    for (const bad of [
+      { complete: true, entries: [{ ...row("A", null), id: "" }] },
+      { complete: true, entries: [{ ...row("A", null), uploadedAt: "soon" }] },
+      { complete: true, entries: [{ ...row("A", null), parent: 7 }] },
+      { complete: true, entries: [{ ...row("A", null), device: 7 }] },
+      { complete: true, entries: ["nope"] },
+      { complete: true },
+      null,
+    ]) {
+      expect(() => parseHistoryPage(bad)).toThrow(/invalid history/);
+    }
+  });
+});
+
+// The index is a convenience, never an authority. These are the three ways trusting it would
+// have produced a confident wrong answer about the user's own history.
+describe("SyncEngine.listHistory does not trust the index over the manifests", () => {
+  it("propagates a head the server lists but no longer holds", async () => {
+    const engine = makeEngine();
+    await threeCommits(engine);
+    server.serveHistoryIndex = true;
+    // The listing still names the head; only the object is gone. Deleting it before capturing
+    // the page would make the page incomplete and send this down the fallback walk instead —
+    // which passes for the wrong reason and proves nothing about the indexed path.
+    const listed = await server.getHistory(10);
+    server.getHistory = async () => listed;
+    server.manifests.delete(server.head!);
+
+    // Not retention, and not an empty vault: it is a server whose own pointer names a snapshot
+    // it lost. Returning [] would tell the user their history does not exist.
+    await expect(makeEngine().listHistory(10, { changes: true })).rejects.toThrow(/unknown manifest/);
+  });
+
+  it("still treats a missing ANCESTOR as retention, not as a fault", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = true;
+    const listed = await server.getHistory(10);
+    server.getHistory = async () => listed;
+    server.manifests.delete(heads[0]);
+
+    const history = await makeEngine().listHistory(10, { changes: true });
+
+    expect(history.map((h) => h.id)).toEqual([heads[2], heads[1]]);
+    expect(history[1].changes).toEqual({ unknown: "parent-missing" });
+  });
+
+  it("refuses a listing whose parent disagrees with the snapshot itself", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = true;
+    const real = await server.getHistory(10);
+    // A chain the manifests contradict. `parent` is covered by `manifestAad` on a v3
+    // envelope, so the fetched snapshot is the authenticated version — believing the index
+    // instead would diff a snapshot against something that is not its parent, and cache it.
+    server.getHistory = async () => ({
+      complete: true,
+      entries: real!.entries.map((e) =>
+        e.id === heads[2] ? { ...e, parent: heads[0] } : e
+      ),
+    });
+
+    await expect(makeEngine().listHistory(10, { changes: true })).rejects.toThrow(
+      /but the snapshot itself names/
+    );
+  });
+
+  it("reports the snapshot's own device and time, not the index's", async () => {
+    const engine = makeEngine({ deviceName: "real-device" });
+    vault.set("a.md", "one");
+    await engine.sync();
+    server.serveHistoryIndex = true;
+    const real = await server.getHistory(10);
+    server.getHistory = async () => ({
+      complete: true,
+      entries: real!.entries.map((e) => ({ ...e, device: "wrong", createdAt: "1999-01-01T00:00:00.000Z" })),
+    });
+
+    const history = await makeEngine().listHistory(10, { changes: true });
+
+    expect(history[0].device).toBe("real-device");
+    expect(history[0].createdAt).not.toBe("1999-01-01T00:00:00.000Z");
   });
 });
