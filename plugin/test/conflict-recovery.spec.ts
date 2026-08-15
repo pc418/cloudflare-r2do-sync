@@ -10,7 +10,7 @@
 // same line, so the pass keeps both and the only way out is one of these four buttons.
 import { beforeEach, describe, expect, it } from "vitest";
 import LogSyncPlugin, { DEFAULT_SETTINGS, type Settings } from "../src/main";
-import { LifecycleApp, Notice } from "./obsidian-fake";
+import { type FakeElement, LifecycleApp, Modal, Notice } from "./obsidian-fake";
 import type { ConflictInfo } from "../src/sync";
 
 const PATH = "notes/shared.md";
@@ -79,6 +79,15 @@ async function makePlugin(
   return plugin;
 }
 
+function bodyOf(modal: Modal): FakeElement {
+  return modal.contentEl as unknown as FakeElement;
+}
+
+/** Lets the window's fire-and-forget rendering settle. */
+function flush(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 let files: Map<string, string>;
 
 beforeEach(() => {
@@ -88,6 +97,7 @@ beforeEach(() => {
     document: { visibilityState: "visible" },
   });
   Notice.shown.length = 0;
+  Modal.shown.length = 0;
   files = new Map([
     [PATH, MINE],
     [COPY, THEIRS],
@@ -149,6 +159,54 @@ describe("recovering a same-line conflict", () => {
     expect(files.get(PATH)).toBe(MINE);
     expect(files.get(COPY)).toBe(THEIRS);
     expect(plugin.lastConflicts).toHaveLength(0);
+  });
+
+  describe("when the note itself has been deleted since the conflict was recorded", () => {
+    // The reported bug. `pruneResolved` only ever checked the COPY, and in the ordinary
+    // layout the other side is the note's own path — so deleting the note left an entry that
+    // was still listed, whose keep-mine / keep-both / combine buttons could only fail with
+    // "is gone", and which could never clear. "File not found", permanently.
+
+    it("still lets the parked version be restored onto the path", async () => {
+      files.delete(PATH);
+      const plugin = await makePlugin(files, [conflict()]);
+      await plugin.resolveConflict(plugin.lastConflicts[0], "keep-theirs");
+
+      // Promoting a parked copy onto a note that has since been deleted is a restore, not a
+      // hazard — this is the choice that has to keep working.
+      expect(files.get(PATH)).toBe(THEIRS);
+      expect(files.has(COPY)).toBe(false);
+      expect(plugin.lastConflicts).toHaveLength(0);
+    });
+
+    it("names the missing side and offers only what can still be done", async () => {
+      files.delete(PATH);
+      const plugin = await makePlugin(files, [conflict()]);
+      await plugin.openConflictReview();
+      await flush();
+
+      const body = bodyOf(Modal.shown.at(-1)!);
+      expect(body.texts().join(" ")).toContain(`No longer in the vault: ${PATH}`);
+
+      // Only the choice that does not need the deleted note is live. The rest are visible but
+      // disabled: a button whose only outcome is an error is worse than one that is plainly
+      // unavailable.
+      const buttons = body.log.rows.flatMap((r) => r.buttons).filter((b) => b.text !== "Close");
+      const live = buttons.filter((b) => !b.disabled).map((b) => b.text);
+      expect(live).toEqual(["Other device"]);
+      expect(buttons.filter((b) => b.disabled).map((b) => b.text).sort()).toEqual(
+        ["Both files", "Combine into one", "This device"].sort()
+      );
+    });
+
+    it("is not pruned away, because one side is still recoverable", async () => {
+      files.delete(PATH);
+      const plugin = await makePlugin(files, [conflict()]);
+      await plugin.openConflictReview();
+      await flush();
+      // Dropping it would silently discard the only surviving copy of the other device's work.
+      expect(plugin.lastConflicts).toHaveLength(1);
+    });
   });
 
   it("stops rather than half-applying when the copy has already gone", async () => {

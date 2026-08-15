@@ -1,11 +1,14 @@
 import { describe, it, expect } from "vitest";
 import { diffLines, ELISION } from "../src/merge";
 import {
+  CONFLICT_CHOICES,
+  choiceBlockedReason,
   combineText,
   conflictDiff,
   conflictSides,
   isResolvable,
   latestSide,
+  missingSides,
   planResolution,
   planResolutionOnDisk,
   pruneResolved,
@@ -133,6 +136,37 @@ describe("conflictSides", () => {
 
 describe("pruneResolved", () => {
   const copy = "note.conflict-phone-260807-1200.md";
+
+  it("reports which side of the pair has left the vault", () => {
+    const pair = info();
+    // Both there.
+    expect(missingSides(pair, new Set([pair.path, pair.copy!]))).toEqual([]);
+    // The note deleted after the conflict was recorded — the case the review window used to
+    // offer four buttons for, three of which could only fail.
+    expect(missingSides(pair, new Set([pair.copy!]))).toEqual([pair.path]);
+    expect(missingSides(pair, new Set([pair.path]))).toEqual([pair.copy!]);
+  });
+
+  it("blocks only the choices that need a file that is gone", () => {
+    const pair = info();
+    const onlyCopy = new Set([pair.copy!]);
+
+    // Promoting the parked copy onto a deleted note is a restore, not a hazard.
+    expect(choiceBlockedReason(pair, "keep-theirs", onlyCopy)).toBeNull();
+    // Everything that needs the note itself says so, by name.
+    for (const choice of ["keep-mine", "keep-both", "combine"] as const) {
+      expect(choiceBlockedReason(pair, choice, onlyCopy)).toBe(`${pair.path} is no longer in the vault.`);
+    }
+
+    // With both present nothing is blocked...
+    for (const choice of CONFLICT_CHOICES) {
+      expect(choiceBlockedReason(pair, choice, new Set([pair.path, pair.copy!]))).toBeNull();
+    }
+    // ...and a pair with no copy at all is blocked for the older, different reason.
+    expect(choiceBlockedReason(info({ copy: null }), "keep-mine", new Set())).toMatch(
+      /nothing left to choose/
+    );
+  });
 
   it("keeps a pair whose copy is still on disk", () => {
     expect(pruneResolved([info()], new Set(["note.md", copy]))).toEqual([info()]);

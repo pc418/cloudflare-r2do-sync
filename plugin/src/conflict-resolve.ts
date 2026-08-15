@@ -97,6 +97,42 @@ export function isResolvable(info: ConflictInfo): boolean {
 }
 
 /**
+ * The pair's files that are no longer in the vault, in the order the window names them.
+ *
+ * A conflict outlives the pass that recorded it, and either side can leave in between: the
+ * note deleted by hand, the copy resolved on another device, either one renamed. Asking is
+ * the only way to know — the recorded entry cannot.
+ */
+export function missingSides(info: ConflictInfo, present: ReadonlySet<string>): string[] {
+  if (info.copy === null) return [];
+  const sides = conflictSides(info);
+  return [sides.mine, sides.theirs].filter((path) => !present.has(path));
+}
+
+/**
+ * Why one choice cannot be carried out against the vault as it is now, or null when it can.
+ *
+ * The window used to offer all four buttons whenever the *copy* was still there, because that
+ * is all `pruneResolved` checks. In the ordinary layout `sides.mine` IS the note's own path,
+ * so a note deleted after the conflict was recorded left three buttons whose only outcome was
+ * "…is gone" — and the entry could never clear, because pruning never looked at that side. A
+ * button that can only fail is worse than one that is visibly unavailable.
+ */
+export function choiceBlockedReason(
+  info: ConflictInfo,
+  choice: ConflictChoice,
+  present: ReadonlySet<string>
+): string | null {
+  const unresolvable = unresolvableReason(info);
+  if (unresolvable !== null) return unresolvable;
+  const missing = pathsRequired(info, choice).filter((path) => !present.has(path));
+  if (missing.length === 0) return null;
+  return missing.length === 1
+    ? `${missing[0]} is no longer in the vault.`
+    : `Neither ${missing[0]} nor ${missing[1]} is in the vault any more.`;
+}
+
+/**
  * The conflicts still worth listing, given what the vault currently holds.
  *
  * The outstanding list survives restarts, and every one of the ways a pair leaves disk is
@@ -201,6 +237,7 @@ export function planResolutionOnDisk(
  * kept one file — an answer that was wrong in the one direction this whole feature exists to
  * prevent. Doing nothing is only "keeping both" when there are both.
  */
+/** Also used by `choiceBlockedReason` above, to decide what a button can promise. */
 function pathsRequired(info: ConflictInfo, choice: ConflictChoice): string[] {
   const sides = conflictSides(info);
   switch (choice) {

@@ -33,8 +33,10 @@ import {
 import {
   conflictDiff,
   conflictSides,
+  choiceBlockedReason,
   isResolvable,
   latestSide,
+  missingSides,
   planResolutionOnDisk,
   pruneResolved,
   unresolvableReason,
@@ -1700,8 +1702,14 @@ export default class LogSyncPlugin extends Plugin {
     // at all: no window, no notice, an unhandled promise. Failing to *check* the disk is not
     // a reason to withhold the list — resolution re-checks each pair at click time anyway.
     let outstanding = batch;
+    // Kept for the window: `pruneResolved` only drops pairs whose *copy* has gone, and in the
+    // ordinary layout the other side is the note's own path. Without this the window offers
+    // buttons for a note that was deleted after the conflict was recorded, every one of them
+    // fails with "is gone", and the entry can never clear.
+    let present: ReadonlySet<string> = new Set<string>();
     try {
-      outstanding = pruneResolved(batch, await this.#presentPaths(batch));
+      present = await this.#presentPaths(batch);
+      outstanding = pruneResolved(batch, present);
     } catch (e) {
       new Notice(
         `R2DO Sync could not check which conflicts are still on disk: ${message(e)}. ` +
@@ -1719,10 +1727,15 @@ export default class LogSyncPlugin extends Plugin {
         8000
       );
     }
-    new ConflictReportModal(this.app, outstanding, {
-      readText: (path) => this.#readTextIfPresent(path),
-      resolve: (info, choice) => this.resolveConflict(info, choice),
-    }).open();
+    new ConflictReportModal(
+      this.app,
+      outstanding,
+      {
+        readText: (path) => this.#readTextIfPresent(path),
+        resolve: (info, choice) => this.resolveConflict(info, choice),
+      },
+      present
+    ).open();
   }
 
   /** Which of these paths hold a file right now — one stat each, never a vault walk. */
@@ -2767,10 +2780,21 @@ export class ConflictReportModal extends Modal {
     private readonly actions: {
       readText: (path: string) => Promise<string | null>;
       resolve: (info: ConflictInfo, choice: ConflictChoice) => Promise<void>;
-    } | null = null
+    } | null = null,
+    /**
+     * Which of the pairs' files are on disk right now. Empty means "not checked", which is
+     * how the preview call site and older tests get every button — the window must not
+     * disable everything just because nobody looked.
+     */
+    private readonly present: ReadonlySet<string> = new Set()
   ) {
     super(app);
     this.#conflicts = [...conflicts];
+  }
+
+  /** Null when the check was never run, so "unknown" and "missing" stay different answers. */
+  #blocked(c: ConflictInfo, choice: ConflictChoice): string | null {
+    return this.present.size === 0 ? null : choiceBlockedReason(c, choice, this.present);
   }
 
   onOpen(): void {
@@ -2823,6 +2847,16 @@ export class ConflictReportModal extends Modal {
       const sides = conflictSides(c);
       list.createEl("li", { text: `This device's version is in: ${sides.mine}` });
       list.createEl("li", { text: `The other device's version is in: ${sides.theirs}` });
+      // Named explicitly, because the buttons below go quiet on the strength of it and a
+      // disabled button with no stated reason reads as a broken window.
+      const gone = this.present.size === 0 ? [] : missingSides(c, this.present);
+      if (gone.length > 0) {
+        list.createEl("li", {
+          text:
+            `No longer in the vault: ${gone.join(", ")}. Only the choices that do not need ` +
+            "it are still available.",
+        });
+      }
       if (this.actions === null) continue;
       this.#renderDiff(box, c);
       this.#renderChoices(box, c, newer);
@@ -2874,7 +2908,12 @@ export class ConflictReportModal extends Modal {
     const row = new Setting(box).setName("Keep");
     const button = (text: string, choice: ConflictChoice, cta: boolean) =>
       row.addButton((b) => {
+        const blocked = this.#blocked(c, choice);
+        if (blocked !== null) b.setDisabled(true).setTooltip(blocked);
         b.setButtonText(text).onClick(async () => {
+          // Belt and braces: the button is disabled, and the fake used in tests still fires
+          // a disabled button's handler. A click that cannot succeed must not half-run.
+          if (blocked !== null) return;
           // A resolution is several file operations; a second click landing between them
           // resolves an already-resolved pair and reports a failure for work that succeeded.
           if (this.#busy) return;
