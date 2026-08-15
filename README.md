@@ -318,11 +318,17 @@ unreadable.
 # All commands are run from the repository root.
 npm --prefix worker install && npm --prefix plugin install
 
-npm --prefix worker test             # 156 tests, real workerd via vitest-pool-workers
-npm --prefix plugin test             # 814 tests, incl. rendered settings-tab/modal coverage
-node --test scripts/*.test.mjs       # 56 tests: deploy/setup/release/token helpers
+npm --prefix worker test             # 157 tests, real workerd via vitest-pool-workers
+npm --prefix plugin test             # 907 tests, incl. rendered settings-tab/modal coverage
+node --test scripts/*.test.mjs       # 58 tests: deploy/setup/release/token helpers
 npm --prefix plugin run lint         # typed lint; the baseline is zero, so any finding is new
 npm --prefix worker run lint
+
+# Optional: the same plugin driven against a REAL deployed Worker, with real files on disk.
+# Needs a throwaway sandbox on a Cloudflare account that is not the one holding your vault.
+node scripts/sandbox.mjs             # deploy one; --suffix <group> for an isolated second
+npm --prefix plugin run test:live    # 82 tests; skips entirely when no sandbox is deployed
+node scripts/sandbox.mjs --destroy --all
 
 npm --prefix plugin run build        # -> plugin/dist/{main.js,manifest.json,styles.css}
 node scripts/release-validate.mjs 0.3.0   # release layout check; must run from the root
