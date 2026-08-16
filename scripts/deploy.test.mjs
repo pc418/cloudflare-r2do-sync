@@ -9,8 +9,10 @@ test("REST deploy metadata enables sampled Workers logs", () => {
 });
 
 test("the REST production Worker bundle is minified", () => {
+  // Same guard as the plugin's, in the same shape: deploy.mjs drives esbuild through its JS
+  // API rather than its CLI, because the CLI has no portable spawn (see `localBin`).
   const source = readFileSync(fileURLToPath(new URL("./deploy.mjs", import.meta.url)), "utf8");
-  assert.match(source, /"--minify"/);
+  assert.match(source, /minify:\s*true/);
 });
 
 test("the production plugin bundle is minified", () => {

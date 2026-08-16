@@ -6,7 +6,6 @@
 // `deployViaRest()` is exported so scripts/setup.mjs can continue in-process with the
 // admin token this creates — Cloudflare never reveals a secret again, so scraping it back
 // out of stdout would be the only alternative.
-import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -92,22 +91,24 @@ export async function deployViaRest({
 
   // 1. Bundle -----------------------------------------------------------------
   log("bundling worker...");
-  // `process.execPath` + the package's own entrypoint, not the `.bin` shim: see `localBin`.
-  execFileSync(
-    process.execPath,
-    [
-      localBin(WORKER_DIR, "esbuild/bin/esbuild"),
-      "src/index.ts",
-      "--bundle",
-      "--format=esm",
-      "--platform=neutral",
-      "--conditions=workerd,worker,browser",
-      "--external:cloudflare:workers",
-      "--minify",
-      "--outfile=dist/worker.js",
-    ],
-    { cwd: WORKER_DIR, stdio: "inherit" }
-  );
+  // esbuild's JS API rather than its CLI, because there is no portable way to spawn that
+  // CLI. `node_modules/.bin/esbuild` is a `.cmd` shim on Windows (ENOENT unshelled — issue
+  // #9), and `node_modules/esbuild/bin/esbuild` cannot stand in for it: esbuild's postinstall
+  // REPLACES that file with the raw platform executable, so whether it is JS or a Mach-O/PE
+  // binary depends on whether install scripts were allowed to run. The API has no spawn and
+  // no shim, so it is the same call on every platform and every install state.
+  const esbuild = await import(pathToFileURL(localBin(WORKER_DIR, "esbuild/lib/main.js")).href);
+  await esbuild.build({
+    absWorkingDir: WORKER_DIR,
+    entryPoints: ["src/index.ts"],
+    bundle: true,
+    format: "esm",
+    platform: "neutral",
+    conditions: ["workerd", "worker", "browser"],
+    external: ["cloudflare:workers"],
+    minify: true,
+    outfile: "dist/worker.js",
+  });
   const bundled = readFileSync(path.join(WORKER_DIR, "dist", "worker.js"), "utf8");
   log(`bundle: ${(bundled.length / 1024).toFixed(1)} KiB`);
 
