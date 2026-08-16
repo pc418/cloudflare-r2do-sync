@@ -102,6 +102,76 @@ export function loadWorkerDeployConfig(
 }
 
 /**
+ * A deployment name stands up a WHOLE SECOND VAULT, not a variant of the first.
+ *
+ * It names the Worker script and the R2 bucket, and the Durable Object comes with it for
+ * free: DO namespaces are per-script, so uploading the unchanged `VaultLock` class under a
+ * new script name creates a fresh, empty namespace with its own authoritative head. That is
+ * Cloudflare's model, not something this repo implements — which is also why the class and
+ * the `new_sqlite_classes` migration must stay exactly as they are. `renamed_classes` is for
+ * moving a namespace; nothing here moves one.
+ *
+ * The outer bound is the intersection of what Workers and R2 accept for a name: 3–63
+ * characters, lowercase letters, digits and hyphens, no leading or trailing hyphen. The
+ * refusals past that are this repo's, and each one is a way to lose a vault rather than a
+ * style rule.
+ */
+export const DEPLOYMENT_NAME_RULE =
+  "3-63 characters, lowercase letters, digits and hyphens, not starting or ending with a hyphen";
+export const DEPLOYMENT_NAME_RE = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
+/** Claimed by scripts/sandbox.mjs and by the live suite's `liveConfig()`. */
+const SANDBOX_MARKER = "sandbox";
+/** Named in CLAUDE.md as never in scope, on any account, for any reason. */
+const FOREIGN_BUCKET = "obsidian";
+
+export function parseDeploymentName(value, base) {
+  if (typeof base?.scriptName !== "string" || typeof base?.bucket !== "string") {
+    // Without the default deployment's names there is no way to tell a second vault from a
+    // sideways redeploy of the first, so this refuses rather than checking less.
+    throw new Error("parseDeploymentName needs the default deployment's scriptName and bucket");
+  }
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error("a deployment name is required — pass --vault <name>");
+  }
+  const name = value.trim();
+  if (!DEPLOYMENT_NAME_RE.test(name)) {
+    throw new Error(
+      `invalid deployment name "${name}" — it becomes a Worker script name and an R2 bucket ` +
+        `name, so it must be ${DEPLOYMENT_NAME_RULE}.`
+    );
+  }
+  if (name === base.scriptName || name === base.bucket) {
+    throw new Error(
+      `"${name}" is the DEFAULT deployment's own name. Naming it would not create a second\n` +
+        "vault — it would deploy the existing one while reading a different .env file, so the\n" +
+        "fork guard would be checking against a file that has never seen it. Deploy the default\n" +
+        "vault with no --vault at all."
+    );
+  }
+  if (name === FOREIGN_BUCKET) {
+    throw new Error(`"${FOREIGN_BUCKET}" is an unrelated bucket and is never in scope for this repo.`);
+  }
+  if (name.includes(SANDBOX_MARKER)) {
+    throw new Error(
+      `"${name}" carries the "${SANDBOX_MARKER}" marker, which is reserved for throwaway test\n` +
+        "deployments. `node scripts/sandbox.mjs --destroy --all` purges and deletes buckets by\n" +
+        "that marker, and the live suite uses it to tell a sandbox from a real vault. A vault\n" +
+        "named this way is one command away from being deleted with its contents."
+    );
+  }
+  return name;
+}
+
+/**
+ * Points a parsed config at a named deployment. Everything else — compatibility date, the
+ * Durable Object class and its migration tag, retention, the cron — stays exactly what
+ * `wrangler.jsonc` says, so a second vault cannot quietly drift from the first.
+ */
+export function applyDeploymentName(config, name) {
+  return { ...config, scriptName: name, bucket: name };
+}
+
+/**
  * Identifies "the bucket this deployment created" for one account. The bucket name is a
  * static string in `wrangler.jsonc`, so on any account that happens to already have a bucket
  * by that name, the old preflight silently adopted it — pointing this Worker's vault, GC
@@ -127,6 +197,10 @@ export function bucketOwnershipClaim(accountId, bucket) {
  * provisioned. Either one disagreeing with the config is the signal.
  *
  * A custom domain carries no script name, so it is not evidence and is not treated as any.
+ *
+ * `envFile` is which file those two values came from. A named deployment keeps its identity
+ * in its own `.env.<name>`, and the guard must be comparing this deployment against ITSELF —
+ * fed the default `.env`, every named deploy would look like a fork of production.
  */
 export function assertNoRenameFork({
   scriptName,
@@ -135,6 +209,7 @@ export function assertNoRenameFork({
   workerUrl = null,
   bucketOwned = null,
   allowRename = false,
+  envFile = ".env",
 }) {
   const conflicts = [];
 
@@ -150,7 +225,9 @@ export function assertNoRenameFork({
     if (host?.endsWith(".workers.dev")) {
       const deployed = host.slice(0, host.indexOf("."));
       if (deployed !== scriptName) {
-        conflicts.push(`Worker: .env WORKER_URL is serving "${deployed}", config says "${scriptName}"`);
+        conflicts.push(
+          `Worker: ${envFile} WORKER_URL is serving "${deployed}", config says "${scriptName}"`
+        );
       }
     }
   }
@@ -177,6 +254,43 @@ export function assertNoRenameFork({
       `Renaming a live deployment means migrating it: stand the new one up, copy the bucket,\n` +
       `re-point every device, then retire the old Worker. If that is what you are doing and\n` +
       `you have read the runbook, re-run with --migrate-rename.`
+  );
+}
+
+/**
+ * Refuses to upload a deployment over a Worker script this checkout has no record of.
+ *
+ * The bucket has an adoption guard; the script did not, and for a *named* deployment that is
+ * a real gap. The name comes from the command line rather than from `wrangler.jsonc`, so on
+ * the first deploy of a new vault there is nothing to compare against: `.env.<name>` does not
+ * exist yet, so the fork guard has no evidence, and if the account has an unrelated Worker of
+ * that name with no bucket to match, the bucket preflight succeeds too. The upload is a PUT —
+ * it would replace that Worker's code and bindings, and the schedule call afterwards replaces
+ * its cron.
+ *
+ * Recorded ownership costs no request: a deployment whose env file already names a URL was
+ * put there by a previous successful deploy, and `assertNoRenameFork` has already checked
+ * that URL against this script name. Only a first deploy pays for the lookup.
+ *
+ * `/settings` rather than the script itself: fetching the script returns JavaScript, and the
+ * caller's `cf()` refuses a non-JSON body.
+ */
+export async function ensureWorkerScript(cf, scriptName, { owned = false, adopt = false } = {}) {
+  if (owned) return { status: "owned" };
+  if (adopt) return { status: "adopted" };
+
+  const found = await cf(`/workers/scripts/${encodeURIComponent(scriptName)}/settings`);
+  if (found.status === 404) return { status: "absent" };
+  if (found.status !== 200) {
+    throw new Error(
+      `worker preflight failed with HTTP ${found.status}: ${JSON.stringify(found.body)}`
+    );
+  }
+  throw new Error(
+    `a Worker named "${scriptName}" already exists on this account and this checkout has no\n` +
+      "record of deploying it. Uploading would REPLACE that Worker's code, its bindings and\n" +
+      "its cron — whatever it currently is. If it really is a deployment of this vault whose\n" +
+      "credentials file you lost, re-run with --adopt-worker; otherwise choose another name."
   );
 }
 

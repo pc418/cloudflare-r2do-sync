@@ -17,15 +17,16 @@ import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { loadWorkerDeployConfig } from "./worker-config.mjs";
+import { loadWorkerDeployConfig, parseDeploymentName } from "./worker-config.mjs";
 import {
   ROOT,
   SETUP_USAGE,
-  loadEnvFile,
   localBin,
   mintOrReplaceAccessToken,
   normalizeWorkerUrl,
   parseSetupArgs,
+  resolveDeploymentEnv,
+  resolveDeploymentRequest,
   tokenOutputPlan,
   writeTokenHandoff,
   parseWranglerAccount,
@@ -100,9 +101,23 @@ if (opts.help) {
 }
 
 const config = loadWorkerDeployConfig();
-const fileEnv = loadEnvFile(ROOT);
-const hasToken = Boolean(process.env.CLOUDFLARE_TOKEN ?? fileEnv.CLOUDFLARE_TOKEN);
-const hasAccountId = Boolean(process.env.CLOUDFLARE_ACCOUNT_ID ?? fileEnv.CLOUDFLARE_ACCOUNT_ID);
+
+// Which vault, decided before the deploy path is chosen: a named vault is REST-only, so it
+// can change what `resolveAuthPath` is even allowed to answer.
+const { requested: vaultRequested, source: vaultSource } = resolveDeploymentRequest({ flag: opts.vault });
+let deploymentName = null;
+if (vaultRequested !== null) {
+  try {
+    deploymentName = parseDeploymentName(vaultRequested, config);
+  } catch (error) {
+    die(error instanceof Error ? error.message : String(error));
+  }
+  console.log(`\nVault: "${deploymentName}" — a separate Worker, bucket and commit log (from ${vaultSource})`);
+}
+
+const { env: fileEnv, file: envFile } = resolveDeploymentEnv({ root: ROOT, deploymentName });
+const hasToken = Boolean(fileEnv.CLOUDFLARE_TOKEN);
+const hasAccountId = Boolean(fileEnv.CLOUDFLARE_ACCOUNT_ID);
 
 // Only ask wrangler about itself when it might actually be used: on a machine set up for
 // the REST path, wrangler may be signed in elsewhere and is none of our business.
@@ -116,6 +131,19 @@ try {
   auth = resolveAuthPath({ requested: opts.requested, hasToken, hasAccountId, wranglerAccount: account });
 } catch (error) {
   die(error instanceof Error ? error.message : String(error));
+}
+// The wrangler path runs `wrangler deploy` against worker/wrangler.jsonc as it sits on disk,
+// and there is no CLI override for a script name or an R2 binding. Honouring --vault there
+// would mean generating a variant config the way scripts/sandbox.mjs does; until that exists,
+// deploying the DEFAULT vault while the user asked for a named one is the one outcome worth
+// refusing outright, because it publishes into the wrong vault and looks like it worked.
+if (deploymentName !== null && auth.path !== "token") {
+  die(
+    `--vault needs the REST path, and this run resolved to "${auth.path}" (${auth.reason}).\n` +
+      "  wrangler deploys whatever worker/wrangler.jsonc names, so it cannot stand up a\n" +
+      `  second vault — it would deploy the default one instead. Re-run with --token and\n` +
+      "  CLOUDFLARE_TOKEN + CLOUDFLARE_ACCOUNT_ID set. Nothing was deployed."
+  );
 }
 console.log(`\nDeploy path: ${auth.path} — ${auth.reason}\n`);
 
@@ -143,6 +171,8 @@ try {
     // bucket are about to be provisioned, and let the user stop.
     deployment = await deployViaRest({
       adoptBucket: opts.adoptBucket,
+      adoptWorker: opts.adoptWorker,
+      deploymentName,
       confirm: opts.assumeYes
         ? null
         : async (text) => {
@@ -156,7 +186,7 @@ try {
       assumeYes: opts.assumeYes,
       conflict: auth.conflict,
       account,
-      storedAdminToken: (process.env.ADMIN_TOKEN ?? fileEnv.ADMIN_TOKEN)?.trim() || null,
+      storedAdminToken: fileEnv.ADMIN_TOKEN?.trim() || null,
       run: wrangler,
       confirm,
       randomHex: () => randomBytes(32).toString("hex"),
@@ -180,15 +210,19 @@ console.log(`worker live at ${workerUrl}`);
 // The bucket claim records that this checkout provisioned that storage. Without it the next
 // REST run finds an existing, unclaimed bucket of the configured name and refuses to
 // continue — the adoption guard firing on the very deploy that created it.
-upsertEnvFile(ROOT, {
-  WORKER_URL: workerUrl,
-  ADMIN_TOKEN: deployment.adminToken,
-  ...(deployment.bucketClaim ? { VAULT_BUCKET_OWNED: deployment.bucketClaim } : {}),
-});
+upsertEnvFile(
+  ROOT,
+  {
+    WORKER_URL: workerUrl,
+    ADMIN_TOKEN: deployment.adminToken,
+    ...(deployment.bucketClaim ? { VAULT_BUCKET_OWNED: deployment.bucketClaim } : {}),
+  },
+  envFile
+);
 console.log(
   deployment.adminTokenKept
-    ? "admin credential unchanged — ./.env refreshed (WORKER_URL, ADMIN_TOKEN)"
-    : "admin credential rotated — ./.env updated (WORKER_URL, ADMIN_TOKEN)"
+    ? `admin credential unchanged — ./${envFile} refreshed (WORKER_URL, ADMIN_TOKEN)`
+    : `admin credential rotated — ./${envFile} updated (WORKER_URL, ADMIN_TOKEN)`
 );
 
 // Issue the access token — every run ends with one, because the deploy above always
@@ -227,6 +261,8 @@ if (output.kind === "file") {
       workerUrl,
       accessToken: issued.minted.token,
       tokenName: opts.tokenName,
+      deploymentName,
+      envFile,
     })
   );
 }

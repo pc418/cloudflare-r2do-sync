@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  applyDeploymentName,
   assertNoRenameFork,
   bucketOwnershipClaim,
   ensureR2Bucket,
+  ensureWorkerScript,
+  parseDeploymentName,
   parseWorkerDeployConfig,
 } from "./worker-config.mjs";
 
@@ -190,6 +193,141 @@ test("the rename guard only fires on evidence it actually has", () => {
 
   // A claim recorded against a different account says nothing about this one.
   assert.deepEqual(assertNoRenameFork({ ...base, bucketOwned: "acct-9:old-bucket" }), []);
+});
+
+// --- named deployments (second vaults) ---------------------------------------
+
+test("a deployment name has to be spellable as both a Worker and a bucket", () => {
+  const base = parseWorkerDeployConfig(VALID);
+
+  assert.equal(parseDeploymentName("notes-2", base), "notes-2");
+  assert.equal(parseDeploymentName("  notes-2  ", base), "notes-2");
+
+  for (const bad of [
+    "ab", // under R2's 3-character minimum
+    "-leading",
+    "trailing-",
+    "Upper-Case",
+    "under_score",
+    "dot.name",
+    "spaced name",
+    "a".repeat(64), // past the 63-character ceiling
+    "",
+    "   ",
+  ]) {
+    assert.throws(
+      () => parseDeploymentName(bad, base),
+      /invalid deployment name|deployment name is required/,
+      `expected "${bad}" to be refused`
+    );
+  }
+});
+
+test("a deployment name may not be a way to redeploy or delete something else", () => {
+  const base = parseWorkerDeployConfig(VALID);
+
+  // The default deployment under a different .env file: the fork guard would be comparing
+  // this deploy against a file that has never seen it, so it would sail through.
+  assert.throws(() => parseDeploymentName("sync-test", base), /DEFAULT deployment's own name/);
+  assert.throws(() => parseDeploymentName("sync-bucket", base), /DEFAULT deployment's own name/);
+  // Named in CLAUDE.md as never in scope, on any account.
+  assert.throws(() => parseDeploymentName("obsidian", base), /never in scope/);
+  // `sandbox.mjs --destroy --all` purges and deletes buckets by this marker, and the live
+  // suite uses it to tell a throwaway from a real vault. A vault wearing it is deletable.
+  for (const name of ["sandbox", "my-sandbox", "sandbox-notes", "notes-sandbox-2"]) {
+    assert.throws(() => parseDeploymentName(name, base), /reserved for throwaway/, name);
+  }
+});
+
+test("validating a deployment name without the default's names is refused, not skipped", () => {
+  // Passing no base would make every reserved-name check vacuously pass, which is the one
+  // failure mode that produces a deploy over the default vault's own Worker.
+  assert.throws(() => parseDeploymentName("notes-2", undefined), /needs the default deployment/);
+  assert.throws(() => parseDeploymentName("notes-2", { scriptName: "only" }), /needs the default deployment/);
+});
+
+test("a named deployment moves the Worker and bucket, and nothing else", () => {
+  const base = parseWorkerDeployConfig(VALID);
+  const named = applyDeploymentName(base, "notes-2");
+
+  assert.equal(named.scriptName, "notes-2");
+  assert.equal(named.bucket, "notes-2");
+  // The Durable Object class and its migration must NOT be renamed. The namespace is
+  // per-script, so the unchanged class under a new script name is already a separate, empty
+  // commit log; renaming the class instead would need `renamed_classes` and would be a
+  // migration of the existing namespace, which is data loss dressed as a deploy.
+  assert.equal(named.durableObjectClass, base.durableObjectClass);
+  assert.equal(named.durableObjectBinding, base.durableObjectBinding);
+  assert.equal(named.migrationTag, base.migrationTag);
+  // Everything a vault's behaviour depends on stays what wrangler.jsonc says.
+  assert.deepEqual(named.vars, base.vars);
+  assert.equal(named.cron, base.cron);
+  assert.equal(named.compatibilityDate, base.compatibilityDate);
+  assert.deepEqual(named.compatibilityFlags, base.compatibilityFlags);
+  // The base config is not mutated: one process may resolve several deployments.
+  assert.equal(base.scriptName, "sync-test");
+});
+
+test("a first named deploy will not upload over a Worker it never created", () => {
+  // The gap this closes: on a new vault's first deploy `.env.<name>` does not exist, so the
+  // fork guard has no evidence; if the account has an unrelated Worker of that name and no
+  // bucket to match, the bucket preflight passes too. The upload is a PUT, so it would
+  // replace that Worker's code, bindings and cron.
+  const present = async () => ({ status: 200, body: { result: { bindings: [] } } });
+  return Promise.all([
+    assert.rejects(ensureWorkerScript(present, "notes-2"), /already exists.*no\n?\s*record of/s),
+    // Recorded ownership is an ordinary redeploy, and costs no request at all.
+    ensureWorkerScript(
+      async () => assert.fail("an owned deployment must not be looked up"),
+      "notes-2",
+      { owned: true }
+    ).then((r) => assert.equal(r.status, "owned")),
+    // ...and an operator can still say the Worker is theirs.
+    ensureWorkerScript(present, "notes-2", { adopt: true }).then((r) =>
+      assert.equal(r.status, "adopted")
+    ),
+  ]);
+});
+
+test("worker preflight tells absence apart from a failure to ask", async () => {
+  assert.deepEqual(
+    await ensureWorkerScript(async () => ({ status: 404, body: null }), "notes-2"),
+    { status: "absent" }
+  );
+  // A 403 is not evidence the name is free; treating it as absence is how the overwrite
+  // happens on a token that simply cannot read scripts.
+  await assert.rejects(
+    ensureWorkerScript(async () => ({ status: 403, body: { error: "denied" } }), "notes-2"),
+    /worker preflight failed.*403/
+  );
+});
+
+test("worker preflight asks an endpoint that answers JSON", async () => {
+  // Fetching the script itself returns JavaScript, and deploy.mjs's `cf()` throws on a
+  // non-JSON body — so the existence check would fail as a parse error on exactly the case
+  // it exists to catch.
+  let asked = null;
+  await ensureWorkerScript(async (p) => {
+    asked = p;
+    return { status: 404, body: null };
+  }, "notes-2");
+  assert.equal(asked, "/workers/scripts/notes-2/settings");
+});
+
+test("the fork guard names the file it actually compared against", () => {
+  // Fed `.env` while deploying a named vault, this guard would refuse every second vault as a
+  // rename of production. The file name in the message is how that is visible when it happens.
+  assert.throws(
+    () =>
+      assertNoRenameFork({
+        scriptName: "notes-2",
+        bucket: "notes-2",
+        accountId: "acct-1",
+        workerUrl: "https://notes-2-old.example.workers.dev",
+        envFile: ".env.notes-2",
+      }),
+    /\.env\.notes-2 WORKER_URL is serving "notes-2-old"/
+  );
 });
 
 test("a caller that never opted into ownership tracking keeps the old behaviour", async () => {

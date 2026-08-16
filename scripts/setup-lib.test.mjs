@@ -5,9 +5,12 @@ import path from "node:path";
 import test from "node:test";
 import {
   ROOT,
+  deploymentEnvFile,
   loadEnvFile,
   localBin,
   parseSetupArgs,
+  resolveDeploymentEnv,
+  resolveDeploymentRequest,
   parseWranglerAccount,
   tokenOutputPlan,
   writeTokenHandoff,
@@ -83,6 +86,8 @@ test("setup args default to auto-detected auth and the shared token name", () =>
     out: null,
     printToken: false,
     adoptBucket: false,
+    adoptWorker: false,
+    vault: null,
   });
 });
 
@@ -93,12 +98,23 @@ test("setup args carry the explicit choices", () => {
   assert.equal(opts.assumeYes, true);
 });
 
+test("--vault and --name are different things and do not collide", () => {
+  // `--name` was already taken by the access token's label when second vaults were added, so
+  // the deployment gets `--vault`. Parsing them together is the case that would silently
+  // deploy the wrong vault, or label a token with a vault name, if they were ever merged.
+  const opts = parseSetupArgs(["--token", "--vault", "notes-2", "--name", "phone"]);
+  assert.equal(opts.vault, "notes-2");
+  assert.equal(opts.tokenName, "phone");
+});
+
 test("contradictory or malformed setup args fail instead of guessing", () => {
   assert.throws(() => parseSetupArgs(["--wrangler", "--token"]), /mutually exclusive/);
   assert.throws(() => parseSetupArgs(["--name"]), /needs a value/);
   assert.throws(() => parseSetupArgs(["--name", "--yes"]), /needs a value/);
   assert.throws(() => parseSetupArgs(["--deploy"]), /unknown option/);
   assert.throws(() => parseSetupArgs(["--relogin"]), /unknown option/);
+  assert.throws(() => parseSetupArgs(["--vault"]), /needs a name/);
+  assert.throws(() => parseSetupArgs(["--vault", "--yes"]), /needs a name/);
 });
 
 test("the REST deploy check names the target without printing the whole account id", () => {
@@ -120,6 +136,214 @@ test("the REST deploy check names the target without printing the whole account 
     bucketOwned: true,
   });
   assert.match(redeploy, /created by this checkout/);
+});
+
+// --- named deployments (second vaults) ---------------------------------------
+
+/** A repo root holding a default `.env` and, optionally, one named deployment's file. */
+function envRoot(files) {
+  const dir = mkdtempSync(path.join(tmpdir(), "r2do-env-"));
+  for (const [name, body] of Object.entries(files)) {
+    writeFileSync(path.join(dir, name), body);
+  }
+  return dir;
+}
+
+test("the default deployment keeps exactly the precedence it always had", () => {
+  const root = envRoot({ ".env": "CLOUDFLARE_TOKEN=from-file\nWORKER_URL=https://stored.example\n" });
+
+  const { file, scoped, env } = resolveDeploymentEnv({
+    root,
+    deploymentName: null,
+    processEnv: { WORKER_URL: "https://from-environment.example" },
+  });
+
+  assert.equal(file, ".env");
+  assert.equal(scoped, false);
+  assert.equal(env.CLOUDFLARE_TOKEN, "from-file");
+  // The real environment still wins for the default deployment. Changing that would break
+  // every existing CI invocation that exports WORKER_URL.
+  assert.equal(env.WORKER_URL, "https://from-environment.example");
+});
+
+test("a named vault never inherits the default deployment's identity", () => {
+  // The one that matters. `.env` holds production's URL, admin token and bucket claim. If any
+  // of them leaks into a named deploy: the fork guard compares this vault against
+  // production's URL and refuses the deploy as a rename; the bucket claim vouches for storage
+  // this vault never provisioned; and the admin token is checked against — and could be
+  // written over — another vault's Worker.
+  const root = envRoot({
+    ".env": [
+      "CLOUDFLARE_TOKEN=account-token",
+      "CLOUDFLARE_ACCOUNT_ID=acct-1",
+      "WORKER_URL=https://obsidian-log-sync.example.workers.dev",
+      "ADMIN_TOKEN=production-admin",
+      "VAULT_BUCKET_OWNED=acct-1:obsidian-log-sync",
+    ].join("\n"),
+  });
+
+  const { file, scoped, env } = resolveDeploymentEnv({ root, deploymentName: "notes-2", processEnv: {} });
+
+  assert.equal(file, ".env.notes-2");
+  assert.equal(scoped, true);
+  // Credentials are shared: a second vault normally lives on the same account, and copying a
+  // Cloudflare token into every file would spread it around the disk for nothing.
+  assert.equal(env.CLOUDFLARE_TOKEN, "account-token");
+  assert.equal(env.CLOUDFLARE_ACCOUNT_ID, "acct-1");
+  // Identity is not.
+  assert.equal(env.WORKER_URL, undefined);
+  assert.equal(env.ADMIN_TOKEN, undefined);
+  assert.equal(env.VAULT_BUCKET_OWNED, undefined);
+});
+
+test("a named vault reads its identity from its own file, and not from the environment", () => {
+  const root = envRoot({
+    ".env": "CLOUDFLARE_TOKEN=account-token\nWORKER_URL=https://production.example\n",
+    ".env.notes-2": "WORKER_URL=https://notes-2.example.workers.dev\nADMIN_TOKEN=second-admin\n",
+  });
+
+  const { env } = resolveDeploymentEnv({
+    root,
+    deploymentName: "notes-2",
+    // An exported WORKER_URL is almost always production's, left over from an earlier
+    // command. For a named vault the file is the only authority.
+    processEnv: { WORKER_URL: "https://production.example", CLOUDFLARE_TOKEN: "env-token" },
+  });
+
+  assert.equal(env.WORKER_URL, "https://notes-2.example.workers.dev");
+  assert.equal(env.ADMIN_TOKEN, "second-admin");
+  // Credentials still honour the environment, which is how CI passes them.
+  assert.equal(env.CLOUDFLARE_TOKEN, "env-token");
+});
+
+test("a named vault's first deploy has no identity rather than a borrowed one", () => {
+  // `.env.notes-2` does not exist yet. An inherited WORKER_URL here is what would make the
+  // fork guard refuse the very first deploy of a new vault.
+  const root = envRoot({ ".env": "CLOUDFLARE_TOKEN=t\nWORKER_URL=https://production.example\n" });
+  const { env } = resolveDeploymentEnv({ root, deploymentName: "notes-2", processEnv: {} });
+  assert.equal(env.WORKER_URL, undefined);
+  assert.equal(env.CLOUDFLARE_TOKEN, "t");
+});
+
+test("a deployment name that could name a path is refused where it becomes one", () => {
+  // `deploymentEnvFile` is what `upsertEnvFile` writes an admin token through, so a name that
+  // escapes the repo root has to die here even though callers validate too.
+  assert.equal(deploymentEnvFile(null), ".env");
+  assert.equal(deploymentEnvFile("notes-2"), ".env.notes-2");
+  for (const bad of ["../secrets", "a/b", ".env", "UPPER", "-lead", "trail-", "x", ""]) {
+    assert.throws(() => deploymentEnvFile(bad), /unusable deployment name/, `expected "${bad}" refused`);
+  }
+});
+
+test("env files are written per deployment, and one never overwrites another", () => {
+  const root = envRoot({ ".env": "CLOUDFLARE_TOKEN=keep-me\nWORKER_URL=https://production.example\n" });
+
+  upsertEnvFile(root, { WORKER_URL: "https://notes-2.example", ADMIN_TOKEN: "a2" }, ".env.notes-2");
+
+  assert.match(readFileSync(path.join(root, ".env.notes-2"), "utf8"), /WORKER_URL=https:\/\/notes-2\.example/);
+  // The default deployment's file is untouched — losing production's URL and admin token to a
+  // second vault's deploy is the failure this separation exists to prevent.
+  const original = readFileSync(path.join(root, ".env"), "utf8");
+  assert.match(original, /WORKER_URL=https:\/\/production\.example/);
+  assert.match(original, /CLOUDFLARE_TOKEN=keep-me/);
+  assert.equal(statSync(path.join(root, ".env.notes-2")).mode & 0o777, 0o600);
+});
+
+test("a vault name comes from the flag, then the environment, then not at all", () => {
+  assert.deepEqual(resolveDeploymentRequest({ flag: "notes-2", processEnv: {} }), {
+    requested: "notes-2",
+    source: "--vault",
+  });
+  // An explicit flag beats a stale exported VAULT_NAME rather than conflicting with it.
+  assert.deepEqual(resolveDeploymentRequest({ flag: "notes-2", processEnv: { VAULT_NAME: "other" } }), {
+    requested: "notes-2",
+    source: "--vault",
+  });
+  assert.deepEqual(resolveDeploymentRequest({ flag: null, processEnv: { VAULT_NAME: "notes-2" } }), {
+    requested: "notes-2",
+    source: "VAULT_NAME",
+  });
+  assert.deepEqual(resolveDeploymentRequest({ flag: null, processEnv: {} }), {
+    requested: null,
+    source: null,
+  });
+  // An empty value is not a vault name, so it must not select a `.env.` file.
+  assert.deepEqual(resolveDeploymentRequest({ flag: "  ", processEnv: { VAULT_NAME: "  " } }), {
+    requested: null,
+    source: null,
+  });
+});
+
+test("the deploy check says a named vault is a separate, empty one", () => {
+  const text = renderRestDeployCheck({
+    accountId: "0123456789abcdef0123456789abcdef",
+    scriptName: "notes-2",
+    bucket: "notes-2",
+    bucketOwned: false,
+    deploymentName: "notes-2",
+    envFile: ".env.notes-2",
+  });
+  assert.match(text, /SEPARATE VAULT "notes-2"/);
+  assert.match(text, /Records\s+\.env\.notes-2/);
+  // The mistake this screen exists to stop: pointing an existing device at a new vault.
+  assert.match(text, /NEW, EMPTY vault/);
+
+  // A redeploy onto its own storage is not announced as a new vault.
+  const redeploy = renderRestDeployCheck({
+    accountId: "0123456789abcdef0123456789abcdef",
+    scriptName: "notes-2",
+    bucket: "notes-2",
+    bucketOwned: true,
+    deploymentName: "notes-2",
+    envFile: ".env.notes-2",
+  });
+  assert.doesNotMatch(redeploy, /NEW, EMPTY vault/);
+});
+
+test("a recovery command never silently drops the vault it was fixing", () => {
+  // Both messages recommend a follow-up command. Printed bare while --vault was in force,
+  // they name the DEFAULT deployment — where they succeed, replace its same-named access
+  // token, and leave the vault the user was actually repairing untouched.
+  const source = readFileSync(path.join(ROOT, "scripts", "access-token.mjs"), "utf8");
+  assert.match(source, /issue one with: node scripts\/access-token\.mjs\$\{vaultFlag\(\)\}/);
+  assert.match(source, /re-run \\`node scripts\/setup\.mjs\$\{vaultFlag\(\)\}\\`/);
+  // The 401 handler runs outside main(), so the resolved vault has to be reachable from it.
+  assert.match(source, /^let selectedVault = null;$/m);
+  assert.match(source, /selectedVault = requested;/);
+});
+
+test("every generated credentials file is ignored, and the example is not", () => {
+  // Each .env.<name> holds an ADMIN_TOKEN that mints vault-wide access tokens. Ignoring only
+  // the exact name `.env` left them untracked-but-addable, so `git add -A` would publish one.
+  const ignore = readFileSync(path.join(ROOT, ".gitignore"), "utf8");
+  assert.match(ignore, /^\.env\.\*$/m);
+  assert.match(ignore, /^!\.env\.example$/m);
+});
+
+test("setup args carry an explicit Worker adoption separately from the bucket", () => {
+  // Two different resources: adopting a bucket must not silently adopt a script, because
+  // adopting a script REPLACES its code, bindings and cron.
+  assert.equal(parseSetupArgs(["--adopt-bucket"]).adoptWorker, false);
+  assert.equal(parseSetupArgs(["--adopt-worker"]).adoptBucket, false);
+  assert.equal(parseSetupArgs(["--adopt-worker"]).adoptWorker, true);
+});
+
+test("the closing summary carries the vault through to the commands it prints", () => {
+  const text = renderSetupSummary({
+    workerUrl: "https://notes-2.example.workers.dev",
+    accessToken: "tok",
+    deploymentName: "notes-2",
+    envFile: ".env.notes-2",
+  });
+  // Printing the bare command would send the reader's next token operation to the DEFAULT
+  // vault, which succeeds and mints against the wrong remote.
+  assert.match(text, /access-token\.mjs --vault notes-2 --rotate/);
+  assert.match(text, /\.\/\.env\.notes-2/);
+  assert.doesNotMatch(text, /saved to \.\/\.env /);
+
+  const def = renderSetupSummary({ workerUrl: "https://x.example", accessToken: "tok" });
+  assert.match(def, /access-token\.mjs --rotate/);
+  assert.match(def, /saved to \.\/\.env /);
 });
 
 test("the deploy check states the retention the sweep will delete by", () => {

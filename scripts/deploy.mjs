@@ -12,15 +12,19 @@ import { createInterface } from "node:readline";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  applyDeploymentName,
   assertNoRenameFork,
   bucketOwnershipClaim,
   ensureR2Bucket,
+  ensureWorkerScript,
   loadWorkerDeployConfig,
+  parseDeploymentName,
 } from "./worker-config.mjs";
 import {
-  loadEnvFile,
   localBin,
   renderRestDeployCheck,
+  resolveDeploymentEnv,
+  resolveDeploymentRequest,
   upsertEnvFile,
   verifyAdminToken,
   waitForHealth,
@@ -42,8 +46,14 @@ export async function deployViaRest({
   log = console.log,
   confirm = null,
   adoptBucket = false,
+  adoptWorker = false,
   migrateRename = false,
+  deploymentName = null,
 } = {}) {
+  const base = loadWorkerDeployConfig();
+  // Validated against the default deployment's own names, so a "second vault" that is really
+  // the first one under a different .env file is refused before anything is created.
+  const VAULT = deploymentName === null ? null : parseDeploymentName(deploymentName, base);
   const {
     scriptName: SCRIPT_NAME,
     compatibilityDate: COMPAT_DATE,
@@ -54,12 +64,16 @@ export async function deployViaRest({
     migrationTag: MIGRATION_TAG,
     cron: CRON,
     vars: VARS,
-  } = loadWorkerDeployConfig();
+  } = VAULT === null ? base : applyDeploymentName(base, VAULT);
 
-  const fileEnv = loadEnvFile(ROOT);
+  // Account credentials fall back to .env; this deployment's URL, admin token and bucket
+  // claim come only from its own file. See `resolveDeploymentEnv`.
+  const { env: fileEnv, file: ENV_FILE } = resolveDeploymentEnv({ root: ROOT, deploymentName: VAULT });
   const required = (name, hint) => {
-    const value = process.env[name] ?? fileEnv[name];
-    if (!value) throw new Error(`${name} is not set — add it to .env or the environment (${hint})`);
+    const value = fileEnv[name];
+    if (!value) {
+      throw new Error(`${name} is not set — add it to .env or the environment (${hint})`);
+    }
     return value;
   };
 
@@ -130,17 +144,22 @@ export async function deployViaRest({
   // Which account, which script, which bucket — before anything is created. The wrangler
   // path has always named its target; this one used to create resources on whatever account
   // CLOUDFLARE_ACCOUNT_ID happened to hold. `confirm` is null when setup.mjs already asked.
-  const ownedClaim = (process.env.VAULT_BUCKET_OWNED ?? fileEnv.VAULT_BUCKET_OWNED)?.trim() || null;
+  const ownedClaim = fileEnv.VAULT_BUCKET_OWNED?.trim() || null;
 
   // Before the confirmation screen, not after: a fork is not something to be talked into.
+  // Scoped to this deployment's own file — compared against production's `.env`, every named
+  // deploy would look like a rename fork of it.
   assertNoRenameFork({
     scriptName: SCRIPT_NAME,
     bucket: BUCKET,
     accountId: ACCOUNT_ID,
-    workerUrl: process.env.WORKER_URL ?? fileEnv.WORKER_URL ?? null,
+    workerUrl: fileEnv.WORKER_URL ?? null,
     bucketOwned: ownedClaim,
     allowRename: migrateRename,
+    envFile: ENV_FILE,
   });
+
+  if (VAULT !== null) log(`deployment "${VAULT}" — separate vault, credentials in ${ENV_FILE}`);
 
   if (confirm !== null) {
     const proceed = await confirm(
@@ -150,12 +169,28 @@ export async function deployViaRest({
         bucket: BUCKET,
         bucketOwned: ownedClaim === bucketOwnershipClaim(ACCOUNT_ID, BUCKET),
         retention: VARS,
+        deploymentName: VAULT,
+        envFile: ENV_FILE,
       })
     );
     if (!proceed) throw new Error("cancelled — nothing was deployed");
   }
 
   // 2. Storage and workers.dev subdomain (must exist before first upload) ------
+  // The script check comes before the bucket is created, so a refusal leaves nothing behind.
+  // Named deployments only: the default deployment's name comes from `wrangler.jsonc` and is
+  // this repo's own, and adding a preflight there would refuse the ordinary first deploy from
+  // a checkout whose .env was never kept.
+  if (VAULT !== null) {
+    const script = await ensureWorkerScript(cf, SCRIPT_NAME, {
+      // A recorded URL is proof a previous deploy from this checkout put it there, and the
+      // fork guard above has already checked it against this script name.
+      owned: Boolean(fileEnv.WORKER_URL?.trim()),
+      adopt: adoptWorker,
+    });
+    log(`Worker "${SCRIPT_NAME}": ${script.status}`);
+  }
+
   const bucket = await ensureR2Bucket(cf, BUCKET, {
     accountId: ACCOUNT_ID,
     owned: ownedClaim,
@@ -232,7 +267,7 @@ export async function deployViaRest({
   const secrets = await cf(`/workers/scripts/${SCRIPT_NAME}/secrets`);
   if (secrets.status !== 200) fail("list-secrets", secrets);
   const hasAdmin = (secrets.body.result ?? []).some((s) => s.name === "ADMIN_TOKEN");
-  const stored = (process.env.ADMIN_TOKEN ?? fileEnv.ADMIN_TOKEN)?.trim() || null;
+  const stored = fileEnv.ADMIN_TOKEN?.trim() || null;
   let adminToken = null;
   let adminTokenKept = false;
   if (hasAdmin && stored) {
@@ -256,7 +291,7 @@ export async function deployViaRest({
     if (put.status !== 200 && put.status !== 201) fail("put-secret", put);
   }
 
-  return { url, adminToken, adminTokenKept, bucketClaim: bucket.claim };
+  return { url, adminToken, adminTokenKept, bucketClaim: bucket.claim, envFile: ENV_FILE, deploymentName: VAULT };
 }
 
 /** Prints the target and waits for a yes. No terminal means no unattended provisioning. */
@@ -277,15 +312,27 @@ if (invokedDirectly) {
   try {
     const argv = process.argv.slice(2);
     const adoptBucket = argv.includes("--adopt-bucket");
+    const adoptWorker = argv.includes("--adopt-worker");
     const assumeYes = argv.includes("--yes") || argv.includes("-y");
     const migrateRename = argv.includes("--migrate-rename");
-    const known = ["--adopt-bucket", "--yes", "-y", "--migrate-rename"];
-    const unknown = argv.find((a) => !known.includes(a));
+    const known = ["--adopt-bucket", "--adopt-worker", "--yes", "-y", "--migrate-rename", "--vault"];
+    const unknown = argv.find((a, i) => !known.includes(a) && argv[i - 1] !== "--vault");
     if (unknown) {
       throw new Error(
         `unknown option "${unknown}"\n\n` +
-          "usage: node scripts/deploy.mjs [--adopt-bucket] [--migrate-rename] [--yes]"
+          "usage: node scripts/deploy.mjs [--vault <name>] [--adopt-bucket] [--adopt-worker]\n" +
+          "                               [--migrate-rename] [--yes]"
       );
+    }
+    const vaultFlag = argv.includes("--vault") ? (argv[argv.indexOf("--vault") + 1] ?? "") : null;
+    if (vaultFlag !== null && (vaultFlag === "" || vaultFlag.startsWith("--"))) {
+      throw new Error("--vault needs a name");
+    }
+    const { requested: deploymentName, source } = resolveDeploymentRequest({ flag: vaultFlag });
+    // Said out loud before anything is created: a VAULT_NAME left exported in an old shell
+    // would otherwise redirect the deploy to another vault with nothing on screen saying so.
+    if (deploymentName !== null) {
+      console.log(`deploying vault "${deploymentName}" (from ${source})`);
     }
     // --migrate-rename is never implied by --yes. Skipping the confirmation screen is a
     // statement about typing; standing up a second deployment is not.
@@ -293,21 +340,28 @@ if (invokedDirectly) {
       throw new Error("--migrate-rename cannot be combined with --yes: confirm the target by hand");
     }
 
-    const { url, adminToken, adminTokenKept, bucketClaim } = await deployViaRest({
+    const { url, adminToken, adminTokenKept, bucketClaim, envFile } = await deployViaRest({
       adoptBucket,
+      adoptWorker,
       migrateRename,
+      deploymentName,
       confirm: assumeYes ? null : askToProceed,
     });
-    // The admin credential is never shown to a person — it lives in ./.env so the helper
-    // scripts (access-token.mjs, setup.mjs) keep working without anyone copying secrets.
-    // The bucket claim records that this checkout provisioned that storage, so a later
-    // redeploy is an ordinary reuse rather than an unexplained adoption.
-    upsertEnvFile(ROOT, {
-      WORKER_URL: url,
-      ADMIN_TOKEN: adminToken,
-      ...(bucketClaim ? { VAULT_BUCKET_OWNED: bucketClaim } : {}),
-    });
-    console.log(`admin credential ${adminTokenKept ? "unchanged" : "rotated"} — ./.env updated (WORKER_URL, ADMIN_TOKEN)`);
+    // The admin credential is never shown to a person — it lives in the deployment's env file
+    // so the helper scripts (access-token.mjs, setup.mjs) keep working without anyone copying
+    // secrets. The bucket claim records that this checkout provisioned that storage, so a
+    // later redeploy is an ordinary reuse rather than an unexplained adoption. A named vault
+    // writes to .env.<name>: overwriting .env would replace production's identity with it.
+    upsertEnvFile(
+      ROOT,
+      {
+        WORKER_URL: url,
+        ADMIN_TOKEN: adminToken,
+        ...(bucketClaim ? { VAULT_BUCKET_OWNED: bucketClaim } : {}),
+      },
+      envFile
+    );
+    console.log(`admin credential ${adminTokenKept ? "unchanged" : "rotated"} — ./${envFile} updated (WORKER_URL, ADMIN_TOKEN)`);
     console.log(`\nDEPLOYED: ${url}`);
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);

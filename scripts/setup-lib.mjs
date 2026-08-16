@@ -6,6 +6,7 @@
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEPLOYMENT_NAME_RE } from "./worker-config.mjs";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -46,10 +47,10 @@ export const WRANGLER_CMD = "node worker/node_modules/wrangler/bin/wrangler.js";
 const splitLines = (text) => text.split(/\r?\n/);
 
 /** `.env` values, if the file exists. Real environment variables take precedence. */
-export function loadEnvFile(root = ROOT) {
+export function loadEnvFile(root = ROOT, fileName = ".env") {
   const out = {};
   try {
-    for (const line of splitLines(readFileSync(path.join(root, ".env"), "utf8"))) {
+    for (const line of splitLines(readFileSync(path.join(root, fileName), "utf8"))) {
       const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$/);
       if (m) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
     }
@@ -70,8 +71,8 @@ export function loadEnvFile(root = ROOT) {
  * This is how the admin credential stays out of the user's hands entirely: setup stores
  * what the helper scripts need, and nobody has to copy secrets anywhere.
  */
-export function upsertEnvFile(root, values) {
-  const file = path.join(root, ".env");
+export function upsertEnvFile(root, values, fileName = ".env") {
+  const file = path.join(root, fileName);
   const lines = existsSync(file) ? splitLines(readFileSync(file, "utf8")) : [];
   while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
 
@@ -91,6 +92,104 @@ export function upsertEnvFile(root, values) {
   // this function has just written an admin token and a vault-wide access token into it.
   chmodSync(file, 0o600);
   return file;
+}
+
+// --- deployment identity ------------------------------------------------------
+// A named deployment is a second vault on the same Cloudflare account: same credentials,
+// entirely separate Worker, bucket, Durable Object and head.
+
+/** Which deployment a value describes, rather than which account it authenticates to. */
+export const DEPLOYMENT_IDENTITY_KEYS = ["WORKER_URL", "ADMIN_TOKEN", "VAULT_BUCKET_OWNED"];
+/** Which account to talk to. Shared by every deployment made from this checkout. */
+export const ACCOUNT_CREDENTIAL_KEYS = ["CLOUDFLARE_TOKEN", "CLOUDFLARE_ACCOUNT_ID"];
+
+/**
+ * `.env` for the default deployment, `.env.<name>` for a named one.
+ *
+ * The name is re-checked here even though callers validate it, because this is where it stops
+ * being a label and becomes a path that gets WRITTEN — a `..` or a slash reaching this point
+ * would have `upsertEnvFile` overwrite a file outside the repo with a Cloudflare admin token
+ * in it. Cheap invariant, catastrophic if absent, so it is asserted rather than assumed.
+ */
+export function deploymentEnvFile(deploymentName = null) {
+  if (deploymentName === null) return ".env";
+  if (typeof deploymentName !== "string" || !DEPLOYMENT_NAME_RE.test(deploymentName)) {
+    throw new Error(`unusable deployment name ${JSON.stringify(deploymentName)} — it names a file`);
+  }
+  return `.env.${deploymentName}`;
+}
+
+/**
+ * Resolves the environment one deployment runs under, and says which file owns it.
+ *
+ * The split is the whole point, and it is not symmetric:
+ *
+ * - **Account credentials** fall back to `.env`. A second vault normally lives on the same
+ *   account, and making the user copy their Cloudflare token into every file would spread a
+ *   credential across the disk for nothing.
+ * - **Deployment identity** comes from the named file ALONE — not from `.env`, and not from
+ *   the real environment either. `.env` holds production's `WORKER_URL`, `ADMIN_TOKEN` and
+ *   `VAULT_BUCKET_OWNED`; inheriting any of them would point a named deploy's fork guard,
+ *   admin credential and bucket claim at a vault that is not this one. On the very first
+ *   named deploy, when `.env.<name>` does not exist yet, the correct answer is that this
+ *   deployment has no identity yet — an inherited `WORKER_URL` would instead make the fork
+ *   guard refuse the deploy as a rename of production.
+ *
+ * The default deployment keeps exactly the precedence it always had: environment, then `.env`.
+ */
+export function resolveDeploymentEnv({
+  root = ROOT,
+  deploymentName = null,
+  processEnv = process.env,
+} = {}) {
+  const file = deploymentEnvFile(deploymentName);
+  const fromEnv = (key) => {
+    const value = processEnv[key];
+    return typeof value === "string" && value.trim() !== "" ? value : undefined;
+  };
+
+  if (deploymentName === null) {
+    const stored = loadEnvFile(root);
+    const env = { ...stored };
+    for (const key of [...ACCOUNT_CREDENTIAL_KEYS, ...DEPLOYMENT_IDENTITY_KEYS]) {
+      const value = fromEnv(key);
+      if (value !== undefined) env[key] = value;
+    }
+    return { file, deploymentName, scoped: false, env };
+  }
+
+  const account = loadEnvFile(root);
+  const own = loadEnvFile(root, file);
+  const env = {};
+  for (const key of ACCOUNT_CREDENTIAL_KEYS) {
+    const value = fromEnv(key) ?? own[key] ?? account[key];
+    if (value !== undefined) env[key] = value;
+  }
+  for (const key of DEPLOYMENT_IDENTITY_KEYS) {
+    if (own[key] !== undefined) env[key] = own[key];
+  }
+  return { file, deploymentName, scoped: true, env };
+}
+
+/**
+ * Which deployment this invocation is for: an explicit flag, else `VAULT_NAME`, else the
+ * default. Returned unvalidated — `parseDeploymentName` needs the parsed config to know what
+ * the default deployment is called, and that is the caller's to load.
+ *
+ * The environment is honoured because a second vault is usually driven from a script, and
+ * refused silence is the risk: an exported `VAULT_NAME` left over from an earlier shell
+ * would otherwise redirect a deploy to another vault with nothing said. Every caller here
+ * announces the resolved deployment and its file before it creates anything.
+ */
+export function resolveDeploymentRequest({ flag = null, processEnv = process.env } = {}) {
+  if (typeof flag === "string" && flag.trim() !== "") {
+    return { requested: flag.trim(), source: "--vault" };
+  }
+  const fromEnv = processEnv.VAULT_NAME;
+  if (typeof fromEnv === "string" && fromEnv.trim() !== "") {
+    return { requested: fromEnv.trim(), source: "VAULT_NAME" };
+  }
+  return { requested: null, source: null };
 }
 
 function isLoopbackHostname(hostname) {
@@ -126,16 +225,25 @@ export const SETUP_USAGE = `usage: node scripts/setup.mjs [options]
 
   --wrangler         deploy with the wrangler CLI (its own login decides the account)
   --token            deploy with the Cloudflare REST API (CLOUDFLARE_TOKEN + CLOUDFLARE_ACCOUNT_ID)
+  --vault <name>     stand up a SEPARATE second vault under that name (REST path only;
+                     also settable as VAULT_NAME). Worker, R2 bucket and Durable Object
+                     are all its own, and its credentials live in .env.<name>.
   --name <label>     label for the access token (default: vault)
   --out <file>       write the access token to a 0600 JSON file instead of printing it
   --print-token      print the token even when stdout is not a terminal
   --adopt-bucket     use an existing R2 bucket of the configured name (REST path)
+  --adopt-worker     upload over an existing Worker of that name (REST path). Only ever
+                     needed for a named vault whose .env.<name> was lost — it REPLACES
+                     that Worker's code, bindings and cron.
   --yes              do not prompt for confirmation (the target account is still printed)
   --help
 
 With neither --wrangler nor --token the path is chosen from what is configured, and the
 choice is always announced before anything is created. Setup never logs wrangler in or
-out — it reads who you are and stops if that is not who you want.`;
+out — it reads who you are and stops if that is not who you want.
+
+Without --vault everything behaves exactly as before, against the deployment named in
+worker/wrangler.jsonc, with its credentials in .env.`;
 
 export function parseSetupArgs(argv) {
   const opts = {
@@ -146,10 +254,16 @@ export function parseSetupArgs(argv) {
     out: null,
     printToken: false,
     adoptBucket: false,
+    adoptWorker: false,
+    vault: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--wrangler" || arg === "--token") {
+    if (arg === "--vault") {
+      const value = argv[++i];
+      if (!value || value.startsWith("--")) throw new Error("--vault needs a name");
+      opts.vault = value;
+    } else if (arg === "--wrangler" || arg === "--token") {
       const requested = arg.slice(2);
       if (opts.requested && opts.requested !== requested) {
         throw new Error("--wrangler and --token are mutually exclusive");
@@ -167,6 +281,8 @@ export function parseSetupArgs(argv) {
       opts.printToken = true;
     } else if (arg === "--adopt-bucket") {
       opts.adoptBucket = true;
+    } else if (arg === "--adopt-worker") {
+      opts.adoptWorker = true;
     } else if (arg === "--yes" || arg === "-y") {
       opts.assumeYes = true;
     } else if (arg === "--help" || arg === "-h") {
@@ -410,15 +526,28 @@ export async function waitForHealth({
  * shown — enough to tell two accounts apart on sight, without writing the whole identifier
  * into a terminal transcript.
  */
-export function renderRestDeployCheck({ accountId, scriptName, bucket, bucketOwned, retention }) {
+export function renderRestDeployCheck({
+  accountId,
+  scriptName,
+  bucket,
+  bucketOwned,
+  retention,
+  deploymentName = null,
+  envFile = ".env",
+}) {
   return [
     "",
     THIN,
-    "  DEPLOY TARGET (Cloudflare REST API)",
+    deploymentName === null
+      ? "  DEPLOY TARGET (Cloudflare REST API)"
+      : `  DEPLOY TARGET (Cloudflare REST API) — SEPARATE VAULT "${deploymentName}"`,
     THIN,
     `  Account    ${String(accountId).slice(0, 8)}… (from CLOUDFLARE_ACCOUNT_ID)`,
     `  Worker     ${scriptName}`,
     `  R2 bucket  ${bucket}${bucketOwned ? " (created by this checkout)" : ""}`,
+    // Which file this deployment's URL and admin credential are read from and written to.
+    // With several vaults on one account it is the only thing distinguishing them on disk.
+    `  Records    ${envFile}`,
     // Retention is the one deploy-time setting that decides what gets deleted, so it belongs
     // on the same screen as the bucket it deletes from.
     ...(retention
@@ -428,6 +557,15 @@ export function renderRestDeployCheck({ accountId, scriptName, bucket, bucketOwn
     bucketOwned
       ? "  This is a redeploy onto storage this checkout provisioned."
       : "  If that bucket already exists on this account, setup will stop rather than adopt it.",
+    // A second vault shares nothing but the account. Said here because the failure it
+    // prevents is a person pointing an existing device at it and finding an empty vault.
+    ...(deploymentName !== null && !bucketOwned
+      ? [
+          "",
+          "  This is a NEW, EMPTY vault: its own Worker, bucket and commit log. No note, key",
+          "  or device from any other deployment carries over, and nothing here touches them.",
+        ]
+      : []),
     "",
   ].join("\n");
 }
@@ -471,7 +609,16 @@ export function writeTokenHandoff(file, payload) {
  * else. There is deliberately no admin-token section — that credential is managed
  * automatically in ./.env, so a person never stores, types, or rotates it by hand.
  */
-export function renderSetupSummary({ workerUrl, accessToken, tokenName = "vault" }) {
+export function renderSetupSummary({
+  workerUrl,
+  accessToken,
+  tokenName = "vault",
+  deploymentName = null,
+  envFile = ".env",
+}) {
+  // Every later command has to be told which vault it is for, so the flag is carried into
+  // the printed commands rather than left for the reader to remember.
+  const vaultFlag = deploymentName === null ? "" : ` --vault ${deploymentName}`;
   if (!accessToken) {
     // Setup always ends holding a working admin credential (reused or rotated), so an
     // absent access token is a bug in the caller, not a state to explain to the user.
@@ -480,9 +627,18 @@ export function renderSetupSummary({ workerUrl, accessToken, tokenName = "vault"
   return [
     "",
     WIDE,
-    "  PASTE THESE INTO OBSIDIAN",
+    deploymentName === null
+      ? "  PASTE THESE INTO OBSIDIAN"
+      : `  PASTE THESE INTO OBSIDIAN — VAULT "${deploymentName}"`,
     WIDE,
     "",
+    ...(deploymentName === null
+      ? []
+      : [
+          `  This is a separate vault from your default one. Use it in a DIFFERENT Obsidian`,
+          `  vault: pointing an existing device here replaces which remote it syncs with.`,
+          "",
+        ]),
     `  Server URL   ${workerUrl}`,
     `  Access token ${accessToken}`,
     "",
@@ -511,13 +667,13 @@ export function renderSetupSummary({ workerUrl, accessToken, tokenName = "vault"
     "  GOOD TO KNOW (nothing to do here)",
     THIN,
     "",
-    "  A server admin secret (ADMIN_TOKEN) was saved to ./.env next to the server",
+    `  A server admin secret (ADMIN_TOKEN) was saved to ./${envFile} next to the server`,
     "  URL. It lets the scripts in this repo issue and revoke access tokens — it",
-    "  cannot read your notes. You will most likely never touch it: .env is",
+    `  cannot read your notes. You will most likely never touch it: ${envFile} is`,
     "  gitignored, and if it is ever lost or wrong, re-running setup fixes it.",
     "",
-    "  Lost a device:        node scripts/access-token.mjs --rotate   (revokes the rest)",
-    "  Just need the token:  node scripts/access-token.mjs            (or re-run setup)",
+    `  Lost a device:        node scripts/access-token.mjs${vaultFlag} --rotate   (revokes the rest)`,
+    `  Just need the token:  node scripts/access-token.mjs${vaultFlag}            (or re-run setup)`,
     WIDE,
     "",
   ].join("\n");
