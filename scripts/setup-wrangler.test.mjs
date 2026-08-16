@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import test from "node:test";
-import { ROOT, parseWranglerAccount } from "./setup-lib.mjs";
+import { ROOT, localBin, parseWranglerAccount } from "./setup-lib.mjs";
 import { SetupError, deployViaWrangler } from "./setup-wrangler.mjs";
 
 const CONFIG = { scriptName: "obsidian-log-sync", bucket: "obsidian-log-sync" };
@@ -158,7 +158,7 @@ test("declining the account check deploys nothing", async () => {
   const w = fakeWrangler({ deploy: { status: 0, out: DEPLOY_OUT } });
   await assert.rejects(
     deployViaWrangler({ ...base({ assumeYes: false, confirm: async () => false }), run: w.run }),
-    (error) => error instanceof SetupError && /wrangler logout/.test(error.message)
+    (error) => error instanceof SetupError && /wrangler\.js logout/.test(error.message)
   );
   assert.deepEqual(w.commands(), []);
 });
@@ -170,7 +170,7 @@ test("a logged-out CLI stops with instructions instead of logging you in", async
 
   await assert.rejects(
     deployViaWrangler({ ...base({ account: null }), run: w.run }),
-    (error) => error instanceof SetupError && /node_modules\/\.bin\/wrangler login/.test(error.message)
+    (error) => error instanceof SetupError && /wrangler\/bin\/wrangler\.js login/.test(error.message)
   );
   assert.deepEqual(w.commands(), []);
 });
@@ -185,10 +185,13 @@ test("no path ever runs wrangler login or logout", async () => {
 // --- one real invocation, to prove the spawn wiring matches the fake ---------
 
 test("the real wrangler binary answers whoami through the same call shape", (t) => {
-  const bin = path.join(ROOT, "worker", "node_modules", ".bin", "wrangler");
+  // Deliberately the entrypoint under `process.execPath`, matching setup.mjs: spawning the
+  // `node_modules/.bin` shim is what fails with ENOENT on Windows (issue #9), and this is
+  // the only test that exercises the real spawn wiring rather than the fake.
+  const bin = localBin(path.join(ROOT, "worker"), "wrangler/bin/wrangler.js");
   if (!existsSync(bin)) return t.skip("wrangler devDependency not installed");
 
-  const res = spawnSync(bin, ["whoami"], {
+  const res = spawnSync(process.execPath, [bin, "whoami"], {
     cwd: path.join(ROOT, "worker"),
     encoding: "utf8",
     stdio: ["inherit", "pipe", "pipe"],

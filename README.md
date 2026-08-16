@@ -55,7 +55,8 @@ node scripts/setup.mjs
 ```
 
 Log in first, if you have not already, with the wrangler this repo pins —
-`./worker/node_modules/.bin/wrangler login`. Setup uses only that copy and never logs you
+`node worker/node_modules/wrangler/bin/wrangler.js login`, which works the same on Windows,
+macOS and Linux. Setup uses only that copy and never logs you
 in or out. It prints **which account** it is about to deploy to and waits for you to
 confirm, then creates the R2 bucket, deploys the Worker, sets the admin secret, schedules
 nightly garbage collection, smoke-tests `/health`, and issues your access token. Every step

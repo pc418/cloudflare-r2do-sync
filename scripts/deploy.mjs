@@ -20,6 +20,7 @@ import {
 } from "./worker-config.mjs";
 import {
   loadEnvFile,
+  localBin,
   renderRestDeployCheck,
   upsertEnvFile,
   verifyAdminToken,
@@ -91,9 +92,11 @@ export async function deployViaRest({
 
   // 1. Bundle -----------------------------------------------------------------
   log("bundling worker...");
+  // `process.execPath` + the package's own entrypoint, not the `.bin` shim: see `localBin`.
   execFileSync(
-    path.join(WORKER_DIR, "node_modules", ".bin", "esbuild"),
+    process.execPath,
     [
+      localBin(WORKER_DIR, "esbuild/bin/esbuild"),
       "src/index.ts",
       "--bundle",
       "--format=esm",

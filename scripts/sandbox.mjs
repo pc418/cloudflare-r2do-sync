@@ -25,7 +25,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadEnvFile, waitForHealth } from "./setup-lib.mjs";
+import { loadEnvFile, localBin, waitForHealth } from "./setup-lib.mjs";
 import { loadWorkerDeployConfig } from "./worker-config.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -47,8 +47,13 @@ const nameFor = (base, suffix) =>
 /** Env var suffix: the group name as an identifier, so one process can hold several. */
 const varSuffix = (suffix) => (suffix === "" ? "" : `_${suffix.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`);
 
+// The pinned devDependency under the current Node, not `npx` — `npx` is a `.cmd` on Windows
+// (unspawnable without a shell, see `localBin`) and resolves to whatever the registry serves
+// today, on the path that can `--destroy` a bucket.
+const LOCAL_WRANGLER = localBin(WORKER_DIR, "wrangler/bin/wrangler.js");
+
 function wrangler(args, { input } = {}) {
-  const run = spawnSync("npx", ["wrangler", ...args], {
+  const run = spawnSync(process.execPath, [LOCAL_WRANGLER, ...args], {
     cwd: WORKER_DIR,
     input,
     encoding: "utf8",
@@ -68,7 +73,10 @@ const workersDevUrl = (out) => /(https:\/\/[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev)
  * sandbox. Either would mean `--destroy` could delete a real vault's storage.
  */
 function assertSandboxAccount() {
-  const whoami = execFileSync("npx", ["wrangler", "whoami"], { cwd: WORKER_DIR, encoding: "utf8" });
+  const whoami = execFileSync(process.execPath, [LOCAL_WRANGLER, "whoami"], {
+    cwd: WORKER_DIR,
+    encoding: "utf8",
+  });
   const id = /\b([0-9a-f]{32})\b/.exec(whoami)?.[1] ?? null;
   if (id === null) throw new Error(`could not read an account id from wrangler whoami:\n${whoami}`);
 

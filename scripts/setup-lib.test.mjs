@@ -5,6 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import {
   ROOT,
+  loadEnvFile,
+  localBin,
   parseSetupArgs,
   parseWranglerAccount,
   tokenOutputPlan,
@@ -215,7 +217,7 @@ test("the account check offers the way out of a wrong login", () => {
   });
   assert.match(text, /user@example\.com/);
   // The way out is a command the user runs; setup never changes the login itself.
-  assert.match(text, /wrangler logout && \.\/worker\/node_modules\/\.bin\/wrangler login/);
+  assert.match(text, /wrangler\.js logout && node worker\/node_modules\/wrangler\/bin\/wrangler\.js login/);
   assert.doesNotMatch(text, /--relogin/);
   assert.match(text, /CLOUDFLARE_TOKEN is configured/);
 });
@@ -414,6 +416,53 @@ test("the admin credential check maps statuses to keep / rotate / stop", async (
     verifyAdminToken({ workerUrl: "https://x.test", adminToken: "a", fetchImpl: broken }),
     /admin token check failed: HTTP 500 boom/
   );
+});
+
+// --- .env, written by whichever OS the user has ------------------------------
+
+test("a .env parses the same whether it was written with LF or CRLF endings", () => {
+  // Reported as issue #9 from Windows. `split("\n")` leaves `\r` on the end of every line,
+  // and the value regex is `$`-anchored with a `(.*)` that cannot match `\r` — so a CRLF
+  // file did not parse to slightly-wrong values, it parsed to NOTHING, and setup then
+  // reported the credentials as simply absent.
+  const body = "# deploy credentials\nCLOUDFLARE_TOKEN=cf-secret\nWORKER_URL=https://x.example.com\n";
+  const expected = { CLOUDFLARE_TOKEN: "cf-secret", WORKER_URL: "https://x.example.com" };
+
+  for (const [label, text] of [
+    ["LF", body],
+    ["CRLF", body.replace(/\n/g, "\r\n")],
+  ]) {
+    const root = mkdtempSync(path.join(tmpdir(), "setup-lib-eol-"));
+    writeFileSync(path.join(root, ".env"), text);
+    assert.deepEqual(loadEnvFile(root), expected, `${label} .env`);
+  }
+});
+
+test("upserting a CRLF .env keeps the user's lines intact and does not double up keys", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "setup-lib-eol-"));
+  const file = path.join(root, ".env");
+  writeFileSync(file, "# mine\r\nCLOUDFLARE_TOKEN=cf-secret\r\nWORKER_URL=https://old.example.com\r\n");
+
+  upsertEnvFile(root, { WORKER_URL: "https://new.example.com" });
+
+  // Re-reading is the assertion that matters: a `\r` left mid-file would strand the key.
+  assert.deepEqual(loadEnvFile(root), {
+    CLOUDFLARE_TOKEN: "cf-secret",
+    WORKER_URL: "https://new.example.com",
+  });
+  const text = readFileSync(file, "utf8");
+  assert.match(text, /^# mine$/m);
+  assert.equal(text.match(/^WORKER_URL=/gm).length, 1);
+});
+
+// --- locally installed CLIs --------------------------------------------------
+
+test("localBin names a package's own entrypoint, never the .bin shim", () => {
+  // The `.bin` shim is `wrangler.cmd` on Windows: unspawnable without `shell: true`, which
+  // would hand every argument — bucket names, account ids — to cmd.exe to re-parse.
+  const entry = localBin(path.join(ROOT, "worker"), "wrangler/bin/wrangler.js");
+  assert.equal(entry, path.join(ROOT, "worker", "node_modules", "wrangler", "bin", "wrangler.js"));
+  assert.doesNotMatch(entry, /[/\\]\.bin[/\\]/);
 });
 
 test("upserting .env replaces managed keys and leaves everything else untouched", () => {

@@ -3,7 +3,7 @@
 // Every effect goes through the injected `run` (one wrangler invocation), `log`, `confirm`
 // and `randomHex`, so the branch that decides *what* wrangler is asked to do — and, more
 // importantly, what it is NOT asked to do — is exercised without a Cloudflare account.
-import { renderAccountCheck, verifyAdminToken } from "./setup-lib.mjs";
+import { WRANGLER_CMD, renderAccountCheck, verifyAdminToken } from "./setup-lib.mjs";
 
 /** Thrown for a condition the user has to resolve; setup.mjs turns it into a clean exit. */
 export class SetupError extends Error {}
@@ -32,8 +32,8 @@ export async function deployViaWrangler({
   // would also silently replace whatever session was already there.
   if (!account) {
     throw new SetupError(
-      "wrangler is not logged in. Run `./worker/node_modules/.bin/wrangler login` yourself (or\n" +
-        "`./worker/node_modules/.bin/wrangler logout && ./worker/node_modules/.bin/wrangler login` to switch accounts), then re-run setup."
+      `wrangler is not logged in. Run \`${WRANGLER_CMD} login\` yourself (or\n` +
+        `\`${WRANGLER_CMD} logout && ${WRANGLER_CMD} login\` to switch accounts), then re-run setup.`
     );
   }
 
@@ -42,7 +42,7 @@ export async function deployViaWrangler({
   log(renderAccountCheck({ account, scriptName: config.scriptName, bucket: config.bucket, conflict }));
   if (!assumeYes && !(await confirm("Deploy to this account?"))) {
     throw new SetupError(
-      "cancelled — switch accounts with `./worker/node_modules/.bin/wrangler logout && ./worker/node_modules/.bin/wrangler login`, then re-run"
+      `cancelled — switch accounts with \`${WRANGLER_CMD} logout && ${WRANGLER_CMD} login\`, then re-run`
     );
   }
 

@@ -12,11 +12,44 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const WIDE = "═".repeat(72);
 const THIN = "─".repeat(72);
 
+/**
+ * Path to a locally installed CLI's own JS entrypoint, to be run as
+ * `spawnSync(process.execPath, [localBin(dir, …), ...args])` — never the `node_modules/.bin`
+ * shim, and never through a shell.
+ *
+ * On Windows npm writes the shim as `wrangler.cmd`; the extensionless `.bin/wrangler` is an
+ * sh script, so spawning it fails with ENOENT (reported as issue #9). Naming the `.cmd`
+ * instead does not help either: since CVE-2024-27980 Node refuses to spawn a `.cmd`/`.bat`
+ * without `shell: true`, and `shell: true` would hand every argument to cmd.exe to re-parse —
+ * bucket names, worker names and account ids on the same command line as a Cloudflare admin
+ * credential. Running the entrypoint under the current Node needs no shell on any platform,
+ * so no argument is ever reinterpreted.
+ */
+export function localBin(dir, entry) {
+  return path.join(dir, "node_modules", ...entry.split("/"));
+}
+
+/**
+ * How the user is told to run wrangler themselves. Spelled as a `node` invocation of the
+ * pinned devDependency for the same reason `localBin` exists: `./worker/node_modules/.bin/…`
+ * is not a runnable path in cmd.exe or PowerShell, and `npx wrangler` would resolve to
+ * whatever the registry serves today rather than the version this repo was tested against.
+ */
+export const WRANGLER_CMD = "node worker/node_modules/wrangler/bin/wrangler.js";
+
+/**
+ * Splits a config file into lines regardless of who wrote it. A `.env` created on Windows
+ * has CRLF endings, and a bare `split("\n")` leaves `\r` on the end of every line — which
+ * `loadEnvFile`'s `$`-anchored regex cannot match at all (`.` does not match `\r`), so the
+ * file parses to nothing at all rather than to slightly wrong values.
+ */
+const splitLines = (text) => text.split(/\r?\n/);
+
 /** `.env` values, if the file exists. Real environment variables take precedence. */
 export function loadEnvFile(root = ROOT) {
   const out = {};
   try {
-    for (const line of readFileSync(path.join(root, ".env"), "utf8").split("\n")) {
+    for (const line of splitLines(readFileSync(path.join(root, ".env"), "utf8"))) {
       const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$/);
       if (m) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
     }
@@ -39,7 +72,7 @@ export function loadEnvFile(root = ROOT) {
  */
 export function upsertEnvFile(root, values) {
   const file = path.join(root, ".env");
-  const lines = existsSync(file) ? readFileSync(file, "utf8").split("\n") : [];
+  const lines = existsSync(file) ? splitLines(readFileSync(file, "utf8")) : [];
   while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
 
   const pending = new Map(Object.entries(values));
@@ -199,7 +232,7 @@ export function resolveAuthPath({ requested, hasToken, hasAccountId, wranglerAcc
     path: "wrangler",
     needsLogin: true,
     conflict: false,
-    reason: "nothing is configured yet — log in with `./worker/node_modules/.bin/wrangler login`, or set CLOUDFLARE_TOKEN",
+    reason: `nothing is configured yet — log in with \`${WRANGLER_CMD} login\`, or set CLOUDFLARE_TOKEN`,
   };
 }
 
@@ -228,8 +261,8 @@ export function renderAccountCheck({ account, scriptName, bucket, conflict = fal
       ? "  Wrong account? Switch it yourself, then re-run setup:"
       : "  Log in first, then re-run setup:",
     account
-      ? "      ./worker/node_modules/.bin/wrangler logout && ./worker/node_modules/.bin/wrangler login"
-      : "      ./worker/node_modules/.bin/wrangler login",
+      ? `      ${WRANGLER_CMD} logout && ${WRANGLER_CMD} login`
+      : `      ${WRANGLER_CMD} login`,
     ""
   );
   if (conflict) {

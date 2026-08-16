@@ -22,6 +22,7 @@ import {
   ROOT,
   SETUP_USAGE,
   loadEnvFile,
+  localBin,
   mintOrReplaceAccessToken,
   normalizeWorkerUrl,
   parseSetupArgs,
@@ -44,8 +45,9 @@ function die(message) {
 }
 
 // The pinned devDependency, so setup deploys with the wrangler this repo was tested
-// against instead of whatever `npx` resolves today.
-const LOCAL_WRANGLER = path.join(WORKER_DIR, "node_modules", ".bin", "wrangler");
+// against instead of whatever `npx` resolves today. Its own entrypoint rather than the
+// `.bin` shim, so it runs unshelled on Windows too — see `localBin`.
+const LOCAL_WRANGLER = localBin(WORKER_DIR, "wrangler/bin/wrangler.js");
 
 /** Runs wrangler and returns its output. `check: false` lets a caller inspect a failure. */
 function wrangler(args, { input, check = true, quiet = false } = {}) {
@@ -61,7 +63,7 @@ function wrangler(args, { input, check = true, quiet = false } = {}) {
         "  Cloudflare credentials."
     );
   }
-  const res = spawnSync(LOCAL_WRANGLER, args, {
+  const res = spawnSync(process.execPath, [LOCAL_WRANGLER, ...args], {
     cwd: WORKER_DIR,
     input,
     encoding: "utf8",
