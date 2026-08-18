@@ -188,7 +188,6 @@ describe("settings tab rendering", () => {
     "Say when a sync starts",
     "List the changed files",
     "Label",
-    "Short snapshot ids",
     "Sync settings between devices",
     "Test connection",
   ])("renders %s", (name) => {
@@ -266,7 +265,6 @@ describe("settings tab rendering", () => {
   it.each([
     ["Say when a sync starts", "notifyOnStart", false],
     ["List the changed files", "verboseSyncNotice", true],
-    ["Short snapshot ids", "shortSnapshotIds", false],
     ["Sync on startup", "syncOnStartup", false],
   ] as const)("wires the %s toggle to %s", async (row, key, target) => {
     const plugin = fakePlugin();
@@ -284,7 +282,7 @@ describe("settings tab rendering", () => {
     expect(plugin.saved).toBe(1);
     // Nothing else moved with it.
     const others = (
-      ["notifyOnStart", "verboseSyncNotice", "shortSnapshotIds", "syncOnStartup"] as const
+      ["notifyOnStart", "verboseSyncNotice", "syncOnStartup"] as const
     ).filter((k) => k !== key);
     for (const other of others) {
       expect(plugin.settings[other]).toBe(DEFAULT_SETTINGS[other]);
@@ -337,7 +335,6 @@ describe("settings tab rendering", () => {
     expect(at("What sync announces")).toBeLessThan(at("Say when a sync starts"));
     expect(at("Say when a sync starts")).toBeLessThan(at("List the changed files"));
     expect(at("List the changed files")).toBeLessThan(at("Label"));
-    expect(at("Label")).toBeLessThan(at("Short snapshot ids"));
   });
 
   it("warns that Silent means silent, and only there", () => {

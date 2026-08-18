@@ -780,6 +780,26 @@ describe("continuity gate", () => {
     }
   });
 
+  it("abbreviates both heads, like every other id on screen", () => {
+    // This window used to spell them in full while the notice beside it showed seven
+    // characters, so the reader's first job was working out whether they were the same
+    // snapshot. Realistic ULIDs here, since a short fixture id cannot show the difference.
+    const head = "01K2QWERTYABCDEFGHJKMNPQRS";
+    const lastHead = "01K2QWERTYABCDEFGHJZZZZZZ";
+    const text = continuityBody({
+      head,
+      lastHead,
+      reason: "replaced",
+      walked: 1,
+      alreadyApplied: 0,
+    }).join(" ");
+
+    expect(text).toContain("KMNPQRS");
+    expect(text).toContain("ZZZZZZ");
+    expect(text).not.toContain(head);
+    expect(text).not.toContain(lastHead);
+  });
+
   it("does not promise nothing changed when this pass already applied a verified snapshot", () => {
     // The one case where "stopping changes nothing" is a lie: an earlier turn of the same
     // pass merged a head whose ancestry it confirmed, then lost the head race.

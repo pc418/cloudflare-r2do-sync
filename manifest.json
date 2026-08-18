@@ -1,7 +1,7 @@
 {
   "id": "cloudflare-rdo-sync",
   "name": "R2DO Sync",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "minAppVersion": "1.5.0",
   "description": "Versioned vault sync to Cloudflare R2 with content-addressed snapshots and serialized commits.",
   "author": "pc418",

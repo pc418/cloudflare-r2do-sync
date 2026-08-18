@@ -465,21 +465,23 @@ describe("shortSnapshot", () => {
     // The first ten characters are the creation time, so a seven-character prefix is constant
     // for ~33 seconds and says nothing the notice's own arrival time did not. This is the one
     // assertion that would fail if someone "fixed" it to slice from the front like git.
-    expect(shortSnapshot(id, true)).toBe("KMNPQRS");
-    expect(shortSnapshot(id, true)).toHaveLength(SHORT_SNAPSHOT_LENGTH);
-    expect(id.startsWith(shortSnapshot(id, true))).toBe(false);
+    expect(shortSnapshot(id)).toBe("KMNPQRS");
+    expect(shortSnapshot(id)).toHaveLength(SHORT_SNAPSHOT_LENGTH);
+    expect(id.startsWith(shortSnapshot(id))).toBe(false);
   });
 
-  it("returns the id untouched when shortening is off", () => {
-    expect(shortSnapshot(id, false)).toBe(id);
-    expect(shortSnapshot(id, false)).toHaveLength(26);
+  it("takes no switch, because every id on screen is the short one", () => {
+    // A setting used to make this conditional. An id abbreviated in a notice and spelled in
+    // full in the dialog two taps later reads as two identifiers rather than one thoughtful
+    // choice per surface — and the long form buys nothing, since nobody types or pastes it.
+    expect(shortSnapshot.length).toBe(1);
   });
 
   it("leaves an id that is already short alone rather than padding or slicing it", () => {
     // Fakes and older tests use short ids; slicing one would report a suffix of something the
     // reader would recognise in full.
-    expect(shortSnapshot("01SNAP", true)).toBe("01SNAP");
-    expect(shortSnapshot("", true)).toBe("");
-    expect(shortSnapshot("0123456", true)).toBe("0123456");
+    expect(shortSnapshot("01SNAP")).toBe("01SNAP");
+    expect(shortSnapshot("")).toBe("");
+    expect(shortSnapshot("0123456")).toBe("0123456");
   });
 });

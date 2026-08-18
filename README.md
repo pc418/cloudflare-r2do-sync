@@ -299,10 +299,14 @@ curl -X POST "$WORKER_URL/api/tokens" -H "authorization: Bearer $ADMIN_TOKEN" \
 | **Say when a sync starts** | off | The "syncing…" pop-up while a sync *you* started runs. Separate from the level above because it answers your tap, so it works at every level. Turn it on if you sync by hand — below **All** it is the only reply a manual sync that found nothing gives you |
 | **Label** | `Cloudflare R2DO Sync` | The name in front of every notice, with its own on/off. Blank or off leaves just the message |
 | **List the changed files** | off | Names each file that moved instead of counts alone, and is what puts the snapshot id in the notice |
-| **Short snapshot ids** | on | Shows a snapshot as its last 7 characters wherever one appears. The exported sync log always carries the full 26 |
 | **Show the status bar on mobile** | off | Forces Obsidian's hidden mobile status bar open, so sync state is readable without notices |
 | **Sync settings between devices** | on | Shares vault-wide settings through the server, encrypted like notes; most recent change wins |
 | **Snapshot retention** (server) | 90 days / 500 snapshots | Not a plugin setting: `GC_KEEP_DAYS` / `GC_KEEP_COUNT` in `worker/wrangler.jsonc`; edit and redeploy — see [Limits](#limits) |
+
+Snapshot ids are shown as their last 7 characters everywhere on screen — notices, dialogs and
+the history browser alike. They are ULIDs, so the first ten characters are the timestamp and the
+end is the part that identifies the snapshot. The exported **Sync log** keeps all 26, because
+that is the id the server API actually takes.
 
 Vault-wide settings (excludes, thresholds, intervals, direction, the public salt…) sync
 between devices. Credentials, **Device name**, **Parallel lanes**, everything under **Notices**

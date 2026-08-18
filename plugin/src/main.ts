@@ -91,7 +91,6 @@ import {
   DEFAULT_NOTICE_LEVEL,
   DEFAULT_NOTICE_START,
   LEGACY_NOTICE_KEYS,
-  SHORT_SNAPSHOT_LENGTH,
   type NoticeCategory,
   type NoticeLevel,
 } from "./notify";
@@ -192,11 +191,6 @@ export interface Settings {
   /** List the changed files in the notice, not just how many files and lines moved. */
   verboseSyncNotice: boolean;
   /**
-   * Abbreviate snapshot ids in notices and dialogs. The exported log always carries the full
-   * id, so shortening never costs the one place a bug report reads from.
-   */
-  shortSnapshotIds: boolean;
-  /**
    * Force Obsidian's hidden status bar visible on mobile. Off by default: it overrides
    * Obsidian's own layout, so it is opt-in and reversible.
    */
@@ -244,12 +238,10 @@ export const DEFAULT_SETTINGS: Settings = {
   noticeLevel: DEFAULT_NOTICE_LEVEL,
   notifyOnStart: DEFAULT_NOTICE_START,
   // Off: the compact summary already says how many files and lines moved each way, and a named
-  // list is the one notice shape that can run to a dozen lines on a first sync. Note the knock-on
-  // — the snapshot id rides on the verbose form, so a default notice carries no id even though
-  // `shortSnapshotIds` is on; that setting governs the dialogs and the verbose line, and the
-  // exported log keeps the full id regardless.
+  // list is the one notice shape that can run to a dozen lines on a first sync. Knock-on worth
+  // knowing: the snapshot id rides on the verbose form, so a default pass notice carries no id.
+  // Every id that IS shown, anywhere, is the 7-character form; the exported log keeps all 26.
   verboseSyncNotice: false,
-  shortSnapshotIds: true,
   mobileStatusBar: false,
   syncSettings: true,
   firstSyncAcknowledged: false,
@@ -1343,7 +1335,7 @@ export default class LogSyncPlugin extends Plugin {
     new ConfirmModal(this.app, {
       title: "Pull the remote over this device?",
       body:
-        `${summary.write} file(s) from snapshot ${summary.head} will be written over this ` +
+        `${summary.write} file(s) from snapshot ${shortSnapshot(summary.head)} will be written over this ` +
         `vault, and ${describePaths(summary.remove, "local file")} will be removed. ` +
         `${
           summary.park.length === 0
@@ -1410,7 +1402,8 @@ export default class LogSyncPlugin extends Plugin {
       title: "Push this device over the remote?",
       body:
         `${summary.files} file(s) from this device become the new snapshot, on top of ` +
-        `${summary.head ?? "an empty vault"}. ${describePaths(summary.drop, "remote file")} ` +
+        `${summary.head === null ? "an empty vault" : shortSnapshot(summary.head)}. ` +
+          `${describePaths(summary.drop, "remote file")} ` +
         `will be left out of it${
           summary.drop.length > 0
             ? " — still restorable from Snapshot history, but gone from every device that pulls"
@@ -1481,7 +1474,7 @@ export default class LogSyncPlugin extends Plugin {
       title: "Rebuild the remote history?",
       body: [
         `${summary.files} file(s) from this device become the only snapshot, replacing ` +
-          `${summary.head}. ${summary.carried} path(s) this device does not sync are carried ` +
+          `${shortSnapshot(summary.head)}. ${summary.carried} path(s) this device does not sync are carried ` +
           "unchanged. Local files are not touched.",
         `${discarded} earlier snapshot(s) are discarded. Every version of every file they ` +
           "hold — including anything you are trying to purge — stops being restorable, on " +
@@ -1603,7 +1596,7 @@ export default class LogSyncPlugin extends Plugin {
         http: obsidianHttp,
       }).getHead();
       new Notice(
-        `R2DO Sync configured as "${payload.name}"${payload.mode === "encrypted" ? " (encrypted)" : " (plaintext)"}. Remote head: ${head === null ? "(empty vault)" : shortSnapshot(head, this.settings.shortSnapshotIds)}`,
+        `R2DO Sync configured as "${payload.name}"${payload.mode === "encrypted" ? " (encrypted)" : " (plaintext)"}. Remote head: ${head === null ? "(empty vault)" : shortSnapshot(head)}`,
         10_000
       );
       // A device that was just set up should not sit idle until someone finds the ribbon.
@@ -2115,7 +2108,7 @@ export default class LogSyncPlugin extends Plugin {
       // A named list takes longer to read than "up to date", and a pass that moved nothing
       // should not linger on screen.
       const duration = !changed ? 4_000 : verbose ? 12_000 : 8_000;
-      const detail = describePass(result, { verbose, shortIds: this.settings.shortSnapshotIds });
+      const detail = describePass(result, { verbose });
       new Notice(this.#prefixed(`${NL}${detail}`), duration);
     } else if (result.pulled > 0) {
       // Files changed under the user without them asking. This used to be the floor no setting
@@ -2488,7 +2481,7 @@ export function continuityBody(summary: ContinuitySummary): string[] {
   };
   return [
     what[summary.reason],
-    `Remote head: ${summary.head}. Last synced from this device: ${summary.lastHead}.`,
+    `Remote head: ${shortSnapshot(summary.head)}. Last synced from this device: ${shortSnapshot(summary.lastHead)}.`,
     "Continuing merges the remote in the ordinary way: nothing is deleted here without the " +
       "usual large-change question, and anything that cannot be merged keeps both versions.",
     // Never "stopping changes nothing": a pass that applied a verified snapshot and then lost
@@ -2561,7 +2554,7 @@ class PreviewModal extends Modal {
     contentEl.empty();
     contentEl.createEl("h2", { text: "Sync preview" });
     contentEl.createEl("p", {
-      text: `Remote head: ${preview.head ?? "(empty vault)"}. Nothing has been changed.`,
+      text: `Remote head: ${preview.head === null ? "(empty vault)" : shortSnapshot(preview.head)}. Nothing has been changed.`,
     });
 
     if (preview.halted) {
@@ -2718,8 +2711,8 @@ export class HistoryModal extends Modal {
         .setName(`${when} — ${snap.device}`)
         .setDesc(
           snap.readable
-            ? `${summary ?? `${snap.fileCount} file(s)`} · ${snap.fileCount} file(s) total · ${snap.id}`
-            : `unreadable with this device's key · ${snap.id}`
+            ? `${summary ?? `${snap.fileCount} file(s)`} · ${snap.fileCount} file(s) total · ${shortSnapshot(snap.id)}`
+            : `unreadable with this device's key · ${shortSnapshot(snap.id)}`
         );
       if (!snap.readable) continue;
       setting.addButton((b) =>
@@ -2770,7 +2763,7 @@ export class SnapshotModal extends Modal {
     contentEl.empty();
     contentEl.createEl("h2", { text: "Snapshot contents" });
     contentEl.createEl("p", {
-      text: `${new Date(this.snap.createdAt).toLocaleString()} — ${this.snap.device} — ${this.snap.id}`,
+      text: `${new Date(this.snap.createdAt).toLocaleString()} — ${this.snap.device} — ${shortSnapshot(this.snap.id)}`,
     });
 
     try {
@@ -2887,7 +2880,7 @@ export class SnapshotModal extends Modal {
     new ConfirmModal(this.app, {
       title: "Restore the whole vault?",
       body: [
-        `Every file this device syncs will be made to match snapshot ${this.snap.id}. Files ` +
+        `Every file this device syncs will be made to match snapshot ${shortSnapshot(this.snap.id)}. Files ` +
           `added since then will be moved to the trash.`,
         `Anything whose current version was published stays in the snapshot history and can ` +
           `be restored the same way. Edits made since the last sync have never left this ` +
@@ -4160,7 +4153,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
             const shown =
               head === null
                 ? "(empty vault)"
-                : shortSnapshot(head, this.plugin.settings.shortSnapshotIds);
+                : shortSnapshot(head);
             new Notice(`R2DO Sync OK. Remote head: ${shown}`);
           } catch (e) {
             new Notice(`R2DO Sync failed: ${message(e)}`, 10_000);
@@ -4886,20 +4879,6 @@ export class LogSyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         });
       });
-
-    new Setting(containerEl)
-      .setName("Short snapshot ids")
-      .setDesc(
-        `Shows a snapshot as its last ${SHORT_SNAPSHOT_LENGTH} characters instead of all 26 — ` +
-          "the readable end, since the first ten are just the time it was made. Notices only; " +
-          "the exported sync log always carries the full id."
-      )
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.shortSnapshotIds).onChange(async (v) => {
-          this.plugin.settings.shortSnapshotIds = v;
-          await this.plugin.saveSettings();
-        })
-      );
 
     if (Platform.isMobile) this.#mobileStatusBarRow(containerEl);
   }

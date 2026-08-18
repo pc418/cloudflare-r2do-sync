@@ -243,7 +243,7 @@ const committed = (over: Partial<SyncResult> = {}): SyncResult =>
 
 describe("describePass", () => {
   it("says so plainly when nothing moved", () => {
-    expect(describePass({ status: "unchanged", ...base }, { verbose: false, shortIds: false })).toBe("up to date");
+    expect(describePass({ status: "unchanged", ...base }, { verbose: false })).toBe("up to date");
   });
 
   it("counts files and net lines per direction on one line", () => {
@@ -252,7 +252,7 @@ describe("describePass", () => {
         pushedChanges: [change("a.md", "add", 12), change("b.md", "update", 23)],
         pulledChanges: [change("c.md", "update", -7)],
       }),
-      { verbose: false, shortIds: false }
+      { verbose: false }
     );
     // One file added, so +1/-0; lines split by sign across the group rather than netted.
     expect(line).toContain("^ +1/-0 files, +35/-0 lines");
@@ -270,7 +270,7 @@ describe("describePass", () => {
       committed({
         pushedChanges: [change("grew.md", "update", 40), change("shrank.md", "update", -40)],
       }),
-      { verbose: false, shortIds: false }
+      { verbose: false }
     );
     expect(line).toContain("+40/-40 lines");
     expect(line).not.toContain("+0/-0");
@@ -279,7 +279,7 @@ describe("describePass", () => {
   it("groups thousands, because a first sync reports five figures", () => {
     const line = describePass(
       committed({ pushedChanges: [change("a.md", "add", 21_430)] }),
-      { verbose: false, shortIds: false }
+      { verbose: false }
     );
     expect(line).toContain("+21,430/-0 lines");
   });
@@ -289,7 +289,7 @@ describe("describePass", () => {
     // a file gained — so the pass reports a zero line pair rather than vanishing.
     const line = describePass(
       committed({ pushedChanges: [change("a.md", "update", 0)] }),
-      { verbose: false, shortIds: false }
+      { verbose: false }
     );
     expect(line).toContain("^ +0/-0 lines");
   });
@@ -297,16 +297,13 @@ describe("describePass", () => {
   it("drops the line clause when nothing could be counted, and flags a partial count", () => {
     // Binary: no lines to pair, but a file did arrive, so the file pair carries it.
     expect(
-      describePass(committed({ pushedChanges: [change("img.png", "add", null)] }), {
-        verbose: false,
-        shortIds: false,
-      })
+      describePass(committed({ pushedChanges: [change("img.png", "add", null)] }), { verbose: false })
     ).toContain("^ +1/-0 files");
 
     expect(
       describePass(
         committed({ pushedChanges: [change("a.md", "add", 4), change("img.png", "add", null)] }),
-        { verbose: false, shortIds: false }
+        { verbose: false }
       )
     ).toContain("+2/-0 files, +4/-0 lines (1 not counted)");
   });
@@ -314,10 +311,7 @@ describe("describePass", () => {
   it("stays a single line when not verbose, with nothing appended to explain itself", () => {
     // A legend was tried here and removed: the pairs read as what they are, and a fixed extra
     // line on every pass forever is exactly the noise short ids were meant to buy back.
-    const moved = describePass(committed({ pushedChanges: [change("a.md", "add", 1)] }), {
-      verbose: false,
-      shortIds: false,
-    });
+    const moved = describePass(committed({ pushedChanges: [change("a.md", "add", 1)] }), { verbose: false });
     expect(moved.split(String.fromCharCode(10))).toHaveLength(1);
   });
 
@@ -336,7 +330,7 @@ describe("describePass", () => {
           },
         ],
       }),
-      { verbose: false, shortIds: false }
+      { verbose: false }
     );
     expect(line).toContain("1 conflict");
     expect(line).toContain("1 skipped");
@@ -348,13 +342,15 @@ describe("describePass", () => {
         pushedChanges: [change("new.md", "add", 12), change("gone.md", "delete", -4)],
         pulledChanges: [change("merged.md", "merge", 2)],
       }),
-      { verbose: true, shortIds: false }
+      { verbose: true }
     );
     const lines = text.split(String.fromCharCode(10));
     expect(lines).toContain("  + new.md (+12)");
     expect(lines).toContain("  - gone.md (-4)");
     expect(lines).toContain("  >< merged.md (+2)");
-    expect(lines.at(-1)).toBe("snapshot 01SNAPSHOT");
+    // The fixture id is a 10-character stand-in, so it is abbreviated like a real one would
+    // be — every id on screen is the 7-character form now, with no setting behind it.
+    expect(lines.at(-1)).toBe("snapshot NAPSHOT");
   });
 
   // A realistic id: 10 characters of ULID timestamp then 16 of randomness.
@@ -365,8 +361,8 @@ describe("describePass", () => {
       head: longId,
     }) as SyncResult;
 
-  it("abbreviates the snapshot id when asked, and nothing else on the line", () => {
-    const lines = describePass(withLongId(), { verbose: true, shortIds: true }).split(
+  it("abbreviates the snapshot id, and nothing else on the line", () => {
+    const lines = describePass(withLongId(), { verbose: true }).split(
       String.fromCharCode(10)
     );
     expect(lines.at(-1)).toBe("snapshot KMNPQRS");
@@ -374,36 +370,29 @@ describe("describePass", () => {
     expect(lines).toContain("  + a.md (+1)");
   });
 
-  it("keeps the whole id when shortening is off, so the toggle actually does something", () => {
-    const lines = describePass(withLongId(), { verbose: true, shortIds: false }).split(
-      String.fromCharCode(10)
-    );
-    expect(lines.at(-1)).toBe(`snapshot ${longId}`);
+  it("takes no option for it, so no caller can print the full 26 on screen", () => {
+    // `describePass` used to carry a `shortIds` flag through from a setting. The whole point of
+    // dropping it is that no surface can disagree with another about what a snapshot is called.
+    expect(describePass(withLongId(), { verbose: true })).not.toContain(longId);
   });
 
   it("writes a zero net delta as 0, never as -0", () => {
     // `-0` reports a file that shrank. Zero here is a real answer — five lines swapped for
     // five — and the settings copy promises it reads as 0.
-    const text = describePass(committed({ pushedChanges: [change("a.md", "update", 0)] }), {
-      verbose: true,
-      shortIds: false,
-    });
+    const text = describePass(committed({ pushedChanges: [change("a.md", "update", 0)] }), { verbose: true });
     expect(text).toContain("  ~ a.md (0)");
     expect(text).not.toContain("-0)");
   });
 
   it("omits the count for a file it could not attribute rather than printing (0)", () => {
-    const text = describePass(committed({ pushedChanges: [change("img.png", "add", null)] }), {
-      verbose: true,
-      shortIds: false,
-    });
+    const text = describePass(committed({ pushedChanges: [change("img.png", "add", null)] }), { verbose: true });
     expect(text).toContain("  + img.png");
     expect(text).not.toContain("img.png (");
   });
 
   it("caps the verbose list so a first sync cannot fill the screen", () => {
     const many = Array.from({ length: 25 }, (_, i) => change(`n${i}.md`, "add", 1));
-    const text = describePass(committed({ pushedChanges: many }), { verbose: true, shortIds: false });
+    const text = describePass(committed({ pushedChanges: many }), { verbose: true });
     const named = text.split(String.fromCharCode(10)).filter((l) => l.startsWith("  + "));
     expect(named).toHaveLength(10);
     expect(text).toContain("... 15 more");

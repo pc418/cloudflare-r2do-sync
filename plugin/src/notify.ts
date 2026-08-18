@@ -314,14 +314,20 @@ export function conflictReport(opts: {
 export const SHORT_SNAPSHOT_LENGTH = 7;
 
 /**
- * How a snapshot id is shown to a person.
+ * How a snapshot id is shown to a person. **Every** surface, unconditionally.
  *
- * Shortening is display only and never round-trips: nothing is ever looked up by the value
- * this returns, so an unlucky collision would be cosmetic rather than a wrong snapshot. The
- * full id stays in the exported sync log, which is the bug-report artifact and deliberately
- * not governed by a display preference.
+ * There was a setting for this and it is gone. Two arguments retired it. An id abbreviated in
+ * a notice and spelled in full in the dialog two taps later does not read as one thoughtful
+ * choice per surface, it reads as two different identifiers — and the reader's job is to match
+ * them up. And a *preference* implies the long form buys something; it does not, because the
+ * full id is never typed or pasted anywhere by hand. The one place it is genuinely needed is
+ * the exported sync log, which is a file rather than a screen and keeps all 26 (`formatLogNote`).
+ *
+ * Shortening is display only and never round-trips: nothing is ever looked up by the value this
+ * returns — `GET /api/manifests/:id` wants the whole thing — so an unlucky collision would be
+ * cosmetic rather than a wrong snapshot.
  */
-export function shortSnapshot(id: string, short: boolean): string {
-  if (!short || id.length <= SHORT_SNAPSHOT_LENGTH) return id;
+export function shortSnapshot(id: string): string {
+  if (id.length <= SHORT_SNAPSHOT_LENGTH) return id;
   return id.slice(-SHORT_SNAPSHOT_LENGTH);
 }

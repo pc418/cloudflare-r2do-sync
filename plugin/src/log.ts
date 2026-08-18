@@ -118,10 +118,10 @@ const SYMBOL: Record<PassChange["action"], string> = {
  * What a pass moved, in one compact line - or, when `verbose`, a line per changed file with
  * its net line change and the snapshot it produced.
  *
- * `shortIds` governs only the snapshot line: a notice is read at a glance, and 26 characters of
- * ULID is the widest thing in it. The full id is still what the exported log carries.
+ * The snapshot line is abbreviated like every other on-screen id; `formatLogNote` below is the
+ * one place that keeps all 26, because it is a file rather than a screen.
  */
-export function describePass(result: SyncResult, opts: { verbose: boolean; shortIds: boolean }): string {
+export function describePass(result: SyncResult, opts: { verbose: boolean }): string {
   const groups: Array<{ arrow: string; changes: PassChange[] }> = [
     { arrow: "^", changes: result.pushedChanges },
     { arrow: "v", changes: result.pulledChanges },
@@ -151,7 +151,7 @@ export function describePass(result: SyncResult, opts: { verbose: boolean; short
   }
   lines.push(...extras);
   if (result.status === "committed") {
-    lines.push(`snapshot ${shortSnapshot(result.head, opts.shortIds)}`);
+    lines.push(`snapshot ${shortSnapshot(result.head)}`);
   }
   return lines.join(NL);
 }
