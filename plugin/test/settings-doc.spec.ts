@@ -19,15 +19,13 @@ function base(): SharedSettings {
     debounceSeconds: 3,
     intervalMinutes: 15,
     syncOnStartup: true,
+    resumeSyncMinutes: 15,
     maxBlobMB: 90,
     protectPercent: 50,
     logEntries: 50,
     historyLimit: 40,
     retryAttempts: 3,
     logNoteFolder: "",
-    notifyOnSync: true,
-    notifyOnlyChanged: false,
-    verboseSyncNotice: false,
   };
 }
 

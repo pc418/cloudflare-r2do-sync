@@ -10,6 +10,11 @@ export interface RenderedSetting {
   desc: string;
   controls: RenderedKind[];
   /**
+   * Whether the row rendered greyed out. Recorded because "the control is there but does
+   * nothing" is a state a rendering test cannot otherwise tell from a working one.
+   */
+  disabled: boolean;
+  /**
    * The heading this row rendered under, which is the only record of it: `setHeading()` takes
    * a heading back out of the settings list, so nothing else relates the two. Grouping is
    * what the page is *for* — a row filed under the wrong part is a row nobody finds.
@@ -277,7 +282,13 @@ export class ButtonComponent {
 }
 
 export class Setting {
-  readonly rendered: RenderedSetting = { name: "", desc: "", controls: [], section: "" };
+  readonly rendered: RenderedSetting = {
+    name: "",
+    desc: "",
+    controls: [],
+    section: "",
+    disabled: false,
+  };
   readonly texts: TextComponent[] = [];
   readonly toggles: ToggleComponent[] = [];
   readonly dropdowns: DropdownComponent[] = [];
@@ -298,6 +309,10 @@ export class Setting {
   }
   setDesc(desc: string): this {
     this.rendered.desc = desc;
+    return this;
+  }
+  setDisabled(disabled: boolean): this {
+    this.rendered.disabled = disabled;
     return this;
   }
   /**

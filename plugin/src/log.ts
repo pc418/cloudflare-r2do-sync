@@ -1,4 +1,5 @@
 import type { PassChange, SyncResult } from "./sync";
+import { shortSnapshot } from "./notify";
 
 /** Separator between the two directions on the compact line. */
 const SEP = " \u00b7 ";
@@ -103,52 +104,6 @@ export function summarise(result: SyncResult): string {
   return parts.length > 0 ? parts.join(", ") : "up to date";
 }
 
-/** Did this pass actually move a file, in either direction? */
-export function passChangedSomething(result: SyncResult): boolean {
-  return result.pushedChanges.length > 0 || result.pulledChanges.length > 0;
-}
-
-/**
- * Whether a finished pass puts a notice on screen.
- *
- * A halt, a pending decision, a conflict and a skipped file each have their own message, so
- * this governs only the per-pass summary. An interactive pass always answers: on a phone there
- * is no status bar, and silence is indistinguishable from a tap that missed.
- */
-export function announcePass(opts: {
-  notifyOnSync: boolean;
-  onlyChanged: boolean;
-  interactive: boolean;
-  result: SyncResult;
-}): boolean {
-  if (!opts.notifyOnSync) return false;
-  // A pass that stopped to ask something did not finish, so the per-pass summary would be a
-  // false statement — "up to date" printed above a notice explaining that nothing was done.
-  // Each of these carries its own message instead.
-  if (
-    opts.result.status === "halted" ||
-    opts.result.status === "needs-decision" ||
-    opts.result.status === "needs-continuity"
-  ) {
-    return false;
-  }
-  if (passChangedSomething(opts.result)) return true;
-  if (opts.interactive) return true;
-  return !opts.onlyChanged;
-}
-
-/**
- * Whether a pass says anything as it *begins*.
- *
- * Only a pass the user started. A phone has no status bar, so between the tap and the summary
- * there was nothing at all on screen — and a first sync, or one over a slow link, leaves that
- * gap open for minutes, which reads exactly like a tap that missed. A timer firing in the
- * background has nobody to reassure, so it stays quiet and reports only what it did.
- */
-export function announceStart(opts: { notifyOnSync: boolean; interactive: boolean }): boolean {
-  return opts.notifyOnSync && opts.interactive;
-}
-
 /** Names listed per direction before the rest are summed. A first sync has hundreds. */
 const MAX_NAMES = 10;
 
@@ -162,8 +117,11 @@ const SYMBOL: Record<PassChange["action"], string> = {
 /**
  * What a pass moved, in one compact line - or, when `verbose`, a line per changed file with
  * its net line change and the snapshot it produced.
+ *
+ * `shortIds` governs only the snapshot line: a notice is read at a glance, and 26 characters of
+ * ULID is the widest thing in it. The full id is still what the exported log carries.
  */
-export function describePass(result: SyncResult, opts: { verbose: boolean }): string {
+export function describePass(result: SyncResult, opts: { verbose: boolean; shortIds: boolean }): string {
   const groups: Array<{ arrow: string; changes: PassChange[] }> = [
     { arrow: "^", changes: result.pushedChanges },
     { arrow: "v", changes: result.pulledChanges },
@@ -192,23 +150,75 @@ export function describePass(result: SyncResult, opts: { verbose: boolean }): st
     if (rest > 0) lines.push(`  ... ${rest} more`);
   }
   lines.push(...extras);
-  if (result.status === "committed") lines.push(`snapshot ${result.head}`);
+  if (result.status === "committed") {
+    lines.push(`snapshot ${shortSnapshot(result.head, opts.shortIds)}`);
+  }
   return lines.join(NL);
 }
 
-/** "3 files, +35 lines" - the line clause is dropped when no change could be attributed. */
+/**
+ * "+2/-1 files, +120/-45 lines" — a clause with nothing to say is dropped entirely.
+ *
+ * Two independent pairs, because they answer different questions. The file pair counts files
+ * that came into or went out of existence, so an edit shows nothing there: a note you changed
+ * is not a file you gained. The line pair is about content, so an edit shows up there and only
+ * there. That is why an ordinary editing pass reads `+12/-3 lines` with no file clause at all,
+ * rather than a meaningless `+0/-0 files` in front of it.
+ *
+ * Within a pair both halves always print, `-0` included: a fixed shape is what makes the
+ * numbers comparable at a glance, and it is the *pair* that is dropped when it is silent.
+ */
 function headline(changes: PassChange[]): string {
+  const parts: string[] = [];
+
+  const added = changes.filter((c) => c.action === "add").length;
+  const deleted = changes.filter((c) => c.action === "delete").length;
+  if (added > 0 || deleted > 0) parts.push(`${pair(added, deleted)} files`);
+
   const counted = changes.filter((c) => c.lines !== null);
-  const files = plural(changes.length, "file");
-  if (counted.length === 0) return files;
-  const net = counted.reduce((sum, c) => sum + (c.lines ?? 0), 0);
-  const unknown = changes.length - counted.length;
-  const note = unknown > 0 ? ` (${unknown} not counted)` : "";
-  return `${files}, ${signed(net)} lines${note}`;
+  if (counted.length > 0) {
+    // Split by the sign of each file's net delta rather than netting the whole group: a file
+    // that gained 40 lines and one that lost 40 are not "no change", and reporting them as
+    // such is the thing this format exists to stop.
+    const up = counted.reduce((sum, c) => sum + Math.max(0, c.lines ?? 0), 0);
+    const down = counted.reduce((sum, c) => sum + Math.max(0, -(c.lines ?? 0)), 0);
+    const unknown = changes.length - counted.length;
+    const note = unknown > 0 ? ` (${unknown} not counted)` : "";
+    parts.push(`${pair(up, down)} lines${note}`);
+  }
+
+  // Everything that moved was binary, or renamed with no content change: there is no pair to
+  // print, but something did happen and saying nothing would be worse than saying how many.
+  if (parts.length === 0) return plural(changes.length, "file");
+  return parts.join(", ");
 }
 
+/**
+ * A single file's own net delta, which is one number rather than a pair.
+ *
+ * Zero has its own branch: it is neither a gain nor a loss, and `-0` would report a shrinking
+ * file. It is a real answer, not a missing one — five lines replaced by five others nets to
+ * nothing, which is exactly what the settings copy promises this reads as.
+ */
 function signed(n: number): string {
-  return n > 0 ? `+${n}` : String(n);
+  if (n === 0) return "0";
+  return n > 0 ? `+${grouped(n)}` : `-${grouped(n)}`;
+}
+
+/** `+2/-1`. Both halves always, so the shape does not change with the numbers. */
+function pair(up: number, down: number): string {
+  return `+${grouped(up)}/-${grouped(down)}`;
+}
+
+/**
+ * Thousands separators, because a first sync reports five-figure line counts and `+21430` is
+ * read as a different number than `+21,430` at a glance. Grouped explicitly rather than through
+ * `toLocaleString`, which would vary with the device's locale and make this untestable.
+ */
+function grouped(n: number): string {
+  return Math.abs(n)
+    .toString()
+    .replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
 function plural(n: number, word: string): string {

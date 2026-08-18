@@ -76,12 +76,30 @@ import {
   entryFromResult,
   formatLogNote,
   relativeTime,
-  announcePass,
-  announceStart,
   describePass,
-  passChangedSomething,
   type SyncLogEntry,
 } from "./log";
+import {
+  announcePass,
+  announceStart,
+  conflictReport,
+  noticeAllowed,
+  passChangedSomething,
+  resolveNoticeLevel,
+  resolveNoticeStart,
+  shortSnapshot,
+  DEFAULT_NOTICE_LEVEL,
+  DEFAULT_NOTICE_START,
+  LEGACY_NOTICE_KEYS,
+  SHORT_SNAPSHOT_LENGTH,
+  type NoticeCategory,
+  type NoticeLevel,
+} from "./notify";
+import {
+  MobileStatusBar,
+  describeFailure,
+  domMobileChrome,
+} from "./mobile-status-bar";
 import { countInScope, parseGlobs, DEFAULT_CONFIG_DIR } from "./paths";
 import { DEFAULT_LANES, MAX_LANES, clampLanes, mapPool } from "./pool";
 import { SyncScheduler, type ExclusiveHooks } from "./queue";
@@ -128,6 +146,15 @@ export interface Settings {
   debounceSeconds: number;
   intervalMinutes: number;
   syncOnStartup: boolean;
+  /**
+   * Minutes since the last pass before returning to the app starts a sync. `0` never does.
+   *
+   * Mobile only — that is where `visibilitychange` is registered, because a phone resumes far
+   * more than it starts. Its own value rather than a share of `intervalMinutes`: the event
+   * fires for screen unlocks and OS sheets too, so tying the two made a short sync interval
+   * quietly multiply the number of passes a day of ordinary phone use produced.
+   */
+  resumeSyncMinutes: number;
   maxBlobMB: number;
   /** Share of the vault a pull may delete or overwrite before asking. 100 disables. */
   protectPercent: number;
@@ -143,15 +170,37 @@ export interface Settings {
   retryAttempts: number;
   /** Folder the exported report is written to. Empty means the vault root. */
   logNoteFolder: string;
-  /** Notice when a pass finishes — the only status a phone can show. */
-  notifyOnSync: boolean;
   /**
-   * Narrow those notices to passes that actually moved a file. Off by default: a sync that
-   * found nothing to do is still evidence the plugin is alive and reaching the server.
+   * Name put in front of every sync notice, and whether to use it at all.
+   *
+   * A field rather than a constant because the name is repeated on every pass forever, and on a
+   * phone it is a meaningful share of a small screen. `showNoticePrefix` is separate from an
+   * empty string so that turning it off does not destroy whatever was typed there.
    */
-  notifyOnlyChanged: boolean;
+  noticePrefix: string;
+  showNoticePrefix: boolean;
+  /**
+   * How much sync says on its own initiative — one ordered choice, not a toggle per topic.
+   * `notify.ts` holds the ladder and the reasoning.
+   */
+  noticeLevel: NoticeLevel;
+  /**
+   * The "syncing…" opener, for a pass the user started. Outside the ladder on purpose: it
+   * answers a click, which is the one thing the levels never govern.
+   */
+  notifyOnStart: boolean;
   /** List the changed files in the notice, not just how many files and lines moved. */
   verboseSyncNotice: boolean;
+  /**
+   * Abbreviate snapshot ids in notices and dialogs. The exported log always carries the full
+   * id, so shortening never costs the one place a bug report reads from.
+   */
+  shortSnapshotIds: boolean;
+  /**
+   * Force Obsidian's hidden status bar visible on mobile. Off by default: it overrides
+   * Obsidian's own layout, so it is opt-in and reversible.
+   */
+  mobileStatusBar: boolean;
   /** Share vault-wide settings (excludes, thresholds, intervals, …) between devices. */
   syncSettings: boolean;
   /**
@@ -178,6 +227,10 @@ export const DEFAULT_SETTINGS: Settings = {
   debounceSeconds: 3,
   intervalMinutes: 15,
   syncOnStartup: true,
+  // 15 was the old hardcoded fallback for a vault with no interval set. As a real default it
+  // also stops a short `intervalMinutes` from setting the resume rate, which is the change
+  // someone syncing every 3 minutes will actually feel.
+  resumeSyncMinutes: 15,
   maxBlobMB: 90,
   protectPercent: 50,
   conflictMode: "keep-both",
@@ -186,11 +239,18 @@ export const DEFAULT_SETTINGS: Settings = {
   historyLimit: 40,
   retryAttempts: 3,
   logNoteFolder: "",
-  // On by default: mobile has no status bar, so without this a tap on the ribbon that
-  // succeeds with nothing to do looks identical to one that never ran.
-  notifyOnSync: true,
-  notifyOnlyChanged: false,
+  noticePrefix: "Cloudflare R2DO Sync",
+  showNoticePrefix: true,
+  noticeLevel: DEFAULT_NOTICE_LEVEL,
+  notifyOnStart: DEFAULT_NOTICE_START,
+  // Off: the compact summary already says how many files and lines moved each way, and a named
+  // list is the one notice shape that can run to a dozen lines on a first sync. Note the knock-on
+  // — the snapshot id rides on the verbose form, so a default notice carries no id even though
+  // `shortSnapshotIds` is on; that setting governs the dialogs and the verbose line, and the
+  // exported log keeps the full id regardless.
   verboseSyncNotice: false,
+  shortSnapshotIds: true,
+  mobileStatusBar: false,
   syncSettings: true,
   firstSyncAcknowledged: false,
 };
@@ -324,6 +384,9 @@ interface PendingEncryptionTransition {
 /** Where a user with no clone can read the setup instructions the first-run panel names. */
 const REPO_URL = "https://github.com/pc418/cloudflare-r2do-sync#readme";
 
+/** Newline, spelled without a source escape so no tool can flatten it into the file. */
+const NL = String.fromCharCode(10);
+
 /** How often the status bar re-renders so "synced 3m ago" keeps counting up. */
 const STATUS_REFRESH_MS = 30_000;
 
@@ -419,6 +482,8 @@ export default class LogSyncPlugin extends Plugin {
   #stateServerUrl = "";
   #statusBar: HTMLElement | null = null;
   #ribbon: HTMLElement | null = null;
+  /** The mobile status-bar override, built only on mobile and only while it is switched on. */
+  #mobileStatusBar: MobileStatusBar | null = null;
   /** The live periodic-sync timer and the interval it was built from, so a change can replace it. */
   #autoSyncTimer: number | null = null;
   #autoSyncMinutes = 0;
@@ -464,6 +529,17 @@ export default class LogSyncPlugin extends Plugin {
     if (this.settings.excludes === ".obsidian/**\n.trash/**") {
       this.settings.excludes = ".trash/**";
     }
+    // The five per-category notice booleans became one level in 0.7.2. Resolved from the SAVED
+    // object rather than from `this.settings`, because the spread above has already merged the
+    // new defaults in and "absent" would no longer be distinguishable from "chosen". The old
+    // keys are then deleted so a value nothing reads any more cannot be picked up by something
+    // written later, and so `data.json` stops carrying them forward forever.
+    const legacy = savedSettings as Record<string, unknown> | null;
+    this.settings.noticeLevel = resolveNoticeLevel(legacy);
+    this.settings.notifyOnStart = resolveNoticeStart(legacy);
+    for (const key of LEGACY_NOTICE_KEYS) {
+      delete (this.settings as unknown as Record<string, unknown>)[key];
+    }
     this.#stateServerUrl = endpointIdentity(this.settings.serverUrl);
     const persistedStateServerUrl = endpointIdentity(
       data?.stateServerUrl ?? data?.settings?.serverUrl ?? this.settings.serverUrl
@@ -481,8 +557,9 @@ export default class LogSyncPlugin extends Plugin {
     this.#lastConflicts = data?.lastConflicts ?? [];
     this.#pendingEncryptionTransition = data?.pendingEncryptionTransition ?? null;
 
-    // The status bar does not exist on mobile, so the ribbon is the only always-present
-    // affordance a phone has: it both starts a sync and carries the status in its tooltip.
+    // Obsidian hides the status bar on mobile, so the ribbon is the always-present affordance a
+    // phone has: it both starts a sync and carries the status in its tooltip. `mobileStatusBar`
+    // can un-hide the bar itself, which is what makes silencing notices survivable there.
     this.#ribbon = this.addRibbonIcon("refresh-cw", "R2DO Sync: sync now", () => void this.syncNow());
     this.#statusBar = this.addStatusBarItem();
     this.#statusBar.onClickEvent(() => void this.syncNow());
@@ -585,13 +662,36 @@ export default class LogSyncPlugin extends Plugin {
       this.app.workspace.onLayoutReady(() => void this.#autoSync());
     }
 
+    // Deferred to layout-ready: the status bar and the mobile nav bar are both Obsidian's own
+    // chrome, and neither is in the DOM while `onload` runs.
+    if (Platform.isMobile && this.settings.mobileStatusBar) {
+      this.app.workspace.onLayoutReady(() => {
+        const failure = this.applyMobileStatusBar();
+        // Deliberately NOT routed through the notice policy, and the only message here that is
+        // not. Every other exemption is about a click deserving an answer; this one is about
+        // the exemption's own premise: someone who silenced notices did it because the status
+        // bar was carrying the state. If the bar could not be shown, that trade has silently
+        // stopped holding, and a `console.error` nobody opens is how a device ends up with no
+        // notices AND no status bar reporting a failing sync.
+        if (failure !== null) new Notice(failure, 0);
+      });
+    }
+
     // A phone rarely cold-starts Obsidian — the OS suspends and RESUMES it, so
     // `onLayoutReady` never re-fires and the interval timer slept the whole time.
-    // Becoming visible again is mobile's equivalent of startup.
+    // Becoming visible again is mobile's equivalent of startup, which is why `syncOnStartup`
+    // still governs it and `resumeSyncMinutes` only narrows it further.
+    //
+    // The event is far noisier than "the user came back to the app": it also fires for screen
+    // lock and unlock, the notification shade, split-screen, and any OS sheet. So the gap is
+    // the whole guard, and it has its OWN setting rather than borrowing `intervalMinutes` —
+    // sharing them meant a shorter sync interval silently made every screen unlock a sync,
+    // which is not something the interval's name suggests.
     if (Platform.isMobile) {
       this.registerDomEvent(document, "visibilitychange", () => {
         if (document.visibilityState !== "visible" || !this.settings.syncOnStartup) return;
-        const gapMinutes = this.settings.intervalMinutes > 0 ? this.settings.intervalMinutes : 15;
+        const gapMinutes = this.settings.resumeSyncMinutes;
+        if (gapMinutes <= 0) return; // 0 is off, and is the only way to reach zero gap
         const lastPassAt = Math.max(this.#lastSuccessAt ?? 0, this.#lastFailureAt ?? 0);
         if (Date.now() - lastPassAt < gapMinutes * 60_000) return;
         void this.#autoSync();
@@ -659,7 +759,38 @@ export default class LogSyncPlugin extends Plugin {
   onunload(): void {
     if (this.#settingsPushTimer !== null) window.clearTimeout(this.#settingsPushTimer);
     if (this.#autoSyncTimer !== null) window.clearInterval(this.#autoSyncTimer);
+    // Obsidian's own layout, put back as it was. A disabled plugin that leaves the status bar
+    // forced open has broken the app rather than merely stopped working.
+    this.#mobileStatusBar?.disable();
+    this.#mobileStatusBar = null;
     this.#retireScheduler();
+  }
+
+  /**
+   * Brings the mobile status bar into line with the setting, and says so when it cannot.
+   *
+   * Returns the failure rather than throwing: an Obsidian version that moved the status bar
+   * must not stop the plugin from loading, but it must not pass silently either — the whole
+   * point of the override is that someone is relying on that bar to see failures.
+   */
+  applyMobileStatusBar(): string | null {
+    const wanted = Platform.isMobile && this.settings.mobileStatusBar;
+    if (!wanted) {
+      this.#mobileStatusBar?.disable();
+      this.#mobileStatusBar = null;
+      return null;
+    }
+    if (this.#mobileStatusBar !== null) return null;
+    const { port, failure } = domMobileChrome(document);
+    if (port === null) {
+      const reason = describeFailure(failure ?? "no-status-bar");
+      console.error(`R2DO Sync: ${reason}`);
+      return reason;
+    }
+    this.#mobileStatusBar = new MobileStatusBar(port);
+    this.#mobileStatusBar.enable();
+    this.#renderStatus();
+    return null;
   }
 
   // --- shared settings document --------------------------------------------------------
@@ -764,7 +895,9 @@ export default class LogSyncPlugin extends Plugin {
     if (changed) {
       // Fingerprint already matches the doc, so the push scheduled by saveSettings no-ops.
       await this.saveSettings();
-      new Notice(`R2DO Sync: settings updated from "${rev.device}"`, 5000);
+      // A change made to this device by another one, which is what "changes" covers — the
+      // same category as a pulled file, and for the same reason.
+      this.#say("changes", `settings updated from "${rev.device}"`, 5000);
     } else {
       await this.#persist();
     }
@@ -837,7 +970,11 @@ export default class LogSyncPlugin extends Plugin {
     this.#settingsPushTimer = window.setTimeout(() => {
       this.#settingsPushTimer = null;
       this.#pushSharedSettings().catch((e) => {
-        new Notice(`R2DO Sync: could not publish settings to other devices: ${message(e)}`, 10_000);
+        this.#say(
+          "problems",
+          `could not publish settings to other devices: ${message(e)}`,
+          10_000
+        );
       });
     }, 2000);
   }
@@ -1103,14 +1240,14 @@ export default class LogSyncPlugin extends Plugin {
       if (!consent.proceed) return;
       this.#phase = "syncing";
       this.#renderStatus();
-      if (announceStart({ notifyOnSync: this.settings.notifyOnSync, interactive: true })) {
-        started = new Notice("R2DO Sync: syncing…", 0);
+      if (announceStart({ enabled: this.settings.notifyOnStart, interactive: true })) {
+        started = new Notice(this.#prefixed("syncing…"), 0);
       }
       try {
         await this.#syncSharedSettings();
       } catch (e) {
         // The file sync still runs — stale policy knobs beat not syncing notes at all.
-        new Notice(`R2DO Sync: shared settings check failed: ${message(e)}`, 10_000);
+        this.#say("problems", `shared settings check failed: ${message(e)}`, 10_000);
       }
       if (!this.#scheduler) return;
       // `pullOnly` is set only for the first pass of a device with nothing of its own to
@@ -1466,7 +1603,7 @@ export default class LogSyncPlugin extends Plugin {
         http: obsidianHttp,
       }).getHead();
       new Notice(
-        `R2DO Sync configured as "${payload.name}"${payload.mode === "encrypted" ? " (encrypted)" : " (plaintext)"}. Remote head: ${head ?? "(empty vault)"}`,
+        `R2DO Sync configured as "${payload.name}"${payload.mode === "encrypted" ? " (encrypted)" : " (plaintext)"}. Remote head: ${head === null ? "(empty vault)" : shortSnapshot(head, this.settings.shortSnapshotIds)}`,
         10_000
       );
       // A device that was just set up should not sit idle until someone finds the ribbon.
@@ -1692,12 +1829,27 @@ export default class LogSyncPlugin extends Plugin {
    * ordinary "up to date", a conflict is exactly the event a user must not miss. A watched
    * pass opens the detail modal directly; a background one gets a notice pointing at the
    * review command instead, because there may be no one at the screen to dismiss a modal.
+   *
+   * Both of those are governed by the `conflicts` category, the modal included. Auto-opening a
+   * window is a *larger* interruption than the notice beside it, so a device that asked not to
+   * be told about conflicts must not get one — a category that silenced the quiet half and
+   * kept the loud half would be worse than no setting.
+   *
+   * The record is not governed. `#lastConflicts` is assigned before any of it, so the conflicts
+   * are still on disk, still counted on the settings page, and still listed by "Review and
+   * resolve conflicts". Silencing loses the prompt, never the evidence.
    */
   #reportConflicts(result: SyncResult): void {
     const details = result.conflictDetails;
     if (details.length === 0) return;
+    // Kept before anything is decided: the record is not what the setting governs.
     this.#lastConflicts = details;
-    if (this.#interactive > 0) {
+    const how = conflictReport({
+      level: this.noticeLevel,
+      interactive: this.#interactive > 0,
+    });
+    if (how === "none") return;
+    if (how === "modal") {
       void this.openConflictReview();
       return;
     }
@@ -1710,9 +1862,9 @@ export default class LogSyncPlugin extends Plugin {
     const advice = details.some((c) => isResolvable(c))
       ? 'Run "Review and resolve conflicts" to see the differences and pick a side.'
       : 'Run "Review and resolve conflicts" for what happened to each one.';
-    new Notice(
-      `R2DO Sync: ${names.length} conflict${names.length === 1 ? "" : "s"} — ${shown}${more}. ` +
-        advice,
+    this.#say(
+      "conflicts",
+      `${names.length} conflict${names.length === 1 ? "" : "s"} — ${shown}${more}. ${advice}`,
       15_000
     );
   }
@@ -1901,52 +2053,103 @@ export default class LogSyncPlugin extends Plugin {
     this.#progress = null;
     this.#phase = "idle";
     this.#renderStatus();
-    new Notice(`R2DO Sync error: ${e.message}`, 10_000);
+    // Governed like every other status notice. The failure itself is not suppressed — it is in
+    // the log, `lastFailureAt` has moved, and the status bar reads the failure — so what a
+    // silenced device loses is the interruption, not the evidence.
+    this.#say("problems", `error: ${e.message}`, 10_000);
     await this.#persist();
+  }
+
+  /**
+   * How much this device says. Read fresh at every call site rather than cached, because
+   * settings can be rewritten mid-pass by an applied shared-settings document.
+   */
+  get noticeLevel(): NoticeLevel {
+    return this.settings.noticeLevel;
+  }
+
+  /**
+   * The configured name, or "" when it is switched off or blank.
+   *
+   * Trimmed here rather than on save, so a stray space cannot produce a notice that begins with
+   * one — and so the stored value stays exactly what the user typed.
+   */
+  get noticeName(): string {
+    return this.settings.showNoticePrefix ? this.settings.noticePrefix.trim() : "";
+  }
+
+  /**
+   * A notice's text with the configured name in front of it.
+   *
+   * The name is a prefix rather than part of each message, so that turning it off leaves a
+   * sentence rather than a hole: every message below is written to read correctly both as
+   * "R2DO Sync halted: …" and as "halted: …".
+   */
+  #prefixed(text: string): string {
+    const name = this.noticeName;
+    // A leading newline is the caller asking for the message to sit on its own line BELOW the
+    // name. With no name there is nothing to sit below, so it would render as a blank first
+    // line — the label's absence should cost the row it occupied, not leave a hole where it was.
+    if (name === "") return text.startsWith(NL) ? text.slice(NL.length) : text;
+    return text.startsWith(NL) ? `${name}${text}` : `${name} ${text}`;
+  }
+
+  /**
+   * Raises a notice only if its category is enabled on this device.
+   *
+   * Every self-initiated sync notice goes through here, which is what makes the `silent` level
+   * mean silence rather than "quieter in the places someone remembered". A notice that answers
+   * a click calls `new Notice` directly and is deliberately not routed here.
+   */
+  #say(category: NoticeCategory, text: string, durationMs?: number): void {
+    if (!noticeAllowed(this.noticeLevel, category)) return;
+    new Notice(this.#prefixed(text), durationMs);
   }
 
   #notify(result: SyncResult): void {
     const changed = passChangedSomething(result);
     if (
-      announcePass({
-        notifyOnSync: this.settings.notifyOnSync,
-        onlyChanged: this.settings.notifyOnlyChanged,
-        interactive: this.#interactive > 0,
-        result,
-      })
+      announcePass({ level: this.noticeLevel, result })
     ) {
       const verbose = this.settings.verboseSyncNotice;
       // A named list takes longer to read than "up to date", and a pass that moved nothing
       // should not linger on screen.
       const duration = !changed ? 4_000 : verbose ? 12_000 : 8_000;
-      new Notice(`R2DO Sync\n${describePass(result, { verbose })}`, duration);
+      const detail = describePass(result, { verbose, shortIds: this.settings.shortSnapshotIds });
+      new Notice(this.#prefixed(`${NL}${detail}`), duration);
     } else if (result.pulled > 0) {
-      // The floor no setting removes: files changed under the user without them asking.
-      new Notice(`R2DO Sync changed ${result.pulled} local file(s)`);
+      // Files changed under the user without them asking. This used to be the floor no setting
+      // could remove; it is now its own category, because a device asked to be silent has a
+      // status bar to say so and a popup it did not want is still a popup.
+      this.#say("changes", `changed ${result.pulled} local file(s)`);
     }
     if (result.skipped.length > 0) {
       const detail = result.skipped
         .slice(0, 5)
         .map((s) => `${s.path} (${s.reason})`)
         .join("\n");
-      new Notice(`R2DO Sync skipped ${result.skipped.length} file(s):\n${detail}`, 10_000);
+      this.#say("problems", `skipped ${result.skipped.length} file(s):\n${detail}`, 10_000);
     }
     if (result.conflicts.length > 0) {
-      // Never a silent resolution: both versions are on disk and the user has to choose.
-      new Notice(
-        `R2DO Sync could not merge ${result.conflicts.length} file(s). The other device's ` +
+      // Never a silent resolution: both versions are on disk and the user has to choose. The
+      // conflict list also survives in `#lastConflicts`, so silencing this loses the prompt
+      // and not the record — "Review and resolve conflicts" still finds them.
+      this.#say(
+        "conflicts",
+        `could not merge ${result.conflicts.length} file(s). The other device's ` +
           `version is saved beside yours:\n${result.conflicts.slice(0, 5).join("\n")}`,
         0
       );
     }
     if (result.status === "halted") {
-      new Notice(`R2DO Sync halted: ${result.reason}`, 0);
+      this.#say("problems", `halted: ${result.reason}`, 0);
       return;
     }
     if (result.status === "needs-decision") {
       const { deletes, overwrites, percent } = result.summary;
-      new Notice(
-        `R2DO Sync paused: the remote would delete ${deletes.length} and overwrite ` +
+      this.#say(
+        "problems",
+        `paused: the remote would delete ${deletes.length} and overwrite ` +
           `${overwrites.length} file(s) here — ${percent}% of this vault. Run "Sync now" to ` +
           `review and choose what happens.`,
         0
@@ -1956,8 +2159,9 @@ export default class LogSyncPlugin extends Plugin {
       // "Nothing was published" and not "nothing was changed": an earlier turn of the same
       // pass may have applied a snapshot whose history it did confirm, and `result.pulled`
       // has its own notice above saying so.
-      new Notice(
-        "R2DO Sync paused: it could not trace the remote's current snapshot back to the one " +
+      this.#say(
+        "problems",
+        "paused: it could not trace the remote's current snapshot back to the one " +
           `this device last synced (${result.continuity.reason}). Nothing was published. Run ` +
           '"Sync now" to see what was checked and decide.',
         0
@@ -3639,6 +3843,12 @@ export class LogSyncSettingTab extends PluginSettingTab {
    */
   #pending: Array<() => void> = [];
 
+  /**
+   * Why the mobile status-bar override could not be installed, or `null`. Kept across a
+   * `display()` because the redraw that shows it is the one the failure triggered.
+   */
+  mobileStatusBarError: string | null = null;
+
   constructor(
     app: App,
     private readonly plugin: LogSyncPlugin
@@ -3947,7 +4157,11 @@ export class LogSyncSettingTab extends PluginSettingTab {
               http: obsidianHttp,
             });
             const head = await api.getHead();
-            new Notice(`R2DO Sync OK. Remote head: ${head ?? "(empty vault)"}`);
+            const shown =
+              head === null
+                ? "(empty vault)"
+                : shortSnapshot(head, this.plugin.settings.shortSnapshotIds);
+            new Notice(`R2DO Sync OK. Remote head: ${shown}`);
           } catch (e) {
             new Notice(`R2DO Sync failed: ${message(e)}`, 10_000);
           }
@@ -4354,6 +4568,25 @@ export class LogSyncSettingTab extends PluginSettingTab {
         })
       );
 
+    // Mobile only, because that is the only platform where returning to the app is wired to
+    // anything. On desktop the row would be a control for nothing.
+    if (Platform.isMobile) {
+      this.#number(containerEl, {
+        name: "Sync on returning to the app (minutes)",
+        desc:
+          "How long since the last sync before returning to Obsidian starts one. 0 never " +
+          "does. Returning fires more often than it sounds — a screen unlock or a pulled-down " +
+          "notification shade counts — so this is what stops that becoming a sync each time. " +
+          'Needs "Sync on startup" on.',
+        value: this.plugin.settings.resumeSyncMinutes,
+        range: "0–1440",
+        accept: (n) => n >= 0 && n <= 1440,
+        apply: (n) => {
+          this.plugin.settings.resumeSyncMinutes = n;
+        },
+      });
+    }
+
     // A row about keystrokes on a device with no keyboard is noise: mobile Obsidian has no
     // Hotkeys page to send anyone to either.
     if (!Platform.isMobile) this.#hotkeyRow(containerEl);
@@ -4553,44 +4786,71 @@ export class LogSyncSettingTab extends PluginSettingTab {
   #renderNotices(containerEl: HTMLElement): void {
     this.#heading(containerEl, "Notices");
 
+    // One ordered choice rather than a switch per topic. Independent booleans could express
+    // "every pass but never problems" — a stream of "up to date" from a sync that has silently
+    // broken — and they left silence as a state the page had to *detect* and warn about
+    // instead of something anyone could simply pick.
     new Setting(containerEl)
-      // Both ends of a pass, so the name cannot promise only one of them: a sync you start
-      // says "syncing…" as it begins and what it did when it ends.
-      .setName("Notice when a sync runs")
+      .setName("What sync announces")
       .setDesc(
-        Platform.isMobile
-          ? "Every pass, background ones included, and a \"syncing…\" notice while a sync you " +
-            "started is running. Recommended on mobile: there is no status bar, so this is " +
-            "the only confirmation that a tap on the ribbon did anything."
-          : "Every pass, background ones included: how many files moved each way and the net " +
-            "change in lines. A sync you start also says so while it runs."
+        "Each level also says everything the ones below it would. This is a per-device " +
+          "setting: quiet on a phone and loud on a desktop is the ordinary case."
+      )
+      .addDropdown((d) =>
+        d
+          .addOption("all", 'All — every pass, "up to date" included')
+          .addOption("activity", "Activity — only passes that changed something")
+          .addOption("problems", "Problems — conflicts and errors only")
+          .addOption("silent", "Silent — nothing")
+          .setValue(this.plugin.settings.noticeLevel)
+          .onChange(async (v) => {
+            this.plugin.settings.noticeLevel = v as NoticeLevel;
+            await this.plugin.saveSettings();
+            // Redrawn because the warning below belongs to one choice only. Appending it would
+            // stack a second copy every time the level changed.
+            this.display();
+          })
+      );
+
+    if (this.plugin.settings.noticeLevel === "silent") {
+      // Silence is a state someone can choose deliberately, so it has to be visible rather
+      // than merely reachable: a device that has quietly stopped reporting failures otherwise
+      // looks exactly like one that has nothing to report.
+      containerEl.createEl("p", {
+        cls: "r2do-hint",
+        text: Platform.isMobile
+          ? "Sync will not say anything at all — failures included. It keeps running and keeps " +
+            "recording what it did. Turn on the status bar below, or nothing on screen will " +
+            "tell you a sync has started failing."
+          : "Sync will not say anything at all — failures included. It keeps running and keeps " +
+            "recording what it did: the status bar still shows the state, and the sync log " +
+            "still has the detail.",
+      });
+    }
+
+    new Setting(containerEl)
+      .setName("Say when a sync starts")
+      .setDesc(
+        'Shows "syncing…" while a sync you started is running, and only then — a timer has ' +
+          "nobody to reassure. Kept out of the level above because it answers your tap rather " +
+          "than describing the vault, so it still works at Problems and Silent. Below All it " +
+          "is the only reply a manual sync that found nothing gives you, which is what it is " +
+          "for: leave it on if you sync by hand."
       )
       .addToggle((t) =>
-        t.setValue(this.plugin.settings.notifyOnSync).onChange(async (v) => {
-          this.plugin.settings.notifyOnSync = v;
+        t.setValue(this.plugin.settings.notifyOnStart).onChange(async (v) => {
+          this.plugin.settings.notifyOnStart = v;
           await this.plugin.saveSettings();
         })
       );
 
     new Setting(containerEl)
-      .setName("Only notice syncs that changed something")
-      .setDesc(
-        "Skips the notice when a pass found nothing to do. A sync you start yourself always " +
-          "answers, so a manual sync never looks like it failed to run."
-      )
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.notifyOnlyChanged).onChange(async (v) => {
-          this.plugin.settings.notifyOnlyChanged = v;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("List the changed files in the notice")
+      .setName("List the changed files")
       .setDesc(
         "Names each file that moved, with its line change and the snapshot id, instead of " +
           "counts alone. Long lists are cut off. A line count is net — 5 lines replaced by 5 " +
-          "others reads as 0 — and binary files have none."
+          "others reads as 0 — and binary files have none. Shapes the pass summary, so it " +
+          "needs All or Activity above."
       )
       .addToggle((t) =>
         t.setValue(this.plugin.settings.verboseSyncNotice).onChange(async (v) => {
@@ -4598,6 +4858,79 @@ export class LogSyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
+
+    // Switch and text in one row, switch first. As two rows the field came before the control
+    // deciding whether it mattered, and their pairing had to be explained rather than shown.
+    new Setting(containerEl)
+      .setName("Label")
+      .setDesc(
+        "Put in front of every notice above. It is repeated on every pass forever, so a " +
+          "shorter name — or none — buys back a useful amount of a phone screen. The switch " +
+          "is separate from the text so turning it off does not throw away what you typed; a " +
+          "blank name behaves the same as off."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.showNoticePrefix).onChange(async (v) => {
+          this.plugin.settings.showNoticePrefix = v;
+          await this.plugin.saveSettings();
+        })
+      )
+      .addText((t) => {
+        let stored = this.plugin.settings.noticePrefix;
+        t.setValue(stored);
+        this.#stage(t.inputEl, async () => {
+          const entered = t.inputEl.value;
+          if (entered === stored) return;
+          stored = entered;
+          this.plugin.settings.noticePrefix = entered;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Short snapshot ids")
+      .setDesc(
+        `Shows a snapshot as its last ${SHORT_SNAPSHOT_LENGTH} characters instead of all 26 — ` +
+          "the readable end, since the first ten are just the time it was made. Notices only; " +
+          "the exported sync log always carries the full id."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.shortSnapshotIds).onChange(async (v) => {
+          this.plugin.settings.shortSnapshotIds = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    if (Platform.isMobile) this.#mobileStatusBarRow(containerEl);
+  }
+
+  /**
+   * The mobile status bar toggle. Mobile only, because on desktop the bar is already there and
+   * an override that does nothing is worse than no setting at all.
+   */
+  #mobileStatusBarRow(containerEl: HTMLElement): void {
+    new Setting(containerEl)
+      .setName("Show the status bar on mobile")
+      .setDesc(
+        "Obsidian hides the status bar on phones. This forces it back, so sync state is " +
+          "readable without notices — necessary if you turn on Silent sync. It overrides " +
+          "Obsidian's own layout, so turn it off again if anything looks wrong."
+      )
+      .addToggle((t) => {
+        t.setValue(this.plugin.settings.mobileStatusBar).onChange(async (v) => {
+          this.plugin.settings.mobileStatusBar = v;
+          await this.plugin.saveSettings();
+          this.mobileStatusBarError = this.plugin.applyMobileStatusBar();
+          // Redrawn rather than appended: a toggle flipped twice would otherwise stack a
+          // second copy of the same complaint under the row.
+          this.display();
+        });
+      });
+    // Said beside the control that caused it rather than in a notice — the user is looking at
+    // this row, and a device that just asked for silence would not be shown a notice anyway.
+    if (this.mobileStatusBarError !== null) {
+      containerEl.createEl("p", { text: this.mobileStatusBarError, cls: "r2do-error" });
+    }
   }
 
   /** The exported log and the two knobs that shape it. */

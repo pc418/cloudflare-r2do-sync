@@ -4,6 +4,7 @@ import LogSyncPlugin, {
   DEFAULT_SETTINGS,
   type Settings,
 } from "../src/main";
+import { LEGACY_NOTICE_KEYS } from "../src/notify";
 import { encodeSetupPayload } from "../src/setup-link";
 import { LifecycleApp, Modal, Notice, Platform, requestUrlMock } from "./obsidian-fake";
 
@@ -598,29 +599,60 @@ describe("registration and teardown", () => {
     expect(live("timeout")).toHaveLength(0);
   });
 
-  it("registers the mobile resume handler only on mobile, and it respects the interval", async () => {
-    Platform.isMobile = true;
-    const { plugin } = makePlugin(
-      persisted({
-        settings: {
-          ...CONFIGURED,
-          firstSyncAcknowledged: true,
-          syncOnStartup: true,
-          intervalMinutes: 15,
-        },
-        lastSuccessAt: Date.now(),
-      })
-    );
-    await plugin.onload();
-
+  const resumeHandler = (plugin: LogSyncPlugin): (() => void) => {
     const domEvents = (plugin as unknown as { domEvents: { type: string; handler: () => void }[] })
       .domEvents;
     expect(domEvents.map((e) => e.type)).toEqual(["visibilitychange"]);
+    return domEvents[0].handler;
+  };
 
-    // A resume moments after the last pass must not re-sync; the guard is time, not focus.
-    domEvents[0].handler();
+  const onResume = async (over: Partial<Settings>, lastPassAt: number) => {
+    Platform.isMobile = true;
+    const { plugin, app } = makePlugin(
+      persisted({
+        settings: { ...CONFIGURED, firstSyncAcknowledged: true, syncOnStartup: true, ...over },
+        lastSuccessAt: lastPassAt,
+      })
+    );
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    requestUrlMock.calls.length = 0;
+    resumeHandler(plugin)();
     await flush();
-    expect(requestUrlMock.calls).toHaveLength(0);
+    await flush();
+    return requestUrlMock.calls.length;
+  };
+
+  it("registers the mobile resume handler only on mobile, and it respects its own gap", async () => {
+    // A resume moments after the last pass must not re-sync; the guard is time, not focus.
+    expect(await onResume({ resumeSyncMinutes: 15 }, Date.now())).toBe(0);
+  });
+
+  it("syncs on resume once the gap has passed", async () => {
+    expect(await onResume({ resumeSyncMinutes: 15 }, Date.now() - 20 * 60_000)).toBeGreaterThan(0);
+  });
+
+  it("never syncs on resume when the gap is zero, however long it has been", async () => {
+    // 0 is the off switch, and it has to beat every other reason to sync — a device that has
+    // been away for a week is exactly when a resume sync would otherwise be most certain.
+    expect(await onResume({ resumeSyncMinutes: 0 }, Date.now() - 7 * 24 * 60 * 60_000)).toBe(0);
+  });
+
+  it("does not take its gap from the sync interval any more", async () => {
+    // The reported complaint: a 3-minute interval used to mean every screen unlock more than
+    // 3 minutes after the last pass started a sync. The two are independent now.
+    const calls = await onResume(
+      { intervalMinutes: 3, resumeSyncMinutes: 60 },
+      Date.now() - 10 * 60_000
+    );
+    expect(calls).toBe(0);
+  });
+
+  it("still obeys sync on startup, because resuming IS startup on a phone", async () => {
+    expect(
+      await onResume({ syncOnStartup: false, resumeSyncMinutes: 1 }, Date.now() - 60 * 60_000)
+    ).toBe(0);
   });
 
   it("registers no resume handler on desktop", async () => {
@@ -762,5 +794,496 @@ describe("continuity gate", () => {
     expect(text).not.toContain("Stopping leaves both sides exactly as they are");
     expect(text).toContain("Stopping publishes nothing");
     expect(text).toContain("does not undo the 2 file(s)");
+  });
+});
+
+// --- notice policy, end to end -------------------------------------------------------------
+//
+// The unit tests in notify.spec.ts pin the decision. These pin the WIRING: every self-raised
+// notice actually asks the policy, rather than most of them asking and one call site that
+// nobody moved still calling `new Notice` directly. That is the failure a green unit suite
+// cannot see, and it is the failure that makes "silent" a false promise.
+
+describe("the silent level", () => {
+  const withSettings = (over: Partial<Settings>) =>
+    makePlugin(
+      persisted({
+        settings: { ...CONFIGURED, firstSyncAcknowledged: true, retryAttempts: 0, ...over },
+      })
+    );
+
+  it("raises the ordinary pass notice at the default level", async () => {
+    // The control: without this, a suite where nothing ever notices would pass just as well.
+    const { plugin, app } = withSettings({ noticeLevel: "all" });
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    expect(Notice.shown.some((n) => /R2DO Sync/.test(n))).toBe(true);
+  });
+
+  it("says nothing at all for a pass the user started", async () => {
+    const { plugin, app } = withSettings({ noticeLevel: "silent", notifyOnStart: false });
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    expect(Notice.shown).toEqual([]);
+  });
+
+  it("still opens with \"syncing…\" if that switch is left on, and says nothing else", async () => {
+    // The deliberate seam: the opener answers a tap, which the level never governs. Pinned so
+    // nobody folds it into the ladder as a tidy-up — and pinned as "only that", so folding it
+    // in the other direction (leaking the summary back) fails too.
+    const { plugin, app } = withSettings({ noticeLevel: "silent", notifyOnStart: true });
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    expect(Notice.shown).toEqual(["Cloudflare R2DO Sync syncing…"]);
+  });
+
+  it("says nothing when a pass fails, and still records the failure", async () => {
+    // The load-bearing claim of the whole feature: silence removes the interruption, not the
+    // evidence. If this ever regresses to swallowing the error too, silent mode becomes a way
+    // to make a broken sync look like a working one.
+    const { plugin, app } = withSettings({ noticeLevel: "silent", notifyOnStart: false });
+    emptyVault(app);
+    requestUrlMock.impl = async () => {
+      throw new Error("network down");
+    };
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    expect(Notice.shown).toEqual([]);
+    const saved = lastSave(plugin) as PersistedData & {
+      log?: { status: string; detail: string }[];
+      lastFailureAt?: number;
+    };
+    expect(saved.log?.[0]?.status).toBe("error");
+    expect(saved.log?.[0]?.detail).toContain("network down");
+    expect(saved.lastFailureAt).toBeGreaterThan(0);
+  });
+
+  it("still shows a failure at the problems level, where the pass summary is gone", async () => {
+    // The rung's whole purpose: everything routine goes quiet, everything needing a human
+    // stays loud. A level that took the failure with the chatter would be silence with extra
+    // steps.
+    const { plugin, app } = withSettings({ noticeLevel: "problems" });
+    emptyVault(app);
+    requestUrlMock.impl = async () => {
+      throw new Error("network down");
+    };
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    expect(Notice.shown.some((n) => /network down/.test(n))).toBe(true);
+  });
+
+  it("drops the routine summary at the problems level but keeps the pass running", async () => {
+    // `syncSettings: false` because the shared-settings fetch is unmocked here and its failure
+    // is itself a `problems` notice — a real one, but not the thing under test.
+    const { plugin, app } = withSettings({
+      noticeLevel: "problems",
+      notifyOnStart: false,
+      syncSettings: false,
+    });
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    expect(Notice.shown).toEqual([]);
+    const saved = lastSave(plugin) as PersistedData & { lastSuccessAt?: number };
+    expect(saved.lastSuccessAt).toBeGreaterThan(0);
+  });
+
+  it("still answers a click that cannot start a sync at all", async () => {
+    // Not a status notice: it is the direct reply to a tap, and a control that answers nothing
+    // reads as broken. Silence covers what the plugin says on its own initiative.
+    const { plugin } = makePlugin(
+      persisted({
+        settings: { serverUrl: "", accessToken: "", noticeLevel: "silent", notifyOnStart: false },
+      })
+    );
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    expect(Notice.shown.some((n) => /server URL and access token/.test(n))).toBe(true);
+  });
+});
+
+// --- migrating off the five per-category booleans -------------------------------------------
+
+describe("loading a data.json written before the notice level existed", () => {
+  const loadWith = async (settings: Record<string, unknown>) => {
+    const { plugin } = makePlugin(
+      persisted({ settings: { ...CONFIGURED, ...settings } as Partial<Settings> })
+    );
+    await plugin.onload();
+    return plugin;
+  };
+
+  it("carries the shipped defaults onto the loudest level", async () => {
+    const plugin = await loadWith({
+      notifyOnSync: true,
+      notifyOnlyChanged: false,
+      notifyOnChanges: true,
+      notifyOnConflicts: true,
+      notifyOnProblems: true,
+    });
+    expect(plugin.settings.noticeLevel).toBe("all");
+    expect(plugin.settings.notifyOnStart).toBe(true);
+  });
+
+  it("keeps a device that had switched everything off silent, opener included", async () => {
+    // The upgrade someone would notice most: they asked for quiet, and a release that handed
+    // it back a "syncing…" popup would read as the setting having been ignored.
+    const plugin = await loadWith({
+      notifyOnSync: false,
+      notifyOnChanges: false,
+      notifyOnConflicts: false,
+      notifyOnProblems: false,
+    });
+    expect(plugin.settings.noticeLevel).toBe("silent");
+    expect(plugin.settings.notifyOnStart).toBe(false);
+  });
+
+  it("reads the old changes-only narrowing as the activity level", async () => {
+    const plugin = await loadWith({ notifyOnSync: true, notifyOnlyChanged: true });
+    expect(plugin.settings.noticeLevel).toBe("activity");
+  });
+
+  it("deletes the old keys instead of carrying them forward forever", async () => {
+    const plugin = await loadWith({ notifyOnSync: false, notifyOnChanges: false });
+    await plugin.saveSettings();
+    const saved = lastSave(plugin) as PersistedData;
+    const settings = saved.settings as unknown as Record<string, unknown>;
+    for (const key of LEGACY_NOTICE_KEYS) expect(settings, key).not.toHaveProperty(key);
+    expect(settings.noticeLevel).toBe("problems");
+  });
+
+  it("lets a level already chosen win over stale keys beside it", async () => {
+    // A device that migrated on an earlier load can still be holding the old keys if its
+    // data.json was written by an older build. Re-deriving from them every load would undo
+    // the user's choice silently, once per restart.
+    const plugin = await loadWith({ noticeLevel: "all", notifyOnSync: false });
+    expect(plugin.settings.noticeLevel).toBe("all");
+  });
+});
+
+// --- mobile status bar ----------------------------------------------------------------------
+
+/**
+ * Just enough of Obsidian's mobile DOM for `domMobileChrome` to bind to: an app container, the
+ * hidden status bar, and a nav bar with a height. Built here rather than in `obsidian-fake`
+ * because none of it is Obsidian's plugin API — it is the app's own layout, which is precisely
+ * what makes the override worth pinning.
+ */
+function installMobileDom(): {
+  bodyClasses: Set<string>;
+  statusBarProps: Map<string, string>;
+  observers: number;
+  disconnects: number;
+} {
+  const bodyClasses = new Set<string>();
+  const statusBarProps = new Map<string, string>();
+  const counts = { observers: 0, disconnects: 0 };
+  const statusBar = {
+    style: {
+      setProperty: (k: string, v: string) => statusBarProps.set(k, v),
+      removeProperty: (k: string) => statusBarProps.delete(k),
+    },
+  };
+  const navbar = { style: {} };
+  const doc = {
+    visibilityState: "visible",
+    body: {
+      classList: {
+        toggle: (name: string, on: boolean) => {
+          if (on) bodyClasses.add(name);
+          else bodyClasses.delete(name);
+        },
+      },
+    },
+    querySelector: (selector: string) => {
+      if (selector === ".app-container") return {};
+      if (selector === ".app-container .status-bar") return statusBar;
+      if (selector === ".mobile-navbar") return navbar;
+      return null;
+    },
+  };
+  class FakeMutationObserver {
+    constructor() {
+      counts.observers += 1;
+    }
+    observe(): void {}
+    disconnect(): void {
+      counts.disconnects += 1;
+    }
+  }
+  Object.assign(globalThis, {
+    document: doc,
+    MutationObserver: FakeMutationObserver,
+  });
+  Object.assign(globalThis.window, {
+    getComputedStyle: () => ({ getPropertyValue: () => "48px" }),
+  });
+  return {
+    bodyClasses,
+    statusBarProps,
+    get observers() {
+      return counts.observers;
+    },
+    get disconnects() {
+      return counts.disconnects;
+    },
+  };
+}
+
+/** Runs the work the plugin deferred to layout-ready, as Obsidian would. */
+function layoutReady(app: LifecycleApp): void {
+  for (const cb of app.workspace.layoutReady) cb();
+}
+
+describe("mobile status bar override", () => {
+  const onMobile = (over: Partial<Settings>) => {
+    Platform.isMobile = true;
+    return makePlugin(
+      persisted({ settings: { ...CONFIGURED, firstSyncAcknowledged: true, ...over } })
+    );
+  };
+
+  it("shows the bar on a mobile device that asked for it", async () => {
+    const dom = installMobileDom();
+    const { plugin, app } = onMobile({ mobileStatusBar: true });
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    // The fake records layout-ready work rather than running it, which is the point: this
+    // must NOT have run during `onload`, when Obsidian's chrome is not in the DOM yet.
+    expect(dom.bodyClasses.size).toBe(0);
+    layoutReady(app);
+    await flush();
+
+    expect(dom.bodyClasses.has("r2do-mobile-status-bar")).toBe(true);
+    expect(dom.statusBarProps.get("--r2do-mobile-navbar-height")).toBe("48px");
+  });
+
+  it("leaves Obsidian's layout alone unless the setting asks", async () => {
+    const dom = installMobileDom();
+    const { plugin, app } = onMobile({ mobileStatusBar: false });
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    layoutReady(app);
+    await flush();
+
+    expect(dom.bodyClasses.size).toBe(0);
+    expect(dom.observers).toBe(0);
+  });
+
+  it("puts the layout back when the plugin unloads", async () => {
+    // A disabled plugin that leaves the status bar forced open has not stopped working, it has
+    // broken the app — and the user's only clue is a plugin they have already turned off.
+    const dom = installMobileDom();
+    const { plugin, app } = onMobile({ mobileStatusBar: true });
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    layoutReady(app);
+    await flush();
+    expect(dom.bodyClasses.has("r2do-mobile-status-bar")).toBe(true);
+
+    plugin.onunload();
+
+    expect(dom.bodyClasses.has("r2do-mobile-status-bar")).toBe(false);
+    expect(dom.statusBarProps.has("--r2do-mobile-navbar-height")).toBe(false);
+    expect(dom.disconnects).toBe(1);
+  });
+
+  it("reports a layout it cannot find instead of failing to load", async () => {
+    installMobileDom();
+    // An Obsidian version that moved the status bar: the plugin must still work.
+    Object.assign(globalThis, {
+      document: { visibilityState: "visible", querySelector: () => null },
+    });
+    // At the silent level, which is the state that makes this message load-bearing: the whole
+    // reason silencing notices is offered is that the status bar carries the state instead.
+    // The opener is off too, so a leak through the policy cannot hide behind it.
+    const { plugin, app } = onMobile({
+      mobileStatusBar: true,
+      noticeLevel: "silent",
+      notifyOnStart: false,
+    });
+    emptyVault(app);
+    okServer();
+    Notice.shown.length = 0;
+    await plugin.onload();
+    layoutReady(app);
+    await flush();
+
+    expect(plugin.applyMobileStatusBar()).toMatch(/app container was not found/);
+    // Said on screen at startup, not only into the console — and deliberately NOT routed
+    // through the notice policy. Someone who silenced notices did it because the status bar
+    // was carrying the state; if the bar could not be shown, that trade has stopped holding
+    // and a console line nobody opens is how a device ends up with neither.
+    expect(Notice.shown.some((n) => /app container was not found/.test(n))).toBe(true);
+  });
+
+  it("does nothing on desktop, where the bar is already visible", async () => {
+    const dom = installMobileDom();
+    Platform.isMobile = false;
+    const { plugin, app } = makePlugin(
+      persisted({ settings: { ...CONFIGURED, firstSyncAcknowledged: true, mobileStatusBar: true } })
+    );
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    layoutReady(app);
+    await flush();
+    expect(dom.bodyClasses.size).toBe(0);
+
+    // Called directly, because `onload` never reaches it on desktop — this pins the guard
+    // inside the method rather than only the one at the call site. The settings row is mobile
+    // only, but a stale `mobileStatusBar: true` carried over from a phone by shared settings
+    // or a copied `data.json` would otherwise override the desktop layout for no reason.
+    expect(plugin.applyMobileStatusBar()).toBeNull();
+    expect(dom.bodyClasses.size).toBe(0);
+  });
+});
+
+// --- the notice name ------------------------------------------------------------------------
+
+describe("notice name", () => {
+  const failingServer = (): void => {
+    requestUrlMock.impl = async () => {
+      throw new Error("network down");
+    };
+  };
+
+  const noticeAfterFailedSync = async (over: Partial<Settings>): Promise<string> => {
+    const { plugin, app } = makePlugin(
+      persisted({
+        settings: {
+          ...CONFIGURED,
+          firstSyncAcknowledged: true,
+          retryAttempts: 0,
+          // Off, or the shared-settings check fails first with the same message and this
+          // asserts against the wrong notice.
+          syncSettings: false,
+          ...over,
+        },
+      })
+    );
+    emptyVault(app);
+    failingServer();
+    await plugin.onload();
+    Notice.shown.length = 0;
+    await plugin.syncNow();
+    await flush();
+    const shown = Notice.shown.find((n) => /network down/.test(n));
+    expect(shown, "no failure notice was raised at all").toBeDefined();
+    return shown!;
+  };
+
+  it("labels notices with the configured name", async () => {
+    expect(await noticeAfterFailedSync({})).toBe("Cloudflare R2DO Sync error: network down");
+  });
+
+  it("uses a name the user typed", async () => {
+    expect(await noticeAfterFailedSync({ noticePrefix: "Vault" })).toBe(
+      "Vault error: network down"
+    );
+  });
+
+  it("drops the label when the toggle is off, leaving a sentence rather than a hole", async () => {
+    // Every message is written to read correctly with and without the label in front of it.
+    // A message that only parsed with the prefix attached would read as truncated here.
+    expect(await noticeAfterFailedSync({ showNoticePrefix: false })).toBe("error: network down");
+  });
+
+  it("keeps the typed name while the label is switched off", async () => {
+    // The two are separate settings precisely so this round-trips.
+    expect(
+      await noticeAfterFailedSync({ noticePrefix: "Vault", showNoticePrefix: false })
+    ).toBe("error: network down");
+  });
+
+  it("treats a blank name as no name, without a leading space", async () => {
+    expect(await noticeAfterFailedSync({ noticePrefix: "   " })).toBe("error: network down");
+  });
+
+  // The pass summary is the one message built with a leading newline, so that the detail sits
+  // on its own line BELOW the name. Every test above asserts a single-line message, which is
+  // exactly why this shape got its own bug: with the label off the newline had nothing left to
+  // sit below and rendered as a blank first line.
+  const summaryAfterOkSync = async (over: Partial<Settings>): Promise<string> => {
+    const { plugin, app } = makePlugin(
+      persisted({
+        settings: {
+          ...CONFIGURED,
+          firstSyncAcknowledged: true,
+          retryAttempts: 0,
+          syncSettings: false,
+          // `all`, not the shipped `activity`: what is under test is the label's shape on a
+          // summary, and "up to date" is the shortest summary that exercises the leading
+          // newline. At `activity` an idle pass correctly says nothing and there is no shape
+          // left to assert on.
+          noticeLevel: "all",
+          notifyOnStart: false,
+          ...over,
+        },
+      })
+    );
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    Notice.shown.length = 0;
+    await plugin.syncNow();
+    await flush();
+    const shown = Notice.shown.find((n) => /up to date/.test(n));
+    expect(shown, "no pass summary was raised at all").toBeDefined();
+    return shown!;
+  };
+
+  it("puts the summary on its own line under the name", async () => {
+    expect(await summaryAfterOkSync({})).toBe("Cloudflare R2DO Sync\nup to date");
+  });
+
+  it("starts the summary with the text, not a blank line, when the label is off", async () => {
+    // The newline exists only to get below the name. Without a name it is a hole where the
+    // label used to be — turning the label off should give back the row it occupied.
+    const summary = await summaryAfterOkSync({ showNoticePrefix: false });
+    expect(summary).toBe("up to date");
+    expect(summary.startsWith("\n")).toBe(false);
+  });
+
+  it("does the same for a blank name", async () => {
+    expect(await summaryAfterOkSync({ noticePrefix: "" })).toBe("up to date");
   });
 });

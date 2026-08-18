@@ -6,6 +6,7 @@ import {
   type Settings,
 } from "../src/main";
 import { App, type FakeElement, Modal, Notice, Platform, type RenderLog } from "./obsidian-fake";
+import { NOTICE_LEVELS } from "../src/notify";
 
 // Vitest aliases "obsidian" to the fake at runtime, but tsc still resolves the real types
 // (src must keep typechecking against the real API). Bridge the two here, in one place.
@@ -78,6 +79,13 @@ function fakePlugin(over: Partial<Settings> = {}, keyMismatch: string | null = n
       this.reviewed += 1;
     },
     reviewed: 0,
+    mobileStatusBarApplied: 0,
+    /** What the override reports back, so the failure path is reachable from a test. */
+    mobileStatusBarFailure: null as string | null,
+    applyMobileStatusBar(): string | null {
+      this.mobileStatusBarApplied += 1;
+      return this.mobileStatusBarFailure;
+    },
   };
 }
 
@@ -176,9 +184,11 @@ describe("settings tab rendering", () => {
     "Report folder",
     "Snapshots listed in history",
     "Automatic retries",
-    "Notice when a sync runs",
-    "Only notice syncs that changed something",
-    "List the changed files in the notice",
+    "What sync announces",
+    "Say when a sync starts",
+    "List the changed files",
+    "Label",
+    "Short snapshot ids",
     "Sync settings between devices",
     "Test connection",
   ])("renders %s", (name) => {
@@ -251,12 +261,12 @@ describe("settings tab rendering", () => {
     expect(called).toEqual([action]);
   });
 
-  // Three toggles that read almost identically. A copy-paste that pointed two of them at one
+  // Toggles that read almost identically. A copy-paste that pointed two of them at one
   // setting would render perfectly and quietly do the wrong thing.
   it.each([
-    ["Notice when a sync runs", "notifyOnSync", false],
-    ["Only notice syncs that changed something", "notifyOnlyChanged", true],
-    ["List the changed files in the notice", "verboseSyncNotice", true],
+    ["Say when a sync starts", "notifyOnStart", false],
+    ["List the changed files", "verboseSyncNotice", true],
+    ["Short snapshot ids", "shortSnapshotIds", false],
     ["Sync on startup", "syncOnStartup", false],
   ] as const)("wires the %s toggle to %s", async (row, key, target) => {
     const plugin = fakePlugin();
@@ -273,22 +283,171 @@ describe("settings tab rendering", () => {
     expect(plugin.settings[key]).toBe(target);
     expect(plugin.saved).toBe(1);
     // Nothing else moved with it.
-    const others = (["notifyOnSync", "notifyOnlyChanged", "verboseSyncNotice", "syncOnStartup"] as const)
-      .filter((k) => k !== key);
+    const others = (
+      ["notifyOnStart", "verboseSyncNotice", "shortSnapshotIds", "syncOnStartup"] as const
+    ).filter((k) => k !== key);
     for (const other of others) {
       expect(plugin.settings[other]).toBe(DEFAULT_SETTINGS[other]);
     }
   });
 
-  it("shows the notice toggles in the order they narrow down", () => {
+  it("offers the four levels as one ordered choice, loudest first", () => {
+    const { log, names } = render();
+    const row = log.rows[names.indexOf("What sync announces")];
+    // The values, not the labels: the labels are copy, but a missing or misspelled VALUE is a
+    // level nobody can select and a stored setting nothing can round-trip.
+    expect(row.dropdowns[0].options).toEqual([...NOTICE_LEVELS]);
+  });
+
+  it("wires the level dropdown to noticeLevel", async () => {
+    const plugin = fakePlugin();
+    const tab = newTab(plugin);
+    tab.display();
+    const log = logOf(tab);
+    const index = logOf(tab).settings.findIndex((s) => s.name === "What sync announces");
+    const dropdown = log.rows[index].dropdowns[0];
+    expect(dropdown.getValue()).toBe(DEFAULT_SETTINGS.noticeLevel);
+
+    await dropdown.change("problems");
+
+    expect(plugin.settings.noticeLevel).toBe("problems");
+    expect(plugin.saved).toBe(1);
+  });
+
+  it("has no per-category notice toggles left, because the level replaced them", () => {
+    // Two controls answering one question contradict each other on screen. The five booleans
+    // that used to live here are now four rungs; finding any of them back means the page has
+    // grown a second answer to "how much does sync say".
+    const { names } = render();
+    for (const gone of [
+      "Silent sync",
+      "Notice when a sync runs",
+      "Only notice syncs that changed something",
+      "Notice when files change on this device",
+      "Notice conflicts",
+      "Notice problems",
+    ]) {
+      expect(names, gone).not.toContain(gone);
+    }
+  });
+
+  it("puts the level first, since everything under it is a detail of what it chose", () => {
     const { names } = render();
     const at = (name: string) => names.indexOf(name);
-    expect(at("Notice when a sync runs")).toBeLessThan(
-      at("Only notice syncs that changed something")
-    );
-    expect(at("Only notice syncs that changed something")).toBeLessThan(
-      at("List the changed files in the notice")
-    );
+    expect(at("What sync announces")).toBeLessThan(at("Say when a sync starts"));
+    expect(at("Say when a sync starts")).toBeLessThan(at("List the changed files"));
+    expect(at("List the changed files")).toBeLessThan(at("Label"));
+    expect(at("Label")).toBeLessThan(at("Short snapshot ids"));
+  });
+
+  it("warns that Silent means silent, and only there", () => {
+    // The state is choosable, so it has to be visible — otherwise a device that has quietly
+    // stopped reporting failures looks exactly like one that has nothing to report.
+    const silent = render({ noticeLevel: "silent" });
+    expect(silent.log.paragraphs.some((p) => /not say anything at all/.test(p))).toBe(true);
+    for (const level of ["all", "activity", "problems"] as const) {
+      expect(
+        render({ noticeLevel: level }).log.paragraphs.some((p) => /not say anything at all/.test(p)),
+        level
+      ).toBe(false);
+    }
+  });
+
+  it("points a silenced phone at the status bar, which is all it has left", () => {
+    Platform.isMobile = true;
+    try {
+      const { log } = render({ noticeLevel: "silent" });
+      expect(log.paragraphs.some((p) => /status bar/.test(p))).toBe(true);
+    } finally {
+      Platform.isMobile = false;
+    }
+  });
+
+  it("redraws on a level change so the warning follows the choice", async () => {
+    // Appending would stack a second copy of the warning every time the level moved, and
+    // leaving it up after switching away from Silent would be a lie about a live device.
+    const plugin = fakePlugin({ noticeLevel: "silent" });
+    const tab = newTab(plugin);
+    tab.display();
+    expect(logOf(tab).paragraphs.some((p) => /not say anything at all/.test(p))).toBe(true);
+
+    const index = logOf(tab).settings.findIndex((s) => s.name === "What sync announces");
+    await logOf(tab).rows[index].dropdowns[0].change("all");
+
+    expect(logOf(tab).paragraphs.some((p) => /not say anything at all/.test(p))).toBe(false);
+  });
+
+  it("keeps the label switch and its text in one row, switch first", () => {
+    // As two rows the field came before the control deciding whether it mattered at all.
+    const { log, names } = render();
+    const row = log.settings[names.indexOf("Label")];
+    expect(row.controls).toEqual(["toggle", "text"]);
+  });
+
+  it("wires both halves of the label row independently", async () => {
+    const plugin = fakePlugin();
+    const tab = newTab(plugin);
+    tab.display();
+    const log = logOf(tab);
+    const row = log.rows[log.settings.findIndex((s) => s.name === "Label")];
+
+    await row.toggles[0].change(false);
+    expect(plugin.settings.showNoticePrefix).toBe(false);
+    // Switching the label off must not destroy what was typed there.
+    expect(plugin.settings.noticePrefix).toBe(DEFAULT_SETTINGS.noticePrefix);
+
+    row.texts[0].inputEl.value = "Vault";
+    row.texts[0].inputEl.fire("blur");
+    await flush();
+    expect(plugin.settings.noticePrefix).toBe("Vault");
+    expect(plugin.settings.showNoticePrefix).toBe(false);
+  });
+
+  it("offers the resume-sync gap only on mobile, where returning to the app is wired up", () => {
+    expect(render().names).not.toContain("Sync on returning to the app (minutes)");
+    Platform.isMobile = true;
+    try {
+      const { log, names } = render();
+      const row = log.settings[names.indexOf("Sync on returning to the app (minutes)")];
+      expect(row).toBeDefined();
+      // 0 has to be discoverable as the off switch, or the only way anyone finds it is here.
+      expect(row.desc).toContain("0 never");
+    } finally {
+      Platform.isMobile = false;
+    }
+  });
+
+  it("offers the mobile status bar only on mobile, where the bar is actually hidden", () => {
+    // On desktop the bar is already visible, so the row would be a switch for nothing.
+    expect(render().names).not.toContain("Show the status bar on mobile");
+    Platform.isMobile = true;
+    try {
+      expect(render().names).toContain("Show the status bar on mobile");
+    } finally {
+      Platform.isMobile = false;
+    }
+  });
+
+  it("reports a status bar it could not find, beside the toggle rather than in a notice", async () => {
+    Platform.isMobile = true;
+    try {
+      const plugin = fakePlugin();
+      plugin.mobileStatusBarFailure = "Obsidian's status bar element was not found";
+      const tab = newTab(plugin);
+      tab.display();
+      const log = logOf(tab);
+
+      const index = log.settings.findIndex((s) => s.name === "Show the status bar on mobile");
+      await log.rows[index].toggles[0].change(true);
+
+      expect(plugin.settings.mobileStatusBar).toBe(true);
+      expect(plugin.mobileStatusBarApplied).toBe(1);
+      // Rendered, not thrown and not swallowed: someone turning this on is relying on that bar
+      // to see failures, so a silent no-op is the one outcome that must not happen.
+      expect(logOf(tab).paragraphs).toContain("Obsidian's status bar element was not found");
+    } finally {
+      Platform.isMobile = false;
+    }
   });
 
   it("offers nothing to review when there are no conflicts, rather than an empty window", () => {

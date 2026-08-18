@@ -352,8 +352,8 @@ export class LiveHarness {
         firstSyncAcknowledged: true,
         // Off, or a group cannot test its own toggles. Shared settings are published to the
         // vault and pulled back mid-pass, and every group shares one head under one device
-        // name — so with this on, the previous test's published `notifyOnSync` (or conflict
-        // mode, or protect percent) silently overwrites the value the current test just set,
+        // name — so with this on, the previous test's published conflict mode (or protect
+        // percent, or interval) silently overwrites the value the current test just set,
         // in the middle of the very sync it is asserting about. The "This device" group turns
         // it back on deliberately, which is the only place it is the subject rather than a
         // confounder.

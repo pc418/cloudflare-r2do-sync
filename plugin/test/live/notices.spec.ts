@@ -2,22 +2,24 @@
 // the actual Notice text a real pass produced against the real Worker, never just "a request
 // was sent." See docs/260814-eval-LIVE_UI_TEST_PLAN.md, "Group 8 — Notices".
 //
-// One wrinkle the plan's table does not spell out: `announcePass()` (src/log.ts) always speaks
-// for an *interactive* pass — `syncNow()` sets `interactive: true` unconditionally, "so a manual
-// sync never looks like it failed to run" per the Notices section's own description. That means
-// "Only notice syncs that changed something" can only be demonstrated silent on a pass nobody
-// asked for. The plugin's one unattended, non-interactive full-scan pass reachable from a test
-// is `#autoSync()`, fired by `syncOnStartup` on `workspace.onLayoutReady()`. This file drives
-// that path directly with `holdLayout: true` + `fireLayoutReady()`, twice, to get the paired
-// "changed" and "no-op" passes the plan calls for.
+// `announcePass()` (src/notify.ts) used to speak unconditionally for an *interactive* pass, so
+// `activity` could only be shown silent on a pass nobody asked for. That exception is gone — the
+// `syncing…` opener is its own switch now and covers the same ground at the moment someone is
+// actually wondering whether their tap registered — so `activity` means changed-something for
+// manual and background passes alike. The background path below is kept anyway: it is what the
+// plan's table asks for, and an unattended full-scan pass is the case a manual `syncNow()` cannot
+// stand in for. It is reached through `#autoSync()`, fired by `syncOnStartup` on
+// `workspace.onLayoutReady()`, driven directly with `holdLayout: true` + `fireLayoutReady()`.
 //
 // `syncSettings` (shared settings between devices) defaults to true, and every test in this
 // file talks to the same sandbox Worker under the same device name ("live-harness"). Left on,
-// the first test to run publishes its `notifyOnSync`/`notifyOnlyChanged` to `settings/policy.json`,
-// and every later test's fresh harness pulls that doc *before* its own pass and silently
-// overwrites the very toggles under test — confirmed live: a test that set `notifyOnSync: true`
-// got its pass reported with `notifyOnSync` flipped back to `false` mid-`syncNow()`, changing
-// which branch of `#notify` fired. Group 8 does not test settings sharing (that is Group 2's
+// the first test to run publishes its own notice preferences to `settings/policy.json`, and
+// every later test's fresh harness pulls that doc *before* its own pass and silently overwrites
+// the very settings under test — confirmed live, back when they were shared: a test that asked
+// for pass notices got its pass reported with them flipped back off mid-`syncNow()`, changing
+// which branch of `#notify` fired. `noticeLevel` is device-local now, which removes that
+// mechanism, but the harnesses keep `syncSettings: false` because the rest of the reasoning
+// below still holds. Group 8 does not test settings sharing (that is Group 2's
 // "Sync settings between devices" row), so every harness here sets `syncSettings: false` to
 // keep its toggles its own, per the "a group establishes what it needs, inside itself" rule.
 //
@@ -26,8 +28,8 @@
 // this group's sandbox, and files earlier tests (or earlier runs of this file) published stay
 // there. A fresh, empty-local harness therefore does a real *pull* of that leftover content on
 // its first pass — which is itself a notice-worthy change, confirmed live (`R2DO Sync changed
-// N local file(s)`, the floor notice `#notify` fires for an unasked-for pull even with
-// `notifyOnSync` off). Tests that need a clean "nothing changed" baseline run one throwaway
+// N local file(s)`, the `changes` notice `#notify` fires for an unasked-for pull even when the
+// pass summary is off). Tests that need a clean "nothing changed" baseline run one throwaway
 // priming `syncNow()` first to absorb whatever the head already carries, then take their
 // "before" snapshot — the same pattern the "only changed" test below uses explicitly with two
 // consecutive passes, just spelled out once here since it recurs.
@@ -63,10 +65,12 @@ describe.skipIf(config === null)("Notices", () => {
     harness = null;
   });
 
-  it('"Notice when a sync runs" off: a real pass produces no sync notice', async () => {
+  it("the silent level: a real pass produces no notice at all", async () => {
     harness = await LiveHarness.start(config!, {
       files: { "off.md": "no summary wanted\n" },
-      persisted: { settings: { notifyOnSync: false, syncSettings: false } },
+      persisted: {
+        settings: { noticeLevel: "silent", notifyOnStart: false, syncSettings: false },
+      },
     });
 
     // Prime: absorb whatever this shared sandbox head already carries before the pass under
@@ -80,14 +84,14 @@ describe.skipIf(config === null)("Notices", () => {
 
     // A real round trip happened — this is not a no-op stub answering in zero requests.
     expect(harness.http.calls).toBeGreaterThan(callsBefore);
-    // No "syncing…" start toast and no per-pass summary — the toggle is off, and (now that
-    // local and remote agree) nothing pulled either, so not even the floor notice fires.
+    // No "syncing…" opener and no per-pass summary — the level says nothing, and (now that
+    // local and remote agree) nothing pulled either, so not even a `changes` notice fires.
     expect(harness.notices().slice(noticesBefore)).toEqual([]);
   });
 
-  it("an ERROR notice appears even with sync notices off — silence about a failure is the bug", async () => {
+  it("an ERROR notice survives the problems level, where the pass summary does not", async () => {
     // A second harness with a bad token produces a real 401, not a simulated one, per the
-    // task's rule: this exercises `#reportError`, which is unconditional on `notifyOnSync`.
+    // task's rule. This is the whole point of that rung: routine chatter goes, failures stay.
     const badConfig: LiveConfig = {
       url: config!.url,
       token: "0".repeat(64),
@@ -96,7 +100,8 @@ describe.skipIf(config === null)("Notices", () => {
     harness = await LiveHarness.start(badConfig, {
       persisted: {
         settings: {
-          notifyOnSync: false,
+          noticeLevel: "problems",
+          notifyOnStart: false,
           syncSettings: false,
           // 401 is not retryable (src/queue.ts `isRetryable`), but pin this anyway so a
           // failure surfaces as exactly one attempt rather than however many the shipped
@@ -114,13 +119,12 @@ describe.skipIf(config === null)("Notices", () => {
     expect(notice).toMatch(/R2DO Sync error/);
   });
 
-  it('"Only notice syncs that changed something": a no-op background pass is silent, a changing one speaks', async () => {
+  it("the activity level: a no-op background pass is silent, a changing one speaks", async () => {
     harness = await LiveHarness.start(config!, {
       files: { "baseline.md": "line one\nline two\n" },
       persisted: {
         settings: {
-          notifyOnSync: true,
-          notifyOnlyChanged: true,
+          noticeLevel: "activity",
           syncOnStartup: true,
           syncSettings: false,
         },
@@ -131,8 +135,8 @@ describe.skipIf(config === null)("Notices", () => {
     });
 
     // First pass: publishes the seed file. This is the vault's first sync, so it necessarily
-    // changed something — `passChangedSomething()` is true regardless of `notifyOnlyChanged`,
-    // and the notice must say so.
+    // changed something — `passChangedSomething()` is the one thing every speaking level
+    // reports, and the notice must say so.
     let savesBefore = harness.recorded.saves.length;
     let callsBefore = harness.http.calls;
     harness.app.workspace.fireLayoutReady();
@@ -143,9 +147,7 @@ describe.skipIf(config === null)("Notices", () => {
     expect(harness.notices().at(-1)).not.toMatch(/up to date/);
 
     // Second pass: nothing local or remote changed since the first. Genuinely no-op, run the
-    // same non-interactive way. With "only changed" on, this must add no notice at all — the
-    // sharpest form of the setting, and the one an interactive `syncNow()` could never show,
-    // because `announcePass()` always speaks for an interactive caller.
+    // same unattended way. At `activity` this must add no notice at all.
     const noticesBefore = harness.notices().length;
     savesBefore = harness.recorded.saves.length;
     callsBefore = harness.http.calls;
@@ -155,12 +157,11 @@ describe.skipIf(config === null)("Notices", () => {
     expect(harness.notices().length).toBe(noticesBefore);
   });
 
-  it('"List the changed files in the notice": verbose mode names the actual changed path', async () => {
+  it('"List the changed files": verbose mode names the actual changed path', async () => {
     harness = await LiveHarness.start(config!, {
       persisted: {
         settings: {
-          notifyOnSync: true,
-          notifyOnlyChanged: false,
+          noticeLevel: "all",
           verboseSyncNotice: true,
           syncSettings: false,
         },

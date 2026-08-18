@@ -288,7 +288,7 @@ describe("manifest encryption", () => {
 });
 
 describe("settings document encryption", () => {
-  const policy = { excludes: "private/**", protectPercent: 60, notifyOnSync: true };
+  const policy = { excludes: "private/**", protectPercent: 60, conflictMode: "keep-both" };
 
   it("round-trips under the settings key", async () => {
     const c = await VaultCrypto.create(KEY_A);

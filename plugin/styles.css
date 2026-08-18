@@ -95,3 +95,18 @@
   word-break: break-all;
   white-space: pre-wrap;
 }
+
+/*
+ * Opt-in mobile status bar. Obsidian hides `.status-bar` on mobile, so the item the plugin adds
+ * there is created and never seen — which is fine until notices can be silenced, and then the
+ * status bar is the only place left that says a sync is failing.
+ *
+ * Scoped to a body class rather than shipped as a bare `.is-mobile` rule, because a plugin's
+ * stylesheet is always loaded: without the class this file would override Obsidian's own layout
+ * for every user whether they asked for it or not. `mobile-status-bar.ts` owns the class and
+ * measures the height, since the bottom chrome is positioned over the app and varies by device.
+ */
+body.is-mobile.r2do-mobile-status-bar .status-bar {
+  display: flex;
+  margin-bottom: var(--r2do-mobile-navbar-height, 0px);
+}

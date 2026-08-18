@@ -161,9 +161,19 @@ settings and keys. Just change **Device name** afterwards. (Android can instead 
 three `plugin/dist/` files into `YourVault/.obsidian/plugins/cloudflare-rdo-sync/` and set
 up by QR as usual.)
 
-Once running, the **ribbon icon** is the sync button. Every pass ends in a notice, so a tap
-is never silently ignored; the **Notices** toggles narrow or silence them. Returning to the
-app counts as startup — if the last pass is older than your sync interval, a sync runs.
+Once running, the **ribbon icon** is the sync button. By default a pass that moved files says
+so and a pass that found nothing stays quiet; **What sync announces** turns that up to every
+pass or down to nothing. If you want a tap acknowledged even when there was nothing to do, that
+is **Say when a sync starts**. Returning to the
+app counts as startup — if the last pass is older than **Sync on returning to the app**
+(15 minutes by default, 0 to never), a sync runs. Returning fires more often than it sounds —
+a screen unlock counts — so raise that number, or set it to 0, if the phone syncs more than you
+want.
+
+To sync without any pop-ups at all, set **What sync announces** to **Silent** — but turn on
+**Show the status bar on mobile** first. Obsidian hides the status bar on phones, so without it
+a silent device has nothing on screen to say a sync has started failing. That override reaches
+into Obsidian's own layout, so it is opt-in and can be switched off again.
 
 ### Deploying without wrangler
 
@@ -285,12 +295,19 @@ curl -X POST "$WORKER_URL/api/tokens" -H "authorization: Bearer $ADMIN_TOKEN" \
 | **Sync log length** | 50 | Passes kept for troubleshooting |
 | **Snapshots listed in history** | 40 | Each one is a request |
 | **Automatic retries** | 3 | Backoff after a failed pass; a *halted* sync is never retried — it needs a person |
+| **What sync announces** | Activity | One ordered choice: **All** (every pass), **Activity** (only passes that changed something), **Problems** (conflicts and errors), **Silent** (nothing). State still shows in the status bar and the sync log at every level — only the pop-ups stop |
+| **Say when a sync starts** | off | The "syncing…" pop-up while a sync *you* started runs. Separate from the level above because it answers your tap, so it works at every level. Turn it on if you sync by hand — below **All** it is the only reply a manual sync that found nothing gives you |
+| **Label** | `Cloudflare R2DO Sync` | The name in front of every notice, with its own on/off. Blank or off leaves just the message |
+| **List the changed files** | off | Names each file that moved instead of counts alone, and is what puts the snapshot id in the notice |
+| **Short snapshot ids** | on | Shows a snapshot as its last 7 characters wherever one appears. The exported sync log always carries the full 26 |
+| **Show the status bar on mobile** | off | Forces Obsidian's hidden mobile status bar open, so sync state is readable without notices |
 | **Sync settings between devices** | on | Shares vault-wide settings through the server, encrypted like notes; most recent change wins |
 | **Snapshot retention** (server) | 90 days / 500 snapshots | Not a plugin setting: `GC_KEEP_DAYS` / `GC_KEEP_COUNT` in `worker/wrangler.jsonc`; edit and redeploy — see [Limits](#limits) |
 
-Vault-wide settings (excludes, thresholds, intervals, direction, notices, the public salt…)
-sync between devices. Credentials, **Device name**, **Parallel lanes**, and config-folder
-consent deliberately stay per-device.
+Vault-wide settings (excludes, thresholds, intervals, direction, the public salt…) sync
+between devices. Credentials, **Device name**, **Parallel lanes**, everything under **Notices**
+and config-folder consent deliberately stay per-device — "quiet on my phone, everything on my
+desktop" is the ordinary case, and a shared switch cannot express it.
 
 ## Restore outside Obsidian
 

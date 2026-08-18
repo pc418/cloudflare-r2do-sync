@@ -5,11 +5,8 @@ import {
   appendLog,
   entryFromError,
   entryFromResult,
-  announcePass,
-  announceStart,
   describePass,
   formatLogNote,
-  passChangedSomething,
   relativeTime,
   summarise,
 } from "../src/log";
@@ -244,110 +241,9 @@ const change = (
 const committed = (over: Partial<SyncResult> = {}): SyncResult =>
   ({ status: "committed", head: "01SNAPSHOT", ...base, ...over }) as SyncResult;
 
-describe("passChangedSomething", () => {
-  it("is false for a pass that moved nothing", () => {
-    expect(passChangedSomething({ status: "unchanged", ...base })).toBe(false);
-  });
-
-  it("is true for either direction on its own", () => {
-    expect(passChangedSomething(committed({ pushedChanges: [change("a.md", "add", 3)] }))).toBe(true);
-    expect(passChangedSomething(committed({ pulledChanges: [change("a.md", "add", 3)] }))).toBe(true);
-  });
-});
-
-describe("announcePass", () => {
-  const idle = { status: "unchanged", ...base } as SyncResult;
-  const moved = committed({ pushedChanges: [change("a.md", "add", 3)] });
-
-  it("says nothing at all when notices are switched off", () => {
-    for (const result of [idle, moved]) {
-      expect(
-        announcePass({ notifyOnSync: false, onlyChanged: false, interactive: true, result })
-      ).toBe(false);
-    }
-  });
-
-  it("announces every pass by default, including one that did nothing unattended", () => {
-    expect(
-      announcePass({ notifyOnSync: true, onlyChanged: false, interactive: false, result: idle })
-    ).toBe(true);
-  });
-
-  it("stays quiet on an unattended no-op once the user asks for changes only", () => {
-    expect(
-      announcePass({ notifyOnSync: true, onlyChanged: true, interactive: false, result: idle })
-    ).toBe(false);
-    expect(
-      announcePass({ notifyOnSync: true, onlyChanged: true, interactive: false, result: moved })
-    ).toBe(true);
-  });
-
-  it("still answers a pass the user started, even asking for changes only", () => {
-    // A tap with no reply is indistinguishable from a tap that missed, and on a phone there is
-    // no status bar to fall back on.
-    expect(
-      announcePass({ notifyOnSync: true, onlyChanged: true, interactive: true, result: idle })
-    ).toBe(true);
-  });
-
-  it("leaves a halt to its own sticky notice", () => {
-    const halted = { status: "halted", reason: "key mismatch", ...base } as SyncResult;
-    expect(
-      announcePass({ notifyOnSync: true, onlyChanged: false, interactive: true, result: halted })
-    ).toBe(false);
-  });
-
-  it("leaves an unanswered question to its own notice too", () => {
-    // The summary line would read "up to date" directly above a notice saying the pass was
-    // paused and nothing was done. Both cannot be true, and only one of them is.
-    const pending = [
-      {
-        status: "needs-decision",
-        summary: { deletes: [], overwrites: [], localFileCount: 1, percent: 100, threshold: 50 },
-        ...base,
-      },
-      {
-        status: "needs-continuity",
-        continuity: {
-          head: "01NEW",
-          lastHead: "01OURS",
-          reason: "replaced",
-          walked: 1,
-          alreadyApplied: 0,
-        },
-        ...base,
-      },
-    ] as SyncResult[];
-    for (const result of pending) {
-      expect(
-        announcePass({ notifyOnSync: true, onlyChanged: false, interactive: true, result })
-      ).toBe(false);
-    }
-  });
-});
-
-describe("announceStart", () => {
-  // Between the tap and the summary there was nothing on screen at all, and on a phone there
-  // is no status bar to fall back on — a first sync leaves that gap open for minutes, which
-  // reads exactly like a tap that missed.
-  it("answers a sync the user started", () => {
-    expect(announceStart({ notifyOnSync: true, interactive: true })).toBe(true);
-  });
-
-  it("stays quiet for a timer, which has nobody to reassure", () => {
-    expect(announceStart({ notifyOnSync: true, interactive: false })).toBe(false);
-  });
-
-  it("says nothing at all when notices are switched off", () => {
-    // One switch governs both ends of a pass, which is why the row says "runs", not
-    // "finishes": a toggle that silenced the summary but not the opener would be a lie.
-    expect(announceStart({ notifyOnSync: false, interactive: true })).toBe(false);
-  });
-});
-
 describe("describePass", () => {
   it("says so plainly when nothing moved", () => {
-    expect(describePass({ status: "unchanged", ...base }, { verbose: false })).toBe("up to date");
+    expect(describePass({ status: "unchanged", ...base }, { verbose: false, shortIds: false })).toBe("up to date");
   });
 
   it("counts files and net lines per direction on one line", () => {
@@ -356,36 +252,73 @@ describe("describePass", () => {
         pushedChanges: [change("a.md", "add", 12), change("b.md", "update", 23)],
         pulledChanges: [change("c.md", "update", -7)],
       }),
-      { verbose: false }
+      { verbose: false, shortIds: false }
     );
-    expect(line).toContain("2 files, +35 lines");
-    expect(line).toContain("1 file, -7 lines");
+    // One file added, so +1/-0; lines split by sign across the group rather than netted.
+    expect(line).toContain("^ +1/-0 files, +35/-0 lines");
+    // Pulled side changed a file's contents only, so there is NO file clause at all — a note
+    // you edited is not a file you gained, and "+0/-0 files" would be noise on every edit.
+    expect(line).toContain("v +0/-7 lines");
+    expect(line).not.toContain("v +0/-0 files");
     expect(line).not.toContain("a.md");
   });
 
+  it("splits lines by direction instead of letting two files cancel out", () => {
+    // The whole reason for a pair rather than a net: +40 and -40 in one pass is not "no
+    // change", and reporting it as 0 was the old format's worst answer.
+    const line = describePass(
+      committed({
+        pushedChanges: [change("grew.md", "update", 40), change("shrank.md", "update", -40)],
+      }),
+      { verbose: false, shortIds: false }
+    );
+    expect(line).toContain("+40/-40 lines");
+    expect(line).not.toContain("+0/-0");
+  });
+
+  it("groups thousands, because a first sync reports five figures", () => {
+    const line = describePass(
+      committed({ pushedChanges: [change("a.md", "add", 21_430)] }),
+      { verbose: false, shortIds: false }
+    );
+    expect(line).toContain("+21,430/-0 lines");
+  });
+
   it("reports a net zero rather than pretending nothing happened", () => {
-    // Five lines swapped for five is the honest limit of a cached count; the file count carries
-    // the fact that work happened.
+    // Five lines swapped for five is the honest limit of a cached count, and an update is not
+    // a file gained — so the pass reports a zero line pair rather than vanishing.
     const line = describePass(
       committed({ pushedChanges: [change("a.md", "update", 0)] }),
-      { verbose: false }
+      { verbose: false, shortIds: false }
     );
-    expect(line).toContain("1 file, 0 lines");
+    expect(line).toContain("^ +0/-0 lines");
   });
 
   it("drops the line clause when nothing could be counted, and flags a partial count", () => {
+    // Binary: no lines to pair, but a file did arrive, so the file pair carries it.
     expect(
       describePass(committed({ pushedChanges: [change("img.png", "add", null)] }), {
         verbose: false,
+        shortIds: false,
       })
-    ).toBe("^ 1 file");
+    ).toContain("^ +1/-0 files");
 
     expect(
       describePass(
         committed({ pushedChanges: [change("a.md", "add", 4), change("img.png", "add", null)] }),
-        { verbose: false }
+        { verbose: false, shortIds: false }
       )
-    ).toContain("2 files, +4 lines (1 not counted)");
+    ).toContain("+2/-0 files, +4/-0 lines (1 not counted)");
+  });
+
+  it("stays a single line when not verbose, with nothing appended to explain itself", () => {
+    // A legend was tried here and removed: the pairs read as what they are, and a fixed extra
+    // line on every pass forever is exactly the noise short ids were meant to buy back.
+    const moved = describePass(committed({ pushedChanges: [change("a.md", "add", 1)] }), {
+      verbose: false,
+      shortIds: false,
+    });
+    expect(moved.split(String.fromCharCode(10))).toHaveLength(1);
   });
 
   it("appends conflicts and skips, which are not file movements", () => {
@@ -403,7 +336,7 @@ describe("describePass", () => {
           },
         ],
       }),
-      { verbose: false }
+      { verbose: false, shortIds: false }
     );
     expect(line).toContain("1 conflict");
     expect(line).toContain("1 skipped");
@@ -415,18 +348,54 @@ describe("describePass", () => {
         pushedChanges: [change("new.md", "add", 12), change("gone.md", "delete", -4)],
         pulledChanges: [change("merged.md", "merge", 2)],
       }),
-      { verbose: true }
+      { verbose: true, shortIds: false }
     );
     const lines = text.split(String.fromCharCode(10));
     expect(lines).toContain("  + new.md (+12)");
     expect(lines).toContain("  - gone.md (-4)");
     expect(lines).toContain("  >< merged.md (+2)");
-    expect(lines[lines.length - 1]).toBe("snapshot 01SNAPSHOT");
+    expect(lines.at(-1)).toBe("snapshot 01SNAPSHOT");
+  });
+
+  // A realistic id: 10 characters of ULID timestamp then 16 of randomness.
+  const longId = "01K2QWERTYABCDEFGHJKMNPQRS";
+  const withLongId = (): SyncResult =>
+    ({
+      ...committed({ pushedChanges: [change("a.md", "add", 1)] }),
+      head: longId,
+    }) as SyncResult;
+
+  it("abbreviates the snapshot id when asked, and nothing else on the line", () => {
+    const lines = describePass(withLongId(), { verbose: true, shortIds: true }).split(
+      String.fromCharCode(10)
+    );
+    expect(lines.at(-1)).toBe("snapshot KMNPQRS");
+    // The file line is untouched: shortening is about the id, not about trimming the notice.
+    expect(lines).toContain("  + a.md (+1)");
+  });
+
+  it("keeps the whole id when shortening is off, so the toggle actually does something", () => {
+    const lines = describePass(withLongId(), { verbose: true, shortIds: false }).split(
+      String.fromCharCode(10)
+    );
+    expect(lines.at(-1)).toBe(`snapshot ${longId}`);
+  });
+
+  it("writes a zero net delta as 0, never as -0", () => {
+    // `-0` reports a file that shrank. Zero here is a real answer — five lines swapped for
+    // five — and the settings copy promises it reads as 0.
+    const text = describePass(committed({ pushedChanges: [change("a.md", "update", 0)] }), {
+      verbose: true,
+      shortIds: false,
+    });
+    expect(text).toContain("  ~ a.md (0)");
+    expect(text).not.toContain("-0)");
   });
 
   it("omits the count for a file it could not attribute rather than printing (0)", () => {
     const text = describePass(committed({ pushedChanges: [change("img.png", "add", null)] }), {
       verbose: true,
+      shortIds: false,
     });
     expect(text).toContain("  + img.png");
     expect(text).not.toContain("img.png (");
@@ -434,10 +403,10 @@ describe("describePass", () => {
 
   it("caps the verbose list so a first sync cannot fill the screen", () => {
     const many = Array.from({ length: 25 }, (_, i) => change(`n${i}.md`, "add", 1));
-    const text = describePass(committed({ pushedChanges: many }), { verbose: true });
+    const text = describePass(committed({ pushedChanges: many }), { verbose: true, shortIds: false });
     const named = text.split(String.fromCharCode(10)).filter((l) => l.startsWith("  + "));
     expect(named).toHaveLength(10);
     expect(text).toContain("... 15 more");
-    expect(text).toContain("25 files, +25 lines");
+    expect(text).toContain("+25/-0 files, +25/-0 lines");
   });
 });

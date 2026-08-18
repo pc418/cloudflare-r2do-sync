@@ -9,6 +9,13 @@ import { isSyncMode, type SyncMode } from "./sync-policy";
  * — a device needs them *before* it can pull anything, and they are identical per vault
  * anyway), `deviceName` (its whole point is to differ), `lanes` (a phone and a desktop
  * want different widths), and `syncSettings` itself (turning it off must stick locally).
+ *
+ * Notice preferences left in 0.7.2, for the same reason as `lanes`: "quiet on my phone, tell me
+ * everything on my desktop" is the ordinary case and a shared toggle cannot express it. They
+ * were also the one shared key a pass could rewrite *while reporting itself* — a device pulled
+ * the document mid-pass and reported that pass under the other device's preference. Keys dropped
+ * from this list are simply never read again, so an existing document carrying them is ignored
+ * rather than rejected.
  */
 export interface SharedSettings {
   excludes: string;
@@ -18,15 +25,14 @@ export interface SharedSettings {
   debounceSeconds: number;
   intervalMinutes: number;
   syncOnStartup: boolean;
+  /** Mobile-only in effect, but shared: it is sync cadence, which is what this document is for. */
+  resumeSyncMinutes: number;
   maxBlobMB: number;
   protectPercent: number;
   logEntries: number;
   historyLimit: number;
   retryAttempts: number;
   logNoteFolder: string;
-  notifyOnSync: boolean;
-  notifyOnlyChanged: boolean;
-  verboseSyncNotice: boolean;
 }
 
 /** Fixed order — `sharedFingerprint` depends on it being stable across builds. */
@@ -38,15 +44,13 @@ const SHARED_KEYS: readonly (keyof SharedSettings)[] = [
   "debounceSeconds",
   "intervalMinutes",
   "syncOnStartup",
+  "resumeSyncMinutes",
   "maxBlobMB",
   "protectPercent",
   "logEntries",
   "historyLimit",
   "retryAttempts",
   "logNoteFolder",
-  "notifyOnSync",
-  "notifyOnlyChanged",
-  "verboseSyncNotice",
 ];
 
 /**
@@ -58,6 +62,7 @@ const SHARED_KEYS: readonly (keyof SharedSettings)[] = [
 const NUMBER_BOUNDS: Partial<Record<keyof SharedSettings, { min: number; max: number }>> = {
   debounceSeconds: { min: 0, max: 3600 },
   intervalMinutes: { min: 0, max: 24 * 60 },
+  resumeSyncMinutes: { min: 0, max: 24 * 60 },
   maxBlobMB: { min: 1, max: 100 },
   protectPercent: { min: 0, max: 100 },
   logEntries: LOG_ENTRIES_RANGE,
