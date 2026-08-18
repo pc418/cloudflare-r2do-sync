@@ -393,6 +393,16 @@ describe("POST /api/commit — encrypted (v2) snapshots", () => {
  * threshold policy applies here. These cases sit either side of `LIST_THRESHOLD` (64).
  */
 describe("POST /api/commit — verifying many new blobs at once", () => {
+  /**
+   * Vitest's default is 5 s, and every test here uploads ~70 blobs one at a time through the
+   * real Worker before it can even begin — the point being to cross `LIST_THRESHOLD`. On a
+   * shared CI runner those uploads alone measured 2.2-3.5 s, so the default left no margin and
+   * the first-sync case timed out during the 0.7.2 release while passing on the same commit in
+   * CI. These are slow by design, not by accident; a generous ceiling still fails loudly on a
+   * genuine hang, which a raised *global* timeout would not.
+   */
+  const SLOW_MS = 60_000;
+
   /** Enough blobs to cross the listing threshold, uploaded for real. */
   async function uploadMany(count: number, tag: string): Promise<string[]> {
     const hashes: string[] = [];
@@ -407,7 +417,7 @@ describe("POST /api/commit — verifying many new blobs at once", () => {
     expect((await commit(token, m, null)).status).toBe(200);
     const headRes = await SELF.fetch(`${BASE}/api/head`, authed(token));
     expect(await headRes.json()).toEqual({ head: m.id });
-  });
+  }, SLOW_MS);
 
   it("names exactly the absent blobs among many present ones, and does not move head", async () => {
     const present = await uploadMany(LIST_THRESHOLD + 4, "mixed");
@@ -423,7 +433,7 @@ describe("POST /api/commit — verifying many new blobs at once", () => {
 
     const headRes = await SELF.fetch(`${BASE}/api/head`, authed(token));
     expect(await headRes.json()).toEqual({ head: null });
-  });
+  }, SLOW_MS);
 
   it("a reroot past the threshold re-verifies the whole snapshot it re-roots", async () => {
     const blobs = await uploadMany(LIST_THRESHOLD + 2, "reroot");
@@ -435,7 +445,7 @@ describe("POST /api/commit — verifying many new blobs at once", () => {
 
     const headRes = await SELF.fetch(`${BASE}/api/head`, authed(token));
     expect(await headRes.json()).toEqual({ head: rerooted.id });
-  });
+  }, SLOW_MS);
 
   /**
    * The cases above pass against the old per-hash loop too — they assert the answer, and the
@@ -478,7 +488,7 @@ describe("POST /api/commit — verifying many new blobs at once", () => {
     expect(result).toEqual({ ok: true, head: m.id });
     expect(counts.head).toBe(0);
     expect(counts.list).toBeGreaterThan(0);
-  });
+  }, SLOW_MS);
 
   it("a small reroot still verifies correctly, without scanning for two blobs", async () => {
     const kept = await putBlob(token, "small reroot blob");
