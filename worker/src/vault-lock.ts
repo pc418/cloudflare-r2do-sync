@@ -25,6 +25,30 @@ export interface GcPlan {
   retainedIds: string[];
   liveHashes: string[];
   retainedEtags: Array<{ id: string; etag: string }>;
+  /** Retained snapshots whose parent link this run redirects across pruned history. */
+  splices: GcSplice[];
+  /** Snapshots the generational rule dropped this run; they become deletion candidates. */
+  thinned: number;
+}
+
+/**
+ * One redirected parent link: what a retained snapshot's chain step becomes once the commits
+ * between it and its nearest retained ancestor are collected.
+ *
+ * The manifest itself is never touched, so `survivor`'s own envelope still names its true
+ * parent — the one a client authenticates against. This is server bookkeeping that lets the
+ * index keep answering "what came before this" after the middle of the chain is gone.
+ */
+export interface GcSplice {
+  /** The retained snapshot whose recorded link moves. */
+  survivor: string;
+  /** Its nearest retained ancestor: where the link now points. */
+  spliceParent: string;
+  /** Commits hidden between the two, including any an earlier splice already hid. */
+  spliced: number;
+  /** `survivor`'s reference delta recomposed against `spliceParent`. */
+  added: string[];
+  removed: string[];
 }
 
 /** How far the one-time reference-index migration got, and whether it is finished. */
@@ -51,11 +75,20 @@ interface ChainLink {
 /** One row of a history listing: everything a snapshot list shows that is not encrypted. */
 export interface HistoryEntry {
   id: string;
+  /** The manifest's own parent, always. Never rewritten, so a client can authenticate it. */
   parent: string | null;
   uploadedAt: number;
   /** Null on a row indexed before these columns existed and not yet topped up. */
   device: string | null;
   createdAt: string | null;
+  /**
+   * The nearest retained ancestor when `parent` has been collected, else null. Advisory:
+   * unlike `parent` it is a server claim no manifest can confirm, so it may order a listing
+   * and scope a diff, but never carry a verdict about whether history is intact.
+   */
+  spliceParent: string | null;
+  /** How many commits `spliceParent` skips over. Null when nothing was skipped. */
+  pruned: number | null;
 }
 
 export interface HistoryPage {
@@ -118,6 +151,29 @@ const MAX_SQL_PARAMS = 100;
  * exceed is worth more than finishing in one go.
  */
 const DEFAULT_GC_INDEX_CHUNK = 25;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEEK_MS = 7 * DAY_MS;
+
+/**
+ * Parent links one sweep will redirect. Each one costs a delta recomposition, and a vault
+ * adopting generational retention over months of flat history has hundreds waiting — far
+ * more than a request's ~10 ms of CPU affords in one go. Past the bound the walk stops
+ * thinning and keeps what is left, so successive nightly runs converge on the same retained
+ * set instead of one run trying to reach it and dying.
+ */
+const MAX_SPLICES_PER_RUN = 20;
+
+/**
+ * Which generation a snapshot belongs to, as a bucket key. Buckets are epoch-based on R2
+ * upload time — the same clock retention already ages by — so they are deterministic and
+ * free of timezone and ISO-week edge cases. One snapshot per bucket survives.
+ */
+function generationBucket(uploadedAt: number, dailyCutoff: number): string {
+  return uploadedAt >= dailyCutoff
+    ? `d${Math.floor(uploadedAt / DAY_MS)}`
+    : `w${Math.floor(uploadedAt / WEEK_MS)}`;
+}
 
 function setDifference(from: ReadonlySet<string>, without: ReadonlySet<string>): string[] {
   const out: string[] = [];
@@ -190,6 +246,16 @@ export class VaultLock extends DurableObject<Env> {
           ON manifest_blob_deltas(manifest_id);
         CREATE TABLE IF NOT EXISTS current_blob_refs (
           hash TEXT PRIMARY KEY
+        );
+        -- Where a retained snapshot's parent link goes once the commits between it and its
+        -- nearest retained ancestor have been collected. Deliberately NOT part of the
+        -- disposable reference index: the manifests that carried those links are deleted, so
+        -- nothing outside this table can reconstruct the chain across a gap. A row dies only
+        -- with the snapshot it belongs to (see pruneGcIndex), never with an index rebuild.
+        CREATE TABLE IF NOT EXISTS manifest_splices (
+          survivor_id TEXT PRIMARY KEY,
+          splice_parent TEXT NOT NULL,
+          spliced INTEGER NOT NULL
         );
       `);
       this.#addTokenColumns();
@@ -394,6 +460,13 @@ export class VaultLock extends DurableObject<Env> {
     return this.#meta("gc_index_backfilled") === "1";
   }
 
+  /**
+   * Empties the disposable index so it can be rebuilt from the chain. `manifest_splices` is
+   * deliberately left alone: a splice records where a link goes now that the manifests it
+   * used to pass through are deleted, and that is not derivable from anything else. Wiping it
+   * would strand every snapshot older than the first gap outside the rebuilt index — and the
+   * next sweep would then collect them as unreferenced.
+   */
   #resetGcIndex(): void {
     this.ctx.storage.sql.exec("DELETE FROM manifest_blob_deltas");
     this.ctx.storage.sql.exec("DELETE FROM manifest_index");
@@ -531,7 +604,7 @@ export class VaultLock extends DurableObject<Env> {
    * Reads no R2. A row the index does not reach ends the walk with `complete: false` rather
    * than pretending the vault's history stops there.
    */
-  listHistory(limit: number): HistoryPage {
+  listHistory(limit: number, opts: { splices?: boolean } = {}): HistoryPage {
     const max = Math.max(1, Math.min(limit, MAX_HISTORY_PAGE));
     const entries: HistoryEntry[] = [];
     const seen = new Set<string>();
@@ -549,8 +622,13 @@ export class VaultLock extends DurableObject<Env> {
           uploaded_at: number;
           device: string | null;
           created_at: string | null;
+          splice_parent: string | null;
+          spliced: number | null;
         }>(
-          "SELECT id, parent, uploaded_at, device, created_at FROM manifest_index WHERE id = ?",
+          `SELECT i.id, i.parent, i.uploaded_at, i.device, i.created_at, s.splice_parent, s.spliced
+             FROM manifest_index i
+             LEFT JOIN manifest_splices s ON s.survivor_id = i.id
+            WHERE i.id = ?`,
           id
         )
         .toArray()[0];
@@ -561,8 +639,15 @@ export class VaultLock extends DurableObject<Env> {
         uploadedAt: row.uploaded_at,
         device: row.device,
         createdAt: row.created_at,
+        spliceParent: row.splice_parent,
+        pruned: row.splice_parent === null ? null : (row.spliced ?? 0),
       });
-      id = row.parent;
+      // A caller that did not ask for splices is one that reads `parent` as "the next row",
+      // so the chain it is given must actually be one. Stopping here hands it every snapshot
+      // up to the gap and says the listing is short — which is exactly what it is, and what
+      // sends such a client to walk the manifests itself rather than believe history ends.
+      if (row.splice_parent !== null && opts.splices !== true) return { entries, complete: false };
+      id = row.splice_parent ?? row.parent;
     }
     return { entries, complete: true };
   }
@@ -591,15 +676,22 @@ export class VaultLock extends DurableObject<Env> {
         if (seen.has(id)) throw new Error(`manifest chain cycles at ${id}`);
         seen.add(id);
         const row = this.ctx.storage.sql
-          .exec<{ parent: string | null; created_at: string | null }>(
-            "SELECT parent, created_at FROM manifest_index WHERE id = ?",
+          .exec<{ parent: string | null; created_at: string | null; splice_parent: string | null }>(
+            `SELECT i.parent, i.created_at, s.splice_parent
+               FROM manifest_index i
+               LEFT JOIN manifest_splices s ON s.survivor_id = i.id
+              WHERE i.id = ?`,
             id
           )
           .toArray()[0];
         // Nothing indexed this far back; `advanceGcIndex` owns that, not this.
         if (row === undefined) return { done: true, indexed, cursor: null };
+        // Retained history continues past collected commits, so this walks the same links the
+        // listing does. Stopping at a gap would leave every older row without the device and
+        // date it exists to fill in, permanently.
+        const next = row.splice_parent ?? row.parent;
         if (row.created_at !== null) {
-          id = row.parent;
+          id = next;
           continue;
         }
         const link = await this.#readChainLink(id);
@@ -617,7 +709,7 @@ export class VaultLock extends DurableObject<Env> {
           link.createdAt,
           id
         );
-        id = row.parent;
+        id = next;
         if (++indexed >= max) return { done: false, indexed, cursor: id };
       }
       return { done: true, indexed, cursor: null };
@@ -653,11 +745,26 @@ export class VaultLock extends DurableObject<Env> {
 
     for (let indexed = 0; ; ) {
       const older = child;
-      const parentId = older.parent;
-      // Either the real root or the point an earlier GC trimmed. Both mean this link has no
-      // indexed parent, so everything it names counts as an addition and the walk is over.
+      // Retained history continues past collected commits, and the splice table is the only
+      // place that records where — the manifests carrying those links are the ones deleted.
+      // Consulted ahead of the true parent because between a splice and its deletes both
+      // exist for a moment, and the spliced link is the one the plan already walks.
+      const splice = older.parent === null ? null : this.#spliceOf(older.id);
+      const parentId = splice?.spliceParent ?? older.parent;
       const parent = parentId === null ? null : await this.#readParentLink(parentId);
       if (parent === null) {
+        // A splice names a snapshot this vault decided to keep. If that snapshot is not in
+        // R2, the chain cannot be rebuilt — and finishing here would leave every older
+        // retained snapshot outside the index, which the next sweep would read as garbage
+        // and collect. Stop loudly instead: an unbuilt index only costs retention.
+        if (splice !== null) {
+          throw new Error(
+            `splice parent ${parentId} of ${older.id} is missing from R2; refusing to rebuild ` +
+              `an index that would drop retained history`
+          );
+        }
+        // Otherwise the real root, or the point an earlier GC trimmed. Both mean this link
+        // has no indexed parent, so everything it names counts as an addition.
         this.ctx.storage.transactionSync(() => {
           this.#writeBlobDeltas(older.id, [...older.hashes], []);
           this.#finishGcIndex();
@@ -722,55 +829,227 @@ export class VaultLock extends DurableObject<Env> {
     }
   }
 
-  /** Builds the retained union from indexed deltas only; no R2 manifest download occurs. */
-  async getGcPlan(opts: { keepCount: number; ageCutoff: number }): Promise<GcPlan> {
+  /** One index row plus the splice, if any, that redirects its parent link. */
+  #indexRow(id: string):
+    | {
+        id: string;
+        parent: string | null;
+        uploadedAt: number;
+        etag: string;
+        spliceParent: string | null;
+        spliced: number;
+      }
+    | undefined {
+    const row = this.ctx.storage.sql
+      .exec<{
+        id: string;
+        parent: string | null;
+        uploaded_at: number;
+        etag: string;
+        splice_parent: string | null;
+        spliced: number | null;
+      }>(
+        `SELECT i.id, i.parent, i.uploaded_at, i.etag, s.splice_parent, s.spliced
+           FROM manifest_index i
+           LEFT JOIN manifest_splices s ON s.survivor_id = i.id
+          WHERE i.id = ?`,
+        id
+      )
+      .toArray()[0];
+    if (row === undefined) return undefined;
+    return {
+      id: row.id,
+      parent: row.parent,
+      uploadedAt: row.uploaded_at,
+      etag: row.etag,
+      spliceParent: row.splice_parent,
+      spliced: row.spliced ?? 0,
+    };
+  }
+
+  #spliceOf(id: string): { spliceParent: string; spliced: number } | null {
+    const row = this.ctx.storage.sql
+      .exec<{ splice_parent: string; spliced: number }>(
+        "SELECT splice_parent, spliced FROM manifest_splices WHERE survivor_id = ?",
+        id
+      )
+      .toArray()[0];
+    return row === undefined ? null : { spliceParent: row.splice_parent, spliced: row.spliced };
+  }
+
+  /**
+   * The reference delta of the first id in `ids` against the parent of the last one, by
+   * summing the deltas along that stretch of chain.
+   *
+   * Sound because the ids are consecutive links and each row's delta is measured against the
+   * next: the intermediate memberships telescope away, leaving `+1` for a hash the newest
+   * snapshot has and the ancestor does not, `-1` for the reverse, and nothing for a hash both
+   * or neither carry. That also makes composition associative, so recomposing an already
+   * composed delta at the next tier transition is the same operation again.
+   *
+   * Batched by bound parameters, not rows, for the Durable Object's 100-parameter statement
+   * cap; the per-batch sums are added up here, which is exact because they are integers.
+   */
+  #composeDeltas(ids: readonly string[]): { added: string[]; removed: string[] } {
+    const net = new Map<string, number>();
+    for (let i = 0; i < ids.length; i += MAX_SQL_PARAMS) {
+      const slice = ids.slice(i, i + MAX_SQL_PARAMS);
+      const rows = this.ctx.storage.sql
+        .exec<{ hash: string; net: number }>(
+          `SELECT hash, SUM(delta) AS net FROM manifest_blob_deltas
+            WHERE manifest_id IN (${new Array<string>(slice.length).fill("?").join(", ")})
+            GROUP BY hash`,
+          ...slice
+        )
+        .toArray();
+      for (const row of rows) net.set(row.hash, (net.get(row.hash) ?? 0) + row.net);
+    }
+    const added: string[] = [];
+    const removed: string[] = [];
+    for (const [hash, sum] of net) {
+      // Telescoping bounds this at ±1. Anything larger means the ids were not one unbroken
+      // stretch of chain, which would make the composed delta a wrong answer about what a
+      // retained snapshot still references — the one thing GC must never get wrong.
+      if (sum > 1 || sum < -1) {
+        throw new Error(`composed delta for ${hash} is ${sum}; the spliced range is not contiguous`);
+      }
+      if (sum > 0) added.push(hash);
+      else if (sum < 0) removed.push(hash);
+    }
+    return { added, removed };
+  }
+
+  /**
+   * Builds the retained union from indexed deltas only; no R2 manifest download occurs.
+   *
+   * Retention is generational. Everything inside the dense window survives — the newest
+   * `keepCount` snapshots or anything younger than `ageCutoff`, the same union that has
+   * always defined it. Past that, one snapshot per generation survives: the newest of each
+   * UTC day back to `dailyCutoff`, the newest of each week before that. The walk visits every
+   * row and marks its bucket, so the survivor is the first one it meets — the newest — and a
+   * bucket that is already settled can never gain a member, which is what makes successive
+   * runs agree about what to keep.
+   *
+   * The pruned stretches between survivors are not simply forgotten: each becomes a splice
+   * whose composed delta lets the next walk step straight from one survivor to the next.
+   */
+  async getGcPlan(opts: { keepCount: number; ageCutoff: number; dailyCutoff: number }): Promise<GcPlan> {
     if (!this.#gcIndexReady()) throw new Error("GC reference index is not initialized");
     const head = this.#storedHead();
-    if (head === null) return { head: null, retainedIds: [], liveHashes: [], retainedEtags: [] };
+    if (head === null) {
+      return { head: null, retainedIds: [], liveHashes: [], retainedEtags: [], splices: [], thinned: 0 };
+    }
 
     const retainedIds: string[] = [];
     const retainedEtags: Array<{ id: string; etag: string }> = [];
+    const splices: GcSplice[] = [];
     const liveHashes = new Set(
       this.ctx.storage.sql.exec<{ hash: string }>("SELECT hash FROM current_blob_refs").toArray().map((r) => r.hash)
     );
+    const buckets = new Set<string>();
+    const visited = new Set<string>();
+    let thinned = 0;
     let cursor: string | null = head;
     let depth = 0;
-    let childToInvert: string | null = null;
-    const visited = new Set<string>();
+    // The newest retained snapshot so far, and the run of pruned ones found since. An empty
+    // run is the ordinary parent-to-parent step; a non-empty one is a splice.
+    let survivor: { id: string; spliced: number } | null = null;
+    let pruned: Array<{ id: string; spliced: number }> = [];
+
     while (cursor !== null) {
       if (visited.has(cursor)) throw new Error(`manifest index cycles at ${cursor}`);
       visited.add(cursor);
-      const row: { id: string; parent: string | null; uploaded_at: number; etag: string } | undefined =
-        this.ctx.storage.sql
-        .exec<{ id: string; parent: string | null; uploaded_at: number; etag: string }>(
-          "SELECT id, parent, uploaded_at, etag FROM manifest_index WHERE id = ?",
-          cursor
-        )
-        .toArray()[0];
+      const row = this.#indexRow(cursor);
       if (row === undefined) {
         if (depth === 0) throw new Error(`head manifest ${cursor} is missing from the GC index`);
         break;
       }
-      if (depth >= opts.keepCount && row.uploaded_at < opts.ageCutoff) break;
-      if (childToInvert !== null) {
-        const removed = this.ctx.storage.sql
-          .exec<{ hash: string }>(
-            "SELECT hash FROM manifest_blob_deltas WHERE manifest_id = ? AND delta = -1",
-            childToInvert
-          )
-          .toArray();
-        for (const { hash } of removed) liveHashes.add(hash);
+      const dense = depth < opts.keepCount || row.uploadedAt >= opts.ageCutoff;
+      // Marked by every snapshot, dense ones included. The generation a snapshot belongs to
+      // is a fact about when it was uploaded, not about whether this run happens to keep it
+      // for another reason — so a day whose newest snapshots are still inside the dense
+      // window is already represented, and its older ones thin out now rather than lingering
+      // until the window slides past them.
+      const bucket = generationBucket(row.uploadedAt, opts.dailyCutoff);
+      const first = !buckets.has(bucket);
+      buckets.add(bucket);
+      // Opening a run of pruned snapshots is what costs a splice; extending one is free, so
+      // the bound is checked here rather than per snapshot.
+      const keep = dense || first || (pruned.length === 0 && splices.length >= MAX_SPLICES_PER_RUN);
+      if (keep) {
+        if (survivor !== null) {
+          const composed = this.#composeDeltas([survivor.id, ...pruned.map((p) => p.id)]);
+          // What this step's ancestor holds and its child no longer does. Adding it is how
+          // the union grows to cover every retained snapshot without ever materializing one.
+          for (const hash of composed.removed) liveHashes.add(hash);
+          if (pruned.length > 0) {
+            splices.push({
+              survivor: survivor.id,
+              spliceParent: row.id,
+              spliced: pruned.reduce((n, p) => n + 1 + p.spliced, survivor.spliced),
+              added: composed.added,
+              removed: composed.removed,
+            });
+          }
+        }
+        retainedIds.push(row.id);
+        retainedEtags.push({ id: row.id, etag: row.etag });
+        survivor = { id: row.id, spliced: row.spliced };
+        pruned = [];
+      } else {
+        pruned.push({ id: row.id, spliced: row.spliced });
+        thinned++;
       }
-      retainedIds.push(row.id);
-      retainedEtags.push({ id: row.id, etag: row.etag });
-      childToInvert = row.id;
-      cursor = row.parent;
+      cursor = row.spliceParent ?? row.parent;
       depth++;
     }
-    return { head, retainedIds, liveHashes: [...liveHashes], retainedEtags };
+    // A run of pruned snapshots still open when the chain ends has no retained ancestor to
+    // splice onto, so it is simply dropped: the oldest survivor keeps a link to collected
+    // history, exactly as the oldest snapshot has always done, and nothing inverts a delta
+    // past the end of the walk.
+    return { head, retainedIds, liveHashes: [...liveHashes], retainedEtags, splices, thinned };
   }
 
-  /** Prunes only the disposable GC index. The permanent manifest ID registry is untouched. */
+  /**
+   * Redirects the parent links this run's plan chose, under the same fence as the deletes.
+   *
+   * Runs before anything is removed, so the index never points through a manifest that is
+   * already gone. One transaction per splice: a run killed part-way leaves the splices it
+   * finished, whose skipped snapshots the next plan simply never visits and the next sweep
+   * collects.
+   */
+  async applyGcSplices(
+    leaseId: string,
+    expectedHead: string,
+    splices: readonly GcSplice[]
+  ): Promise<boolean> {
+    if (this.#meta("gc_lease_id") !== leaseId || this.#gcLeaseUntil() <= Date.now()) return false;
+    if (this.#storedHead() !== expectedHead) return false;
+    for (const splice of splices) {
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM manifest_blob_deltas WHERE manifest_id = ?",
+          splice.survivor
+        );
+        this.#writeBlobDeltas(splice.survivor, splice.added, splice.removed);
+        this.ctx.storage.sql.exec(
+          `INSERT INTO manifest_splices (survivor_id, splice_parent, spliced) VALUES (?, ?, ?)
+             ON CONFLICT(survivor_id) DO UPDATE
+               SET splice_parent = excluded.splice_parent, spliced = excluded.spliced`,
+          splice.survivor,
+          splice.spliceParent,
+          splice.spliced
+        );
+      });
+    }
+    return true;
+  }
+
+  /**
+   * Prunes only the disposable GC index, plus every splice row that mentions a snapshot being
+   * removed — at either end of the link. The permanent manifest ID registry is untouched, and
+   * so is every splice between two snapshots that survive; those are the chain.
+   */
   async pruneGcIndex(
     leaseId: string,
     expectedHead: string,
@@ -782,6 +1061,17 @@ export class VaultLock extends DurableObject<Env> {
       for (const id of manifestIds) {
         this.ctx.storage.sql.exec("DELETE FROM manifest_blob_deltas WHERE manifest_id = ?", id);
         this.ctx.storage.sql.exec("DELETE FROM manifest_index WHERE id = ?", id);
+        // Its own splice, if it had one, describes a link nothing can follow any more.
+        this.ctx.storage.sql.exec("DELETE FROM manifest_splices WHERE survivor_id = ?", id);
+        // And any splice *pointing at* it. Mid-chain there is never one left by now: the plan
+        // re-pointed whoever reached this snapshot at the next survivor, and `applyGcSplices`
+        // wrote that before any delete, so a row still naming a dead snapshot is one the plan
+        // could not replace. That happens at the end of the chain, where thinning the oldest
+        // retained snapshot leaves nothing older to splice onto — and the row left behind is
+        // invisible until an index rebuild tries to follow it and refuses, permanently.
+        // Removing it says the true thing: this is now the oldest snapshot, and what came
+        // before it is gone.
+        this.ctx.storage.sql.exec("DELETE FROM manifest_splices WHERE splice_parent = ?", id);
       }
     });
     return true;

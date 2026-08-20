@@ -551,7 +551,11 @@ export function renderRestDeployCheck({
     // Retention is the one deploy-time setting that decides what gets deleted, so it belongs
     // on the same screen as the bucket it deletes from.
     ...(retention
-      ? [`  Retention  ${retention.GC_KEEP_DAYS} day(s), and at least the newest ${retention.GC_KEEP_COUNT} snapshot(s)`]
+      ? [
+          `  Retention  every snapshot for ${retention.GC_KEEP_DAYS} day(s) (at least the newest ` +
+            `${retention.GC_KEEP_COUNT}),`,
+          `             then one a day to ${retention.GC_DAILY_DAYS} day(s), then one a week`,
+        ]
       : []),
     "",
     bucketOwned

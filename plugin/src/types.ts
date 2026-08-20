@@ -179,11 +179,25 @@ export interface StateStore {
 /** One row of the server's snapshot listing: the clear envelope, and nothing else. */
 export interface HistoryEntry {
   id: string;
+  /** The snapshot's own parent. The manifest authenticates this one, so it is never guessed. */
   parent: string | null;
   uploadedAt: number;
   /** Null on a snapshot the server has indexed but not yet described. */
   device: string | null;
   createdAt: string | null;
+  /**
+   * The nearest snapshot the server still holds, when `parent` has been collected. Null when
+   * the true parent is still there. Advisory — no manifest can confirm it — so it may say
+   * which snapshot to compare against and how wide the interval is, and nothing more.
+   */
+  spliceParent: string | null;
+  /** Commits collected between this snapshot and `spliceParent`. Null when none were. */
+  pruned: number | null;
+}
+
+/** The snapshot a listing says comes before this one: the real parent, or what replaced it. */
+export function previousOf(entry: HistoryEntry): string | null {
+  return entry.spliceParent ?? entry.parent;
 }
 
 export interface HistoryPage {
@@ -198,9 +212,15 @@ export interface HistoryPage {
 /**
  * Validates a history listing.
  *
- * The chain is checked structurally here rather than trusted: a listing whose `parent` links
- * do not actually join up would produce a diff between two snapshots that are not parent and
- * child, which is a wrong answer presented as a fact about the user's own history.
+ * The chain is checked structurally here rather than trusted: a listing whose links do not
+ * actually join up would produce a diff between two snapshots that are not consecutive, which
+ * is a wrong answer presented as a fact about the user's own history.
+ *
+ * Generational retention means the link a row is followed by is not always its parent: once
+ * the commits in between are collected, the server names the nearest snapshot it still has.
+ * So the join is checked on that link, and `spliceParent`/`pruned` have to agree with each
+ * other — a skip of no commits, or a count with nothing skipped, is a page describing
+ * something that cannot exist.
  */
 export function parseHistoryPage(value: unknown): HistoryPage {
   const fail = (why: string): never => {
@@ -223,12 +243,26 @@ export function parseHistoryPage(value: unknown): HistoryPage {
     }
     if (e.device !== null && typeof e.device !== "string") return fail(`${e.id}: bad device`);
     if (e.createdAt !== null && typeof e.createdAt !== "string") return fail(`${e.id}: bad createdAt`);
+    // Absent on a server that predates thinning, which is a chain with no gaps in it.
+    const spliceParent = e.spliceParent ?? null;
+    const pruned = e.pruned ?? null;
+    if (spliceParent !== null && (typeof spliceParent !== "string" || spliceParent === "")) {
+      return fail(`${e.id}: bad spliceParent`);
+    }
+    if (pruned !== null && (typeof pruned !== "number" || !Number.isInteger(pruned) || pruned < 1)) {
+      return fail(`${e.id}: bad pruned`);
+    }
+    if ((spliceParent === null) !== (pruned === null)) {
+      return fail(`${e.id}: spliceParent and pruned must be given together`);
+    }
     // A manifest id is used once, ever. A repeat — including a row naming itself as its own
     // parent — means the listing is not a chain, and a diff taken across it would compare a
     // snapshot with itself and report "changed nothing".
-    if (seen.has(e.id) || e.parent === e.id) return fail(`${e.id} appears twice`);
+    if (seen.has(e.id) || e.parent === e.id || spliceParent === e.id) {
+      return fail(`${e.id} appears twice`);
+    }
     const previous = entries[entries.length - 1];
-    if (previous !== undefined && previous.parent !== e.id) {
+    if (previous !== undefined && previousOf(previous) !== e.id) {
       return fail(`${e.id} does not follow ${previous.id}`);
     }
     seen.add(e.id);
@@ -238,6 +272,8 @@ export function parseHistoryPage(value: unknown): HistoryPage {
       uploadedAt: e.uploadedAt,
       device: e.device,
       createdAt: e.createdAt,
+      spliceParent,
+      pruned,
     });
   }
   return { entries, complete: page.complete };

@@ -113,6 +113,11 @@ export class FakeServer implements SyncApiLike {
   serveHistoryIndex = false;
   /** Ids the index cannot reach, so a test can produce an honestly incomplete page. */
   readonly unindexed = new Set<string>();
+  /**
+   * Snapshots whose parent a sweep collected, and where the server says the chain continues.
+   * Set by a test to serve the thinned history a generational deployment produces.
+   */
+  readonly splices = new Map<string, { spliceParent: string; pruned: number }>();
   readonly historyRequests: number[] = [];
 
   async getHistory(limit: number): Promise<HistoryPage | null> {
@@ -123,14 +128,17 @@ export class FakeServer implements SyncApiLike {
     while (id !== null && entries.length < limit) {
       const m = this.manifests.get(id);
       if (m === undefined || this.unindexed.has(id)) return { entries, complete: false };
+      const splice = this.splices.get(m.id) ?? null;
       entries.push({
         id: m.id,
         parent: m.parent,
         uploadedAt: 1_754_000_000_000 + entries.length,
         device: m.device,
         createdAt: m.createdAt,
+        spliceParent: splice?.spliceParent ?? null,
+        pruned: splice?.pruned ?? null,
       });
-      id = m.parent;
+      id = splice?.spliceParent ?? m.parent;
     }
     return { entries, complete: true };
   }

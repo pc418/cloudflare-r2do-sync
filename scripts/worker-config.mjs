@@ -24,6 +24,7 @@ function requiredString(value, field) {
 export const GC_RETENTION_VARS = {
   GC_KEEP_DAYS: { max: 3650 },
   GC_KEEP_COUNT: { max: 10_000 },
+  GC_DAILY_DAYS: { max: 3650 },
 };
 
 function retentionVars(vars) {
@@ -46,6 +47,16 @@ function retentionVars(vars) {
       throw new Error(`worker config vars.${name} must be an integer from 1 to ${max}, not "${raw}"`);
     }
     out[name] = String(value);
+  }
+  // The daily tier fills the span between the dense window and the weekly one, so it cannot
+  // end before the dense window does. Equal values are a deployment with no daily tier —
+  // legitimate; inverted values are a typo, and refusing here is cheaper than a sweep that
+  // thins by a rule nobody meant.
+  if (Number(out.GC_DAILY_DAYS) < Number(out.GC_KEEP_DAYS)) {
+    throw new Error(
+      `worker config vars.GC_DAILY_DAYS (${out.GC_DAILY_DAYS}) must be at least ` +
+        `vars.GC_KEEP_DAYS (${out.GC_KEEP_DAYS})`
+    );
   }
   return out;
 }

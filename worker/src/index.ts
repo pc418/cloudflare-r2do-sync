@@ -20,6 +20,7 @@ export interface Env {
   ADMIN_TOKEN: string;
   /** Retention window, as deployed. Strings because they arrive as plain-text bindings. */
   GC_KEEP_DAYS: string;
+  GC_DAILY_DAYS: string;
   GC_KEEP_COUNT: string;
 }
 
@@ -259,7 +260,11 @@ app.get("/api/history", accessAuth, async (c) => {
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
     return c.json(errJson("invalid_limit", "limit must be an integer from 1 to 500"), 422);
   }
-  return c.json(await vault(c.env).listHistory(limit));
+  // Opt-in, because a listing can now step over commits a sweep collected: a client that
+  // does not ask is one that reads `parent` as "the next row", and gets the chain cut at the
+  // first gap instead of a page whose links do not join up.
+  const splices = c.req.query("splices") === "1";
+  return c.json(await vault(c.env).listHistory(limit, { splices }));
 });
 
 app.post("/api/history/index", adminAuth, async (c) => {

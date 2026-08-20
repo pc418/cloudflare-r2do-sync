@@ -36,6 +36,7 @@ import {
   isEmptyManifest,
   type FileEntry,
   type HistoryEntry,
+  previousOf,
   type HistoryPage,
   type Manifest,
   type ManifestV3,
@@ -302,6 +303,13 @@ export interface SnapshotChanges {
   linesUnknown: number;
   /** True when this snapshot has no parent, so everything it holds counts as added. */
   initial: boolean;
+  /**
+   * How many commits this diff covers. Absent means one — the ordinary snapshot-against-its
+   * -parent case. Present and greater than one means the commits in between have been
+   * collected, so this is a true diff over a wider interval, and must be shown as one: the
+   * intermediate states are gone, not unchanged.
+   */
+  spans?: number;
 }
 
 /**
@@ -330,6 +338,18 @@ export interface SnapshotInfo {
    * `{ unknown }` when they were asked for but could not be computed.
    */
   changes?: SnapshotChanges | { unknown: ChangesUnknown };
+}
+
+/**
+ * A cached history row's identity: the snapshot, and what it was compared against.
+ *
+ * The second half is what makes the cache safe once retention can thin the chain. A row's
+ * diff describes an interval, and collecting the snapshot at the far end of that interval
+ * moves it — so a row keyed by id alone would keep answering for an interval that no longer
+ * exists.
+ */
+function rowKey(entry: HistoryEntry): string {
+  return `${entry.id}\u0000${previousOf(entry) ?? ""}`;
 }
 
 /**
@@ -727,12 +747,17 @@ export class SyncEngine {
   readonly #onProgress: SyncEngineOptions["onProgress"];
   readonly #lanes: number;
   /**
-   * History rows already built this session, keyed by manifest id.
+   * History rows already built this session, keyed by manifest id *and* the snapshot they
+   * were compared against.
    *
-   * Needs no invalidation, which is rare enough to be worth stating: a manifest id is
-   * permanent and used once, and a snapshot's parent link never moves — so neither the row nor
-   * its diff against that parent can ever change. Holds finished rows, never path maps, so
-   * forty entries cost kilobytes rather than the megabytes they were derived from.
+   * A manifest id is permanent and used once, and a snapshot's own parent link never moves,
+   * so a row diffed against its true parent could never change and this needed no
+   * invalidation. Generational retention breaks exactly that assumption and no more: when the
+   * snapshot a row was compared against is itself collected, the server names a further one,
+   * and the diff is then over a different interval. Putting that snapshot in the key retires
+   * the stale row without a sweep — a row whose comparison still stands keeps its key and its
+   * value. Holds finished rows, never path maps, so forty entries cost kilobytes rather than
+   * the megabytes they were derived from.
    */
   readonly #historyRows = new Map<string, SnapshotInfo>();
 
@@ -2064,19 +2089,21 @@ export class SyncEngine {
     // A row built for a caller that did not want diffs has no `changes`, and handing it to one
     // that does would report "no change recorded" for a snapshot nobody diffed. `rerootSummary`
     // asks without diffs, so the two callers really do share this cache.
-    const usable = (id: string): SnapshotInfo | undefined => {
-      const row = this.#historyRows.get(id);
+    const usable = (entry: HistoryEntry): SnapshotInfo | undefined => {
+      const row = this.#historyRows.get(rowKey(entry));
       if (row === undefined) return undefined;
       return !wantChanges || row.changes !== undefined ? row : undefined;
     };
 
     const needed = new Set<string>();
     for (const entry of entries) {
-      if (usable(entry.id) !== undefined) continue;
+      if (usable(entry) !== undefined) continue;
       needed.add(entry.id);
       // One manifest past the last uncached row, and only to give it something to diff
-      // against — the same single extra fetch the walk pays.
-      if (wantChanges && entry.parent !== null) needed.add(entry.parent);
+      // against — the same single extra fetch the walk pays. Across collected history that
+      // is the nearest snapshot the server still holds rather than the literal parent.
+      const previous = previousOf(entry);
+      if (wantChanges && previous !== null) needed.add(previous);
     }
 
     const ids = [...needed];
@@ -2107,7 +2134,7 @@ export class SyncEngine {
 
     const out: SnapshotInfo[] = [];
     for (const entry of entries) {
-      const cached = usable(entry.id);
+      const cached = usable(entry);
       if (cached !== undefined) {
         out.push(cached);
         continue;
@@ -2140,17 +2167,28 @@ export class SyncEngine {
         fileCount: got.files === null ? null : Object.keys(got.files).length,
         readable: got.files !== null,
       };
-      if (wantChanges) info.changes = this.#changesFor(manifest, got.files, fetched);
+      if (wantChanges) info.changes = this.#changesFor(entry, manifest, got.files, fetched);
       out.push(info);
-      // Safe forever without invalidation: a manifest id is permanent and one-use, and a
-      // snapshot's parent link never moves, so neither its contents nor its diff can change.
-      this.#historyRows.set(entry.id, info);
+      // Keyed by the snapshot this row was compared against, so it stays valid for exactly as
+      // long as that comparison does — permanently for a true parent, and until the next tier
+      // transition for one reached across collected history.
+      this.#historyRows.set(rowKey(entry), info);
     }
     return out;
   }
 
-  /** Keyed off the manifest's own parent link, which is the one the envelope authenticates. */
+  /**
+   * The diff to show for one listed snapshot.
+   *
+   * Normally that is against the manifest's own parent link, the one the envelope
+   * authenticates. Where the commits in between have been collected, it is against the
+   * nearest snapshot the server still holds — a real diff between two snapshots this device
+   * decrypted itself, over a wider interval, carrying `spans` so it is shown as one. That is
+   * a different thing from an unknown diff: nothing here is being guessed, and rendering it
+   * as `parent-missing` would hide a change the user can still see both ends of.
+   */
   #changesFor(
+    entry: HistoryEntry,
     manifest: Manifest,
     files: Record<string, FileEntry> | null,
     fetched: ReadonlyMap<
@@ -2159,11 +2197,13 @@ export class SyncEngine {
     >
   ): SnapshotChanges | { unknown: ChangesUnknown } {
     if (files === null) return { unknown: "unreadable" };
-    if (manifest.parent === null) return diffSnapshots(null, files);
-    const parent = fetched.get(manifest.parent);
+    const previous = previousOf(entry);
+    if (previous === null) return diffSnapshots(null, files);
+    const parent = fetched.get(previous);
     if (parent === undefined || "missing" in parent) return { unknown: "parent-missing" };
     if (parent.files === null) return { unknown: "parent-unreadable" };
-    return diffSnapshots(parent.files, files);
+    const changes = diffSnapshots(parent.files, files);
+    return entry.pruned === null ? changes : { ...changes, spans: entry.pruned + 1 };
   }
 
   async #listHistoryByWalk(limit: number, opts: { changes?: boolean } = {}): Promise<SnapshotInfo[]> {

@@ -7,6 +7,9 @@ export interface GcOptions {
   keepCount?: number;
   /** Manifests younger than this many days always survive. Defaults to `GC_KEEP_DAYS`. */
   keepDays?: number;
+  /** Past the dense window, one snapshot per day survives back to here. Defaults to
+   *  `GC_DAILY_DAYS`; older generations keep one per week. */
+  dailyDays?: number;
   /** Objects uploaded within this window are never deleted (in-flight commit safety). */
   minAgeMs?: number;
   /** Upper bound on how long this run may hold commits off. */
@@ -20,6 +23,10 @@ export interface GcOptions {
 export interface GcReport {
   retainedManifests: number;
   deletedManifests: number;
+  /** Retained-age snapshots the generational rule dropped: thinning, not expiry. */
+  thinnedManifests: number;
+  /** Parent links redirected across the stretches this run thinned. */
+  splicesApplied: number;
   retainedBlobs: number;
   deletedBlobs: number;
   /** Why the run deleted nothing, or null when it ran to completion. */
@@ -41,6 +48,7 @@ const MAX_KEEP_COUNT = 10_000;
 export interface GcRetention {
   keepDays: number;
   keepCount: number;
+  dailyDays: number;
 }
 
 /**
@@ -51,10 +59,24 @@ export interface GcRetention {
  * chose. `scripts/deploy.mjs` validates the same values before upload, so reaching this
  * error means the Worker was deployed by some other path.
  */
-export function gcRetention(env: Pick<Env, "GC_KEEP_DAYS" | "GC_KEEP_COUNT">): GcRetention {
+export function gcRetention(
+  env: Pick<Env, "GC_KEEP_DAYS" | "GC_KEEP_COUNT" | "GC_DAILY_DAYS">
+): GcRetention {
+  const keepDays = retentionValue(env.GC_KEEP_DAYS, "GC_KEEP_DAYS", MAX_KEEP_DAYS);
+  const dailyDays = retentionValue(env.GC_DAILY_DAYS, "GC_DAILY_DAYS", MAX_KEEP_DAYS);
+  // The daily tier begins where the dense window ends, so it cannot end before it starts.
+  // Equal values are allowed and mean exactly one thing: no daily tier, weekly beyond the
+  // dense window. That is a deployment someone may want; an inverted pair is a mistake.
+  if (dailyDays < keepDays) {
+    throw new Error(
+      `GC_DAILY_DAYS (${dailyDays}) must be at least GC_KEEP_DAYS (${keepDays}); ` +
+        `the daily tier covers the span between them`
+    );
+  }
   return {
-    keepDays: retentionValue(env.GC_KEEP_DAYS, "GC_KEEP_DAYS", MAX_KEEP_DAYS),
+    keepDays,
     keepCount: retentionValue(env.GC_KEEP_COUNT, "GC_KEEP_COUNT", MAX_KEEP_COUNT),
+    dailyDays,
   };
 }
 
@@ -133,16 +155,20 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
   const configured = gcRetention(env);
   const keepCount = opts.keepCount ?? configured.keepCount;
   const keepDays = opts.keepDays ?? configured.keepDays;
+  const dailyDays = opts.dailyDays ?? configured.dailyDays;
   const minAgeMs = opts.minAgeMs ?? DAY;
   const ageCutoff = now - keepDays * DAY;
+  const dailyCutoff = now - dailyDays * DAY;
 
   const report: GcReport = {
     retainedManifests: 0,
     deletedManifests: 0,
+    thinnedManifests: 0,
+    splicesApplied: 0,
     retainedBlobs: 0,
     deletedBlobs: 0,
     skipped: null,
-    retention: { keepDays, keepCount },
+    retention: { keepDays, keepCount, dailyDays },
   };
 
   const lock = env.VAULT_LOCK.getByName("default");
@@ -158,10 +184,12 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
     report.skipped = "index_backfilling";
     return report;
   }
-  const plan = await lock.getGcPlan({ keepCount, ageCutoff });
+  const plan = await lock.getGcPlan({ keepCount, ageCutoff, dailyCutoff });
   logPhase("gc_plan", gcStartedAt, {
     retainedManifests: plan.retainedIds.length,
     retainedBlobs: plan.liveHashes.length,
+    thinnedManifests: plan.thinned,
+    splices: plan.splices.length,
   });
   if (plan.head === null) {
     await opts.testHookBeforeLease?.();
@@ -188,6 +216,7 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
   const liveHashes = new Set(plan.liveHashes);
   report.retainedManifests = retainedIds.size;
   report.retainedBlobs = liveHashes.size;
+  report.thinnedManifests = plan.thinned;
   const uploadedBefore = (object: R2Object) => object.uploaded.getTime() < now - minAgeMs;
 
   // R2 scanning is deliberately outside the exclusion window. Only dead candidates are
@@ -228,6 +257,15 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
     // Verify ownership even when this particular run found no aged candidates. A lapsed
     // sweep must never report completion, because its plan was no longer fenced.
     await holdLease();
+    // Before any deletion, so the index never has to point through a manifest that is
+    // already gone. A run killed between the two leaves spliced links whose skipped
+    // snapshots the next plan simply does not visit, and the next sweep collects.
+    if (plan.splices.length > 0) {
+      if (!(await lock.applyGcSplices(lease.leaseId, plan.head, plan.splices))) {
+        throw new Error("gc: lost the deletion lease before redirecting the links it thinned");
+      }
+      report.splicesApplied = plan.splices.length;
+    }
     for (let i = 0; i < deadManifests.length; i += 100) {
       await holdLease();
       await env.VAULT.delete(deadManifests.slice(i, i + 100).map((object) => object.key));
@@ -251,6 +289,7 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
     logPhase("gc_delete", deleteStartedAt, {
       deletedManifests: report.deletedManifests,
       deletedBlobs: report.deletedBlobs,
+      splicesApplied: report.splicesApplied,
     });
     return report;
   } finally {

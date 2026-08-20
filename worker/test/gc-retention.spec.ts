@@ -7,7 +7,11 @@ import { ADMIN, BASE, authed, commit, mintToken, sha256hex, ulid } from "./helpe
 const DAY = 24 * 60 * 60 * 1000;
 
 let token: string;
-const deployed = { days: env.GC_KEEP_DAYS, count: env.GC_KEEP_COUNT };
+const deployed = {
+  days: env.GC_KEEP_DAYS,
+  count: env.GC_KEEP_COUNT,
+  daily: env.GC_DAILY_DAYS,
+};
 
 beforeEach(async () => {
   ({ token } = await mintToken("retention-tester"));
@@ -18,6 +22,7 @@ afterEach(() => {
   // to put the deployed values back or it silently reconfigures every test after it.
   env.GC_KEEP_DAYS = deployed.days;
   env.GC_KEEP_COUNT = deployed.count;
+  env.GC_DAILY_DAYS = deployed.daily;
 });
 
 async function seedBlob(content: string): Promise<string> {
@@ -61,29 +66,53 @@ async function twoSnapshots(): Promise<{ old: string; head: string }> {
 
 describe("gcRetention", () => {
   it("reads the deployed window rather than a compiled-in default", () => {
-    expect(gcRetention({ GC_KEEP_DAYS: "7", GC_KEEP_COUNT: "3" })).toEqual({
-      keepDays: 7,
-      keepCount: 3,
-    });
+    expect(
+      gcRetention({ GC_KEEP_DAYS: "7", GC_KEEP_COUNT: "3", GC_DAILY_DAYS: "30" })
+    ).toEqual({ keepDays: 7, keepCount: 3, dailyDays: 30 });
     // What this deployment actually ships, so a change to wrangler.jsonc is a visible edit here.
-    expect(gcRetention(env)).toEqual({ keepDays: 90, keepCount: 500 });
+    expect(gcRetention(env)).toEqual({ keepDays: 90, keepCount: 500, dailyDays: 90 });
   });
 
   it("refuses a missing or nonsensical window instead of guessing one", () => {
     for (const bad of ["", "   ", "0", "-1", "1.5", "thirty", "1e3"]) {
-      expect(() => gcRetention({ GC_KEEP_DAYS: bad, GC_KEEP_COUNT: "50" })).toThrow(
-        /GC_KEEP_DAYS/
-      );
+      expect(() =>
+        gcRetention({ GC_KEEP_DAYS: bad, GC_KEEP_COUNT: "50", GC_DAILY_DAYS: "90" })
+      ).toThrow(/GC_KEEP_DAYS/);
+      expect(() =>
+        gcRetention({ GC_KEEP_DAYS: "30", GC_KEEP_COUNT: "50", GC_DAILY_DAYS: bad })
+      ).toThrow(/GC_DAILY_DAYS/);
     }
-    expect(() => gcRetention({ GC_KEEP_DAYS: "3651", GC_KEEP_COUNT: "50" })).toThrow(
-      /1 to 3650/
-    );
-    expect(() => gcRetention({ GC_KEEP_COUNT: "10001", GC_KEEP_DAYS: "30" })).toThrow(
-      /1 to 10000/
-    );
     expect(() =>
-      gcRetention({ GC_KEEP_DAYS: undefined as unknown as string, GC_KEEP_COUNT: "50" })
+      gcRetention({ GC_KEEP_DAYS: "3651", GC_KEEP_COUNT: "50", GC_DAILY_DAYS: "3651" })
+    ).toThrow(/1 to 3650/);
+    expect(() =>
+      gcRetention({ GC_KEEP_COUNT: "10001", GC_KEEP_DAYS: "30", GC_DAILY_DAYS: "90" })
+    ).toThrow(/1 to 10000/);
+    expect(() =>
+      gcRetention({
+        GC_KEEP_DAYS: undefined as unknown as string,
+        GC_KEEP_COUNT: "50",
+        GC_DAILY_DAYS: "90",
+      })
     ).toThrow(/GC_KEEP_DAYS is not configured/);
+    expect(() =>
+      gcRetention({
+        GC_KEEP_DAYS: "30",
+        GC_KEEP_COUNT: "50",
+        GC_DAILY_DAYS: undefined as unknown as string,
+      })
+    ).toThrow(/GC_DAILY_DAYS is not configured/);
+  });
+
+  it("refuses a daily tier that ends before the dense window it follows", () => {
+    expect(() =>
+      gcRetention({ GC_KEEP_DAYS: "30", GC_KEEP_COUNT: "50", GC_DAILY_DAYS: "29" })
+    ).toThrow(/GC_DAILY_DAYS \(29\) must be at least GC_KEEP_DAYS \(30\)/);
+    // Equal is a deployment with no daily tier at all — weekly straight after the dense
+    // window — which is a choice, not a mistake.
+    expect(
+      gcRetention({ GC_KEEP_DAYS: "30", GC_KEEP_COUNT: "50", GC_DAILY_DAYS: "30" })
+    ).toEqual({ keepDays: 30, keepCount: 50, dailyDays: 30 });
   });
 });
 
@@ -95,7 +124,7 @@ describe("runGc retention configuration", () => {
     // 90/500 as deployed: a ten-day-old snapshot is well inside the window.
     const kept = await runGc(env, { now, minAgeMs: 0 });
     expect(kept.skipped).toBeNull();
-    expect(kept.retention).toEqual({ keepDays: 90, keepCount: 500 });
+    expect(kept.retention).toEqual({ keepDays: 90, keepCount: 500, dailyDays: 90 });
     expect(kept.deletedManifests).toBe(0);
     expect(await env.VAULT.head(`manifests/${old}.json`)).not.toBeNull();
 
@@ -103,7 +132,7 @@ describe("runGc retention configuration", () => {
     env.GC_KEEP_DAYS = "1";
     env.GC_KEEP_COUNT = "1";
     const swept = await runGc(env, { now, minAgeMs: 0 });
-    expect(swept.retention).toEqual({ keepDays: 1, keepCount: 1 });
+    expect(swept.retention).toEqual({ keepDays: 1, keepCount: 1, dailyDays: 90 });
     expect(swept.deletedManifests).toBe(1);
     expect(await env.VAULT.head(`manifests/${old}.json`)).toBeNull();
   });
@@ -124,7 +153,7 @@ describe("runGc retention configuration", () => {
     const now = Date.now() + 10 * DAY;
     await twoSnapshots();
     const report = await runGc(env, { now, minAgeMs: 0, keepDays: 1, keepCount: 1 });
-    expect(report.retention).toEqual({ keepDays: 1, keepCount: 1 });
+    expect(report.retention).toEqual({ keepDays: 1, keepCount: 1, dailyDays: 90 });
     expect(report.deletedManifests).toBe(1);
   });
 });
@@ -143,7 +172,9 @@ describe("POST /api/gc", () => {
     await twoSnapshots();
     const res = await SELF.fetch(`${BASE}/api/gc`, authed(ADMIN, { method: "POST" }));
     expect(res.status).toBe(200);
-    const report = (await res.json()) as { retention: { keepDays: number; keepCount: number } };
-    expect(report.retention).toEqual({ keepDays: 90, keepCount: 500 });
+    const report = (await res.json()) as {
+      retention: { keepDays: number; keepCount: number; dailyDays: number };
+    };
+    expect(report.retention).toEqual({ keepDays: 90, keepCount: 500, dailyDays: 90 });
   });
 });

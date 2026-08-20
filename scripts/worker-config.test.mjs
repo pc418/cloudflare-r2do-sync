@@ -21,16 +21,16 @@ const VALID = `
   },
   "migrations": [{ "tag": "v7", "new_sqlite_classes": ["VaultLock"] }],
   "r2_buckets": [{ "binding": "VAULT", "bucket_name": "sync-bucket" }],
-  "vars": { "GC_KEEP_DAYS": "30", "GC_KEEP_COUNT": "50" },
+  "vars": { "GC_KEEP_DAYS": "30", "GC_KEEP_COUNT": "50", "GC_DAILY_DAYS": "90" },
   "triggers": { "crons": ["0 4 * * *"] }
 }`;
 
 /** The valid config with one `vars` entry replaced, for the retention validation cases. */
 function withVar(name, value) {
-  const vars = { GC_KEEP_DAYS: "30", GC_KEEP_COUNT: "50", [name]: value };
+  const vars = { GC_KEEP_DAYS: "30", GC_KEEP_COUNT: "50", GC_DAILY_DAYS: "90", [name]: value };
   if (value === undefined) delete vars[name];
   return VALID.replace(
-    '"vars": { "GC_KEEP_DAYS": "30", "GC_KEEP_COUNT": "50" }',
+    '"vars": { "GC_KEEP_DAYS": "30", "GC_KEEP_COUNT": "50", "GC_DAILY_DAYS": "90" }',
     `"vars": ${JSON.stringify(vars)}`
   );
 }
@@ -45,7 +45,7 @@ test("wrangler JSONC is the single deploy metadata source", () => {
     durableObjectClass: "VaultLock",
     migrationTag: "v7",
     cron: "0 4 * * *",
-    vars: { GC_KEEP_DAYS: "30", GC_KEEP_COUNT: "50" },
+    vars: { GC_KEEP_DAYS: "30", GC_KEEP_COUNT: "50", GC_DAILY_DAYS: "90" },
   });
 });
 
@@ -85,7 +85,27 @@ test("valid retention survives the round trip as normalized strings", () => {
   assert.deepEqual(parseWorkerDeployConfig(withVar("GC_KEEP_DAYS", " 7 ")).vars, {
     GC_KEEP_DAYS: "7",
     GC_KEEP_COUNT: "50",
+    GC_DAILY_DAYS: "90",
   });
+});
+
+test("the daily tier may not end before the dense window it follows", () => {
+  // Inverted, this would thin by a rule nobody wrote down: a weekly generation starting
+  // *inside* the span the deployment believes it keeps every snapshot of.
+  assert.throws(
+    () => parseWorkerDeployConfig(withVar("GC_DAILY_DAYS", "29")),
+    /GC_DAILY_DAYS \(29\) must be at least vars.GC_KEEP_DAYS \(30\)/
+  );
+  // Equal is a deployment with no daily tier — weekly straight after the dense window.
+  assert.deepEqual(parseWorkerDeployConfig(withVar("GC_DAILY_DAYS", "30")).vars, {
+    GC_KEEP_DAYS: "30",
+    GC_KEEP_COUNT: "50",
+    GC_DAILY_DAYS: "30",
+  });
+  assert.throws(
+    () => parseWorkerDeployConfig(withVar("GC_DAILY_DAYS", undefined)),
+    /requires vars.GC_DAILY_DAYS/
+  );
 });
 
 test("bucket preflight creates only a missing bucket", async () => {

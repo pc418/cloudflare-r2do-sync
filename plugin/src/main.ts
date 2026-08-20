@@ -2649,10 +2649,26 @@ function fmtLineChange(c: SnapshotChanges): string | null {
   return `${fmtBytes(Math.abs(c.bytes))} ${c.bytes < 0 ? "smaller" : "larger"}`;
 }
 
+/**
+ * How wide an interval a diff covers, when it is wider than one snapshot.
+ *
+ * Said out loud because the row otherwise reads as "this is what that sync did". Once the
+ * snapshots in between have been collected, the comparison is still exact but the steps it
+ * passed through are gone — and a reader deciding what to restore needs to know that the
+ * intermediate versions no longer exist rather than that nothing happened in them.
+ */
+function fmtSpan(changes: SnapshotChanges): string | null {
+  const spans = changes.spans ?? 1;
+  return spans > 1 ? `spans ${spans} syncs` : null;
+}
+
 /** One snapshot's change summary as a single line. Never guesses: what it cannot state, it omits. */
 export function describeChanges(changes: SnapshotChanges | { unknown: ChangesUnknown }): string {
   if ("unknown" in changes) return UNKNOWN_CHANGES[changes.unknown];
-  if (changes.files.length === 0) return "no file changes";
+  const span = fmtSpan(changes);
+  if (changes.files.length === 0) {
+    return span === null ? "no file changes" : `no file changes · ${span}`;
+  }
   const counts: string[] = [];
   if (changes.added > 0) counts.push(`${changes.added} added`);
   if (changes.modified > 0) counts.push(`${changes.modified} changed`);
@@ -2660,6 +2676,7 @@ export function describeChanges(changes: SnapshotChanges | { unknown: ChangesUnk
   const parts = [changes.initial ? `${counts.join(", ")} (first snapshot)` : counts.join(", ")];
   const lines = fmtLineChange(changes);
   if (lines !== null) parts.push(lines);
+  if (span !== null) parts.push(span);
   return parts.join(" · ");
 }
 

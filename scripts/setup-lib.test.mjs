@@ -352,9 +352,12 @@ test("the deploy check states the retention the sweep will delete by", () => {
     scriptName: "obsidian-log-sync",
     bucket: "obsidian-log-sync",
     bucketOwned: true,
-    retention: { GC_KEEP_DAYS: "7", GC_KEEP_COUNT: "5" },
+    retention: { GC_KEEP_DAYS: "7", GC_KEEP_COUNT: "5", GC_DAILY_DAYS: "60" },
   });
-  assert.match(text, /Retention\s+7 day\(s\), and at least the newest 5 snapshot\(s\)/);
+  // All three tiers, because the one a reader is most likely to misjudge is the last: what
+  // survives past the daily tier is kept for good, not deleted at the end of it.
+  assert.match(text, /Retention\s+every snapshot for 7 day\(s\) \(at least the newest 5\),/);
+  assert.match(text, /then one a day to 60 day\(s\), then one a week/);
 });
 
 // --- which account gets the worker -------------------------------------------

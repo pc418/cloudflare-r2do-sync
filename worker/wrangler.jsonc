@@ -29,6 +29,9 @@
   // within that day, so it guaranteed no history at all and `keepDays` was the whole promise.
   // The two answer different questions — count is the floor a vault keeps once it goes quiet
   // (500 ≈ a week at that peak rate), days is the restore reach while it is active.
-  "vars": { "GC_KEEP_DAYS": "90", "GC_KEEP_COUNT": "500" },
+  // Generational retention. Deliberately still the pre-thinning window: this deploy carries
+  // the code, not the new policy, so the daily tier is empty and nothing is old enough to
+  // thin. The flip to "14" / "100" / "90" is its own commit and its own observed sweep.
+  "vars": { "GC_KEEP_DAYS": "90", "GC_KEEP_COUNT": "500", "GC_DAILY_DAYS": "90" },
   "triggers": { "crons": ["0 4 * * *"] }
 }

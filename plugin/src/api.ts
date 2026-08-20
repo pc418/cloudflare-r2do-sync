@@ -187,7 +187,12 @@ export class SyncApi {
   async getHistory(limit: number): Promise<HistoryPage | null> {
     let res: HttpResponse;
     try {
-      res = await this.#request(`/api/history?limit=${encodeURIComponent(String(limit))}`);
+      // `splices=1` says this client understands a chain whose links step over collected
+      // commits. Without it a thinning server cuts the page at the first gap, which is the
+      // right answer for a client that would read the links as parent-to-parent.
+      res = await this.#request(
+        `/api/history?limit=${encodeURIComponent(String(limit))}&splices=1`
+      );
     } catch (e) {
       // Only "no such route" is evidence about the server's age. Anything else — 401, 429,
       // 5xx, transport — is this request failing, and quietly walking 41 manifests instead

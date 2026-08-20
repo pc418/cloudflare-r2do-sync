@@ -198,7 +198,10 @@ export async function deployViaRest({
   });
   log(`R2 bucket "${BUCKET}": ${bucket.status}`);
   // Stated even with --yes, which skips the confirmation screen that would otherwise say it.
-  log(`GC retention: ${VARS.GC_KEEP_DAYS} day(s), newest ${VARS.GC_KEEP_COUNT} snapshot(s)`);
+  log(
+    `GC retention: every snapshot for ${VARS.GC_KEEP_DAYS} day(s) (at least the newest ` +
+      `${VARS.GC_KEEP_COUNT}), then one a day to ${VARS.GC_DAILY_DAYS} day(s), then one a week`
+  );
 
   let sub = await cf(`/workers/subdomain`);
   let subdomain = sub.body?.result?.subdomain ?? null;

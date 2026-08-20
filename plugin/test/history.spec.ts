@@ -865,6 +865,13 @@ describe("parseHistoryPage", () => {
     createdAt: "2026-08-15T00:00:00.000Z",
   });
 
+  /** A row whose parent has been collected, so the chain continues at `spliceParent`. */
+  const spliced = (id: string, parent: string, spliceParent: string, pruned = 1) => ({
+    ...row(id, parent),
+    spliceParent,
+    pruned,
+  });
+
   it("accepts a well-formed chain", () => {
     const page = parseHistoryPage({ complete: true, entries: [row("B", "A"), row("A", null)] });
     expect(page.entries.map((e) => e.id)).toEqual(["B", "A"]);
@@ -896,6 +903,50 @@ describe("parseHistoryPage", () => {
     expect(() => parseHistoryPage({ entries: [] })).toThrow(/complete is missing/);
   });
 
+  it("joins the chain on the link the server says continues it", () => {
+    // B's own parent X was collected; the listing continues at A. Following `parent` here
+    // would reject a perfectly good page — and worse, a client that did follow it would be
+    // looking for a snapshot that no longer exists.
+    const page = parseHistoryPage({
+      complete: true,
+      entries: [spliced("B", "X", "A", 3), row("A", null)],
+    });
+    expect(page.entries.map((e) => e.id)).toEqual(["B", "A"]);
+    expect(page.entries[0]).toEqual(
+      expect.objectContaining({ parent: "X", spliceParent: "A", pruned: 3 })
+    );
+    // An older server sends neither field, and that is a chain with no gaps in it.
+    expect(parseHistoryPage({ complete: true, entries: [row("A", null)] }).entries[0]).toEqual(
+      expect.objectContaining({ spliceParent: null, pruned: null })
+    );
+  });
+
+  it("refuses a skip that does not describe one", () => {
+    // Half a description is not a smaller claim, it is an incoherent one: a link with no
+    // count, or a count with no link, cannot both be true of the same snapshot.
+    expect(() =>
+      parseHistoryPage({
+        complete: true,
+        entries: [{ ...row("B", "X"), spliceParent: "A" }, row("A", null)],
+      })
+    ).toThrow(/together/);
+    expect(() =>
+      parseHistoryPage({ complete: true, entries: [{ ...row("A", null), pruned: 2 }] })
+    ).toThrow(/together/);
+    for (const bad of [0, -1, 1.5, "1"]) {
+      expect(() =>
+        parseHistoryPage({
+          complete: true,
+          entries: [{ ...row("B", "X"), spliceParent: "A", pruned: bad }, row("A", null)],
+        })
+      ).toThrow(/bad pruned/);
+    }
+    // A snapshot cannot be reached by skipping over its own history.
+    expect(() =>
+      parseHistoryPage({ complete: true, entries: [spliced("A", "X", "A")] })
+    ).toThrow(/twice/);
+  });
+
   it("refuses malformed rows rather than passing them through", () => {
     for (const bad of [
       { complete: true, entries: [{ ...row("A", null), id: "" }] },
@@ -908,6 +959,79 @@ describe("parseHistoryPage", () => {
     ]) {
       expect(() => parseHistoryPage(bad)).toThrow(/invalid history/);
     }
+  });
+});
+
+// Generational retention means a listing can step over commits that have been collected. The
+// snapshots at both ends are still real and still decrypt, so the diff between them is a true
+// one over a wider interval — which is a different thing from a diff that cannot be computed,
+// and has to be shown as what it is.
+describe("SyncEngine.listHistory across collected commits", () => {
+  /** Thin the middle snapshot the way a sweep would: gone from storage, skipped by the index. */
+  function thinMiddle(heads: string[]): void {
+    server.serveHistoryIndex = true;
+    server.splices.set(heads[2], { spliceParent: heads[0], pruned: 1 });
+    server.manifests.delete(heads[1]);
+  }
+
+  it("diffs across the gap and says how many syncs it covers", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    thinMiddle(heads);
+
+    const history = await makeEngine().listHistory(10, { changes: true });
+
+    expect(history.map((h) => h.id)).toEqual([heads[2], heads[0]]);
+    const changes = history[0].changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a real diff");
+    // From "a.md = one" straight to "a.md = three": one modified file, and b.md never appears
+    // because it was added and removed inside the stretch that was collected.
+    expect(changes.files.map((f) => f.path)).toEqual(["a.md"]);
+    expect(changes.modified).toBe(1);
+    expect(changes.spans).toBe(2);
+    // The snapshot on the far side of the gap is an ordinary row diffed against its own
+    // parent, and carries no span: it covers exactly the one sync it always did.
+    const oldest = history[1].changes;
+    if (oldest === undefined || "unknown" in oldest) throw new Error("expected a real diff");
+    expect(oldest.initial).toBe(true);
+    expect(oldest.spans).toBeUndefined();
+  });
+
+  it("rebuilds a cached row when the snapshot it was compared against is collected", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = true;
+
+    const before = await engine.listHistory(10, { changes: true });
+    expect(before.map((h) => h.id)).toEqual([heads[2], heads[1], heads[0]]);
+    const firstRow = before[0].changes;
+    if (firstRow === undefined || "unknown" in firstRow) throw new Error("expected a real diff");
+    expect(firstRow.spans).toBeUndefined();
+
+    // The same engine, after a sweep moved the link its top row was diffed against. A cache
+    // keyed by id alone would keep answering with the old, narrower diff.
+    thinMiddle(heads);
+    const after = await engine.listHistory(10, { changes: true });
+    const changes = after[0].changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a real diff");
+    expect(changes.spans).toBe(2);
+    expect(changes.files.map((f) => f.path)).toEqual(["a.md"]);
+  });
+
+  it("still reports an unknown diff when the snapshot it would compare against is gone", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = true;
+    // A server that says the chain continues at a snapshot it does not actually have. The
+    // row is real, the comparison is not available, and inventing an empty diff for it would
+    // claim the sync changed nothing.
+    server.splices.set(heads[2], { spliceParent: heads[0], pruned: 1 });
+    server.manifests.delete(heads[1]);
+    server.manifests.delete(heads[0]);
+
+    const history = await makeEngine().listHistory(10, { changes: true });
+    expect(history.map((h) => h.id)).toEqual([heads[2]]);
+    expect(history[0].changes).toEqual({ unknown: "parent-missing" });
   });
 });
 
