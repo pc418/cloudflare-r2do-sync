@@ -77,6 +77,22 @@ export const DEFAULT_NOTICE_LEVEL: NoticeLevel = "activity";
  */
 export const DEFAULT_NOTICE_START = false;
 
+/**
+ * Whether a sync the user ran **by hand** reports itself whatever the ladder says.
+ *
+ * On, and that is the point of it. Every level above describes what sync says *on its own
+ * initiative*, and the reasoning behind each rung — a timer firing forever, nobody watching,
+ * toasts that teach people to dismiss this plugin — is reasoning about unattended passes. None
+ * of it is true of a pass someone just started: they are looking at the screen, waiting, and
+ * the only question they have is whether the tap did anything. A control that answers nothing
+ * reads as broken rather than as quiet, which is why the opener was already outside the ladder;
+ * this extends the same rule to the other end of the pass, where the answer actually lives.
+ *
+ * It governs *whether* the pass speaks, never *what it says*: the summary is still shaped by
+ * `verboseSyncNotice`, so someone who asked for counts rather than file names still gets counts.
+ */
+export const DEFAULT_ALWAYS_REPORT_MANUAL = true;
+
 export function isNoticeLevel(value: unknown): value is NoticeLevel {
   return typeof value === "string" && (NOTICE_LEVELS as readonly string[]).includes(value);
 }
@@ -108,6 +124,34 @@ export function policyForLevel(level: NoticeLevel): NoticePolicy {
 /** Whether a notice in this category reaches the screen at this level. */
 export function noticeAllowed(level: NoticeLevel, category: NoticeCategory): boolean {
   return LEVEL_POLICY[level][category];
+}
+
+/**
+ * The level *this* moment reports at.
+ *
+ * The ladder is about unattended sync. A pass the user started — the ribbon, "Sync now", a
+ * hotkey, a force push or pull, a reroot — is a click, and the whole reason the categories
+ * exist is to govern what sync says when nobody asked it anything. So a hand-started pass
+ * reports at `all` while `alwaysManual` is on, and the stored level goes back to deciding what
+ * the timer is allowed to say the moment the action ends.
+ *
+ * Returning a `NoticeLevel` rather than a boolean per notice is deliberate: the override then
+ * cannot silently disagree with itself between the summary, the skipped list and the halt
+ * message, because all three read the same value. `all` is the top of the ladder, so this can
+ * only ever make a pass louder — there is no arrangement of settings where switching the
+ * override on takes a notice away.
+ *
+ * What it does **not** do is open a window. `conflictReport` keeps reading the stored level, so
+ * the override adds messages and never an interruption the user has to close: auto-opening the
+ * conflict review is a bigger event than the notice beside it, and "tell me what my sync did"
+ * is not consent to that.
+ */
+export function passNoticeLevel(opts: {
+  level: NoticeLevel;
+  interactive: boolean;
+  alwaysManual: boolean;
+}): NoticeLevel {
+  return opts.interactive && opts.alwaysManual ? "all" : opts.level;
 }
 
 /**
@@ -269,8 +313,12 @@ export function announcePass(opts: {
  * acknowledged — someone can reasonably want silence from the timer and a reply from the
  * button.
  */
-export function announceStart(opts: { enabled: boolean; interactive: boolean }): boolean {
-  return opts.enabled && opts.interactive;
+export function announceStart(opts: {
+  enabled: boolean;
+  interactive: boolean;
+  alwaysManual: boolean;
+}): boolean {
+  return opts.interactive && (opts.enabled || opts.alwaysManual);
 }
 
 /**
@@ -323,11 +371,19 @@ export const SHORT_SNAPSHOT_LENGTH = 7;
  * full id is never typed or pasted anywhere by hand. The one place it is genuinely needed is
  * the exported sync log, which is a file rather than a screen and keeps all 26 (`formatLogNote`).
  *
+ * Lower-cased for the same reason it is shortened here and not at each call site: an id is a
+ * blob of random characters a person has to compare by eye, and lower case has ascenders and
+ * descenders where block capitals have none. It is applied INSIDE this function, so no surface
+ * can disagree with another — an id set in capitals in one window and lower case in the next
+ * does not read as one identifier shown twice. ULIDs are Crockford base32, whose alphabet is
+ * case-insensitive by definition, so this loses nothing: the full id in the exported log note
+ * still carries all 26 characters as generated.
+ *
  * Shortening is display only and never round-trips: nothing is ever looked up by the value this
  * returns — `GET /api/manifests/:id` wants the whole thing — so an unlucky collision would be
  * cosmetic rather than a wrong snapshot.
  */
 export function shortSnapshot(id: string): string {
-  if (id.length <= SHORT_SNAPSHOT_LENGTH) return id;
-  return id.slice(-SHORT_SNAPSHOT_LENGTH);
+  if (id.length <= SHORT_SNAPSHOT_LENGTH) return id.toLowerCase();
+  return id.slice(-SHORT_SNAPSHOT_LENGTH).toLowerCase();
 }

@@ -14,6 +14,7 @@ const committed = (head: string): SyncResult => ({
   merged: 0,
   conflicts: [],
   conflictDetails: [],
+  currentHead: null,
 });
 
 class FakeEngine {

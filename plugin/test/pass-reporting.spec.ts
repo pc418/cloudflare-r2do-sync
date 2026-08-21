@@ -98,6 +98,29 @@ describe("what a pass reports it pushed", () => {
     expect(res.pushedChanges).toEqual([]);
   });
 
+  it("carries the current snapshot on a pass that committed nothing", async () => {
+    // The field the "show the current snapshot" notice reads. `committed` and `pulled` have a
+    // `head` of their own describing what the pass produced; an `unchanged` pass produced
+    // nothing, so without this there is no way to say which snapshot "up to date" means.
+    vault.set("a.md", "one");
+    const first = await engine.sync();
+    expect(first.status).toBe("committed");
+
+    const idle = await engine.sync();
+    expect(idle.status).toBe("unchanged");
+    // The same snapshot the commit produced, and the one the device's own state records.
+    expect(idle.currentHead).toBe(first.status === "committed" ? first.head : null);
+    expect(idle.currentHead).toBe(store.state?.lastSyncedHead);
+  });
+
+  it("has no current snapshot before anything has ever been committed", async () => {
+    // Null rather than an empty string, so the notice can say "nothing committed yet" instead
+    // of printing a blank id.
+    const res = await engine.sync();
+    expect(res.status).toBe("unchanged");
+    expect(res.currentHead).toBeNull();
+  });
+
   it("caches counts only for paths still in the snapshot", async () => {
     vault.set("a.md", "1\n2");
     vault.set("b.md", "1");

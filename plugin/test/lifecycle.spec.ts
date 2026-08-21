@@ -155,6 +155,18 @@ function lastModal(): Modal & { opts?: Record<string, unknown> } {
   return Modal.shown[Modal.shown.length - 1] as Modal & { opts?: Record<string, unknown> };
 }
 
+/**
+ * Waits for a confirmation window to actually open.
+ *
+ * A typed-phrase window sits behind a preview request, so a fixed flush count is a race: miss
+ * it and the modal opens during the NEXT test, where that test's `answerConfirm` confirms the
+ * wrong action. Seen doing exactly that.
+ */
+async function untilModal(): Promise<void> {
+  for (let i = 0; i < 50 && Modal.shown.length === 0; i++) await flush();
+  expect(lastModal()).toBeDefined();
+}
+
 /** Answers the confirm window the way a user would. */
 function answerConfirm(accept: boolean): void {
   const modal = lastModal();
@@ -774,8 +786,10 @@ describe("continuity gate", () => {
     expect(unauthenticated).toContain("past an encryption change");
     // Every one of them names both heads and says what stopping costs, which is nothing.
     for (const text of [replaced, truncated, limit, unauthenticated]) {
-      expect(text).toContain("01NEW");
-      expect(text).toContain("01OURS");
+      // Lower-cased, like every id on screen: `shortSnapshot` owns the rendering so no two
+      // surfaces can disagree about how one looks.
+      expect(text).toContain("01new");
+      expect(text).toContain("01ours");
       expect(text).toContain("Stopping leaves both sides exactly as they are");
     }
   });
@@ -794,8 +808,8 @@ describe("continuity gate", () => {
       alreadyApplied: 0,
     }).join(" ");
 
-    expect(text).toContain("KMNPQRS");
-    expect(text).toContain("ZZZZZZ");
+    expect(text).toContain("kmnpqrs");
+    expect(text).toContain("zzzzzz");
     expect(text).not.toContain(head);
     expect(text).not.toContain(lastHead);
   });
@@ -846,8 +860,12 @@ describe("the silent level", () => {
     expect(Notice.shown.some((n) => /R2DO Sync/.test(n))).toBe(true);
   });
 
-  it("says nothing at all for a pass the user started", async () => {
-    const { plugin, app } = withSettings({ noticeLevel: "silent", notifyOnStart: false });
+  it("says nothing at all for a pass the user started, with the manual override off", async () => {
+    const { plugin, app } = withSettings({
+      noticeLevel: "silent",
+      notifyOnStart: false,
+      alwaysReportManualSync: false,
+    });
     emptyVault(app);
     okServer();
     await plugin.onload();
@@ -863,7 +881,11 @@ describe("the silent level", () => {
     // The deliberate seam: the opener answers a tap, which the level never governs. Pinned so
     // nobody folds it into the ladder as a tidy-up — and pinned as "only that", so folding it
     // in the other direction (leaking the summary back) fails too.
-    const { plugin, app } = withSettings({ noticeLevel: "silent", notifyOnStart: true });
+    const { plugin, app } = withSettings({
+      noticeLevel: "silent",
+      notifyOnStart: true,
+      alwaysReportManualSync: false,
+    });
     emptyVault(app);
     okServer();
     await plugin.onload();
@@ -879,7 +901,11 @@ describe("the silent level", () => {
     // The load-bearing claim of the whole feature: silence removes the interruption, not the
     // evidence. If this ever regresses to swallowing the error too, silent mode becomes a way
     // to make a broken sync look like a working one.
-    const { plugin, app } = withSettings({ noticeLevel: "silent", notifyOnStart: false });
+    const { plugin, app } = withSettings({
+      noticeLevel: "silent",
+      notifyOnStart: false,
+      alwaysReportManualSync: false,
+    });
     emptyVault(app);
     requestUrlMock.impl = async () => {
       throw new Error("network down");
@@ -924,6 +950,7 @@ describe("the silent level", () => {
     const { plugin, app } = withSettings({
       noticeLevel: "problems",
       notifyOnStart: false,
+      alwaysReportManualSync: false,
       syncSettings: false,
     });
     emptyVault(app);
@@ -937,6 +964,282 @@ describe("the silent level", () => {
     expect(Notice.shown).toEqual([]);
     const saved = lastSave(plugin) as PersistedData & { lastSuccessAt?: number };
     expect(saved.lastSuccessAt).toBeGreaterThan(0);
+  });
+
+  it("reports a pass the user started anyway, because the ladder is about the timer", async () => {
+    // The default, and the whole point of the override: every rung of the ladder is reasoning
+    // about sync running on its own. Someone who just tapped "Sync now" is watching the screen
+    // waiting for an answer, and a control that replies with nothing reads as broken.
+    const { plugin, app } = withSettings({ noticeLevel: "silent", notifyOnStart: false });
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    // Both ends: the opener when the tap lands, and the summary when the work is done.
+    expect(Notice.shown[0]).toBe("Cloudflare R2DO Sync syncing…");
+    expect(Notice.shown.length).toBeGreaterThan(1);
+  });
+
+  it("leaves the timer silent while the override is on", async () => {
+    // The seam that makes the override safe to default on. If a background pass leaked through
+    // it, Silent would mean nothing at all and the ladder would be decoration.
+    const { plugin, app } = withSettings({ noticeLevel: "silent", syncOnStartup: true });
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    layoutReady(app);
+    await flush();
+
+    expect(requestUrlMock.calls.length).toBeGreaterThan(0);
+    expect(Notice.shown).toEqual([]);
+  });
+
+  it("speaks when a hand-started pass fails at Silent", async () => {
+    // The failure is the one thing a person who tapped sync most needs back. The stored level
+    // still owns the timer's failures, which the test above pins.
+    const { plugin, app } = withSettings({ noticeLevel: "silent" });
+    emptyVault(app);
+    requestUrlMock.impl = async () => {
+      throw new Error("network down");
+    };
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    expect(Notice.shown.some((n) => /network down/.test(n))).toBe(true);
+  });
+
+  it("leaves a background settings-push failure at the stored level, mid-manual-sync", async () => {
+    // `#interactive` describes the MOMENT, not the notice. The shared-settings push is a
+    // two-second debounce timer with no pass behind it, and it lands inside a manual sync
+    // easily — change a setting, tap Sync now. Promoting it there would put an unrelated
+    // failure on a silenced device's screen, which is the "sync nobody asked for" case the
+    // ladder exists for. What the manual pass itself says is still promoted; the test above
+    // pins that half, and this one pins that the two do not travel together.
+    const { plugin, app } = makePlugin(
+      persisted({
+        settings: {
+          ...CONFIGURED,
+          firstSyncAcknowledged: true,
+          retryAttempts: 0,
+          noticeLevel: "silent",
+          syncSettings: true,
+        },
+        // No revision yet, so the push goes straight to the PUT below rather than dying on a
+        // fixture that never had one — the failure has to be the one this test names.
+        sharedSettings: null,
+      })
+    );
+    emptyVault(app);
+
+    let puts = 0;
+    let fireSettingsPush: (() => void) | null = null;
+    requestUrlMock.impl = async (req) => {
+      const { url, method } = req as { url: string; method?: string };
+      if (url.endsWith("/api/settings")) {
+        if (method === "PUT") {
+          puts++;
+          throw new Error("settings publish refused");
+        }
+        return { status: 404, text: "{}", json: { error: { code: "not_found", message: "none" } } };
+      }
+      // Mid-pass, so `#interactive` is above zero exactly as it is in a real overlap.
+      if (url.endsWith("/api/head")) {
+        fireSettingsPush?.();
+        fireSettingsPush = null;
+        return { status: 200, text: '{"head":null}', json: { head: null } };
+      }
+      if (url.endsWith("/api/commit")) return { status: 200, text: "{}", json: { head: "01NEWHEAD" } };
+      return { status: 200, text: "{}", json: {} };
+    };
+    await plugin.onload();
+
+    // Move a shared value, so the debounce is actually scheduled rather than skipped as a
+    // fingerprint no-op.
+    plugin.settings.protectPercent = 41;
+    await plugin.saveSettings();
+    const pending = live("timeout").at(-1);
+    expect(pending).toBeDefined();
+    fireSettingsPush = () => pending?.fn();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    // The push really was attempted and really did fail — without this the assertion below
+    // would pass just as well on a test that never reached the notice at all.
+    expect(puts).toBeGreaterThan(0);
+    // The pass the user started still speaks. That is the override doing its job.
+    expect(Notice.shown.length).toBeGreaterThan(0);
+    // The unrelated background failure does not.
+    expect(Notice.shown.filter((n) => /could not publish settings/.test(n))).toEqual([]);
+  });
+
+  it("puts the snapshot in the notice when the switch is on, on any pass", async () => {
+    // End to end, because this is the one part of the feature a user reads directly: the id in
+    // the toast has to be the id the vault is actually on, not a value from the fixture.
+    const { plugin, app } = withSettings({
+      noticeLevel: "all",
+      showHeadInNotice: true,
+      // The shared-settings document is not what this test is about, and the fixture has no
+      // revision for it.
+      syncSettings: false,
+    });
+    vaultWithANote(app);
+    // A server that can actually take a commit: `okServer` answers `{}` to the blob check,
+    // and a pass that cannot upload never reaches a snapshot id to print.
+    let head: string | null = null;
+    requestUrlMock.impl = async (req) => {
+      const { url } = req as { url: string };
+      if (url.endsWith("/api/head")) {
+        return { status: 200, text: "{}", json: { head } };
+      }
+      if (url.endsWith("/api/blobs/check")) {
+        return { status: 200, text: "{}", json: { missing: [] } };
+      }
+      if (url.endsWith("/api/commit")) {
+        head = "01NEWHEAD";
+        return { status: 200, text: "{}", json: { head } };
+      }
+      return { status: 200, text: "{}", json: {} };
+    };
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    // "01NEWHEAD" abbreviated from the random end and lower-cased, which is what
+    // `shortSnapshot` does for every id on screen.
+    expect(Notice.shown.some((n) => /head at newhead/.test(n))).toBe(true);
+
+    // The second pass commits nothing, and still says which snapshot it is up to date with —
+    // the case the verbose list cannot cover, since there is no new snapshot to name.
+    Notice.shown.length = 0;
+    await plugin.syncNow();
+    await flush();
+    expect(Notice.shown.some((n) => /up to date/.test(n) && /head at newhead/.test(n))).toBe(true);
+  });
+
+  it("puts the snapshot on a pass that STOPPED, which is where it is asked hardest", async () => {
+    // The summary never runs for a halt — "up to date" above a notice saying nothing was done
+    // would be a false statement — so without this the switch quietly meant "every pass that
+    // FINISHED". A halted device is exactly the one whose owner needs to know which version it
+    // is sitting on.
+    //
+    // A real halt, not a stubbed result: the persisted state carries a snapshot taken with no
+    // key, and the settings now say encrypted, which is the re-key halt in `sync.ts`.
+    const { plugin, app } = makePlugin(
+      persisted({
+        settings: {
+          ...CONFIGURED,
+          firstSyncAcknowledged: true,
+          retryAttempts: 0,
+          noticeLevel: "all",
+          showHeadInNotice: true,
+          syncSettings: false,
+        },
+        // Taken under a key; the settings above are plaintext. That is the re-key halt in
+        // `sync.ts`, and it needs no crypto to stage.
+        state: { lastSyncedHead: "01HEAD", files: {}, keyId: "K1", lines: {} },
+      })
+    );
+    emptyVault(app);
+    okServer();
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    await plugin.syncNow();
+    await flush();
+
+    const halt = Notice.shown.find((n) => /halted:/.test(n));
+    expect(halt).toBeDefined();
+    // The head the device is actually on, from `persisted()`'s state — abbreviated and
+    // lower-cased like every other id on screen.
+    expect(halt).toMatch(/head at 01head/);
+    // And on exactly one notice. The same snapshot named twice in one pass reads as two.
+    expect(Notice.shown.filter((n) => /head at |head: nothing committed/.test(n))).toHaveLength(1);
+  });
+
+  it("announces a force push while it runs, whatever the notice level says", async () => {
+    // It is the slowest action on the page — a whole vault re-read and uploaded — and it is the
+    // direct answer to a typed confirmation, which the levels never govern. A window that
+    // closes onto nothing reads as an action that did not take.
+    const { plugin, app } = withSettings({
+      noticeLevel: "silent",
+      alwaysReportManualSync: false,
+      syncSettings: false,
+    });
+    vaultWithANote(app);
+    okServer();
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    const push = plugin.forcePush();
+    // The typed-phrase window opens behind a preview request, so wait for it rather than
+    // guessing at a flush count — an unanswered modal would otherwise open inside the NEXT
+    // test and be answered there.
+    await untilModal();
+    answerConfirm(true);
+    await push;
+    await flush();
+
+    expect(Notice.shown.some((n) => /publishing this device over the remote/i.test(n))).toBe(true);
+  });
+
+  it("announces a history rebuild while it runs, for the same reason", async () => {
+    const { plugin, app } = withSettings({
+      noticeLevel: "silent",
+      alwaysReportManualSync: false,
+      syncSettings: false,
+    });
+    vaultWithANote(app);
+    // Rebuild refuses outright on a remote with no snapshot, so this one needs a head and the
+    // manifest behind it before it will reach its typed-phrase window at all.
+    const manifest = {
+      v: 1,
+      id: "01HEAD",
+      parent: null,
+      device: "other",
+      createdAt: "2026-08-20T00:00:00.000Z",
+      files: {},
+    };
+    requestUrlMock.impl = async (req) => {
+      const { url } = req as { url: string };
+      if (url.endsWith("/api/head")) return { status: 200, text: "{}", json: { head: "01HEAD" } };
+      // No indexed history route, so the summary falls back to the manifest walk below —
+      // which is the path an older Worker takes anyway.
+      if (url.includes("/api/history")) {
+        return { status: 404, text: "{}", json: { error: { code: "not_found", message: "none" } } };
+      }
+      if (url.includes("/api/manifests/")) {
+        return { status: 200, text: "{}", json: manifest };
+      }
+      if (url.endsWith("/api/blobs/check")) return { status: 200, text: "{}", json: { missing: [] } };
+      if (url.endsWith("/api/settings")) {
+        return { status: 404, text: "{}", json: { error: { code: "not_found", message: "none" } } };
+      }
+      if (url.endsWith("/api/commit")) return { status: 200, text: "{}", json: { head: "01NEWHEAD" } };
+      return { status: 200, text: "{}", json: {} };
+    };
+    await plugin.onload();
+    Notice.shown.length = 0;
+
+    const rebuild = plugin.rebuildHistory();
+    await untilModal();
+    answerConfirm(true);
+    await rebuild;
+    await flush();
+
+    expect(Notice.shown.some((n) => /rebuilding the remote's history/i.test(n))).toBe(true);
   });
 
   it("still answers a click that cannot start a sync at all", async () => {

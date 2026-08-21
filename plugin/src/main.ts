@@ -76,6 +76,7 @@ import {
   entryFromResult,
   formatLogNote,
   relativeTime,
+  describeHead,
   describePass,
   type SyncLogEntry,
 } from "./log";
@@ -84,12 +85,14 @@ import {
   announceStart,
   conflictReport,
   noticeAllowed,
+  passNoticeLevel,
   passChangedSomething,
   resolveNoticeLevel,
   resolveNoticeStart,
   shortSnapshot,
   DEFAULT_NOTICE_LEVEL,
   DEFAULT_NOTICE_START,
+  DEFAULT_ALWAYS_REPORT_MANUAL,
   LEGACY_NOTICE_KEYS,
   type NoticeCategory,
   type NoticeLevel,
@@ -188,8 +191,22 @@ export interface Settings {
    * answers a click, which is the one thing the levels never govern.
    */
   notifyOnStart: boolean;
+  /**
+   * Whether a pass the user ran by hand reports itself whatever `noticeLevel` says — the
+   * opener when it starts, the summary and any problem when it ends. Outside the ladder for
+   * the same reason the opener is: the levels govern sync nobody asked for. `notify.ts` holds
+   * the argument.
+   */
+  alwaysReportManualSync: boolean;
   /** List the changed files in the notice, not just how many files and lines moved. */
   verboseSyncNotice: boolean;
+  /**
+   * Put the snapshot the vault is on into the pass notice, on **every** pass rather than only
+   * one that committed. Independent of `verboseSyncNotice`, which carries the id of a snapshot
+   * a commit produced and so is silent on exactly the passes where the question is hardest to
+   * answer from the screen.
+   */
+  showHeadInNotice: boolean;
   /**
    * Force Obsidian's hidden status bar visible on mobile. Off by default: it overrides
    * Obsidian's own layout, so it is opt-in and reversible.
@@ -237,11 +254,16 @@ export const DEFAULT_SETTINGS: Settings = {
   showNoticePrefix: true,
   noticeLevel: DEFAULT_NOTICE_LEVEL,
   notifyOnStart: DEFAULT_NOTICE_START,
+  alwaysReportManualSync: DEFAULT_ALWAYS_REPORT_MANUAL,
   // Off: the compact summary already says how many files and lines moved each way, and a named
   // list is the one notice shape that can run to a dozen lines on a first sync. Knock-on worth
   // knowing: the snapshot id rides on the verbose form, so a default pass notice carries no id.
   // Every id that IS shown, anywhere, is the 7-character form; the exported log keeps all 26.
   verboseSyncNotice: false,
+  // Off, like the verbose list and for the same reason: it is a line added to every pass
+  // notice forever, and most passes are ones where nobody is asking which snapshot they are
+  // on. One switch away for anyone who wants the vault's version in front of them.
+  showHeadInNotice: false,
   mobileStatusBar: false,
   syncSettings: true,
   firstSyncAcknowledged: false,
@@ -962,7 +984,7 @@ export default class LogSyncPlugin extends Plugin {
     this.#settingsPushTimer = window.setTimeout(() => {
       this.#settingsPushTimer = null;
       this.#pushSharedSettings().catch((e) => {
-        this.#say(
+        this.#sayUnwatched(
           "problems",
           `could not publish settings to other devices: ${message(e)}`,
           10_000
@@ -1232,7 +1254,13 @@ export default class LogSyncPlugin extends Plugin {
       if (!consent.proceed) return;
       this.#phase = "syncing";
       this.#renderStatus();
-      if (announceStart({ enabled: this.settings.notifyOnStart, interactive: true })) {
+      if (
+        announceStart({
+          enabled: this.settings.notifyOnStart,
+          interactive: true,
+          alwaysManual: this.settings.alwaysReportManualSync,
+        })
+      ) {
         started = new Notice(this.#prefixed("syncing…"), 0);
       }
       try {
@@ -1414,6 +1442,12 @@ export default class LogSyncPlugin extends Plugin {
       onConfirm: async () => {
         this.#phase = "syncing";
         this.#renderStatus();
+        // Unconditional, like the one `forcePull` raises and for the same reason: this is the
+        // direct answer to a typed confirmation, not a report about the vault, and the levels
+        // never govern those. It is also the slowest thing on the page — a whole vault is
+        // re-read and uploaded — so a window that closes onto nothing reads as an action that
+        // did not take.
+        const notice = new Notice("R2DO Sync: publishing this device over the remote…", 0);
         this.#interactive++;
         try {
           // A full audit, like the preview that produced `summary`. Publishing one direction
@@ -1422,6 +1456,7 @@ export default class LogSyncPlugin extends Plugin {
         } catch (e) {
           await this.#reportUnlessReported(e);
         } finally {
+          notice.hide();
           this.#interactive--;
         }
       },
@@ -1488,6 +1523,10 @@ export default class LogSyncPlugin extends Plugin {
       onConfirm: async () => {
         this.#phase = "syncing";
         this.#renderStatus();
+        // Same rule as the two forced directions: the answer to a typed confirmation is never
+        // governed by the notice level. This one has the strongest claim of the three — it is
+        // the only action on the page that destroys history, and it runs long.
+        const notice = new Notice("R2DO Sync: rebuilding the remote's history…", 0);
         this.#interactive++;
         try {
           // Pinned to the head the confirmation just described. A snapshot published
@@ -1497,6 +1536,7 @@ export default class LogSyncPlugin extends Plugin {
         } catch (e) {
           await this.#reportUnlessReported(e);
         } finally {
+          notice.hide();
           this.#interactive--;
         }
       },
@@ -2090,31 +2130,101 @@ export default class LogSyncPlugin extends Plugin {
   /**
    * Raises a notice only if its category is enabled on this device.
    *
-   * Every self-initiated sync notice goes through here, which is what makes the `silent` level
-   * mean silence rather than "quieter in the places someone remembered". A notice that answers
-   * a click calls `new Notice` directly and is deliberately not routed here.
+   * Every self-initiated sync notice goes through here or through `#sayUnwatched`, which is
+   * what makes the `silent` level mean silence rather than "quieter in the places someone
+   * remembered". A notice that answers a click calls `new Notice` directly and is deliberately
+   * not routed here.
+   *
+   * **This one is for a notice raised from inside a pass**, which every caller of it is: the
+   * summary, what the pass pulled or skipped, a conflict, a halt, an unanswered question, a
+   * failure. Those are what someone who just tapped "Sync now" is waiting for, so they read
+   * `#levelNow()` and are promoted while the user is watching.
+   *
+   * Anything raised by a timer or a callback that is **not** part of a pass must use
+   * `#sayUnwatched` instead. `#interactive` describes the moment, not the notice, so a
+   * background failure that merely overlaps a hand-started action would otherwise be promoted
+   * by it — putting an unrelated message on the screen of a device that asked for silence.
    */
   #say(category: NoticeCategory, text: string, durationMs?: number): void {
+    if (!noticeAllowed(this.#levelNow(), category)) return;
+    new Notice(this.#prefixed(text), durationMs);
+  }
+
+  /**
+   * The same gate at the **stored** level, for the one notice nobody is waiting on.
+   *
+   * The debounced shared-settings push is a timer with no pass behind it: it is scheduled by
+   * whichever save happened to move a shared value, fires two seconds later, and its failure
+   * is not an answer to anything. Reading `#levelNow()` there would mean a silenced device
+   * announcing a settings-publish failure purely because the timer landed inside an unrelated
+   * manual sync or a force-action confirmation — the exact "sync nobody asked for" case the
+   * ladder exists to govern.
+   *
+   * One caller today, and it should stay that way: prefer `#say` unless the notice genuinely
+   * has no pass behind it.
+   */
+  #sayUnwatched(category: NoticeCategory, text: string, durationMs?: number): void {
     if (!noticeAllowed(this.noticeLevel, category)) return;
     new Notice(this.#prefixed(text), durationMs);
   }
 
+  /**
+   * The level to judge a notice by **right now**, which is not always the stored one.
+   *
+   * While the user is inside an action they started — "Sync now", the ribbon, a hotkey, a force
+   * push or pull, a reroot — `alwaysReportManualSync` lifts the pass to `all`, so the summary
+   * and any problem it hit reach the screen whatever the ladder is set to. The instant the
+   * action ends, `#interactive` falls back to zero and the timer is governed exactly as before.
+   *
+   * Read fresh at every call rather than captured at the start of a pass, for the same reason
+   * `noticeLevel` is: an applied shared-settings document can rewrite the level mid-pass.
+   *
+   * Deliberately not consulted by `#reportConflicts`, which reads the stored level: this raises
+   * messages and must never be the thing that opens a window.
+   */
+  #levelNow(): NoticeLevel {
+    return passNoticeLevel({
+      level: this.noticeLevel,
+      interactive: this.#interactive > 0,
+      alwaysManual: this.settings.alwaysReportManualSync,
+    });
+  }
+
   #notify(result: SyncResult): void {
     const changed = passChangedSomething(result);
-    if (
-      announcePass({ level: this.noticeLevel, result })
-    ) {
+    // A pass that stopped never reaches the summary — "up to date" above a notice saying
+    // nothing was done is a false statement — so the snapshot line has to ride on the notice
+    // that explains the stop instead. Deciding it once, here, is what keeps the id to exactly
+    // one notice per pass: a halted pass that also pulled files would otherwise print it on
+    // the `changes` line below AND on the halt.
+    const stopped =
+      result.status === "halted" ||
+      result.status === "needs-decision" ||
+      result.status === "needs-continuity";
+    const headOn = this.settings.showHeadInNotice;
+    // The stop notices are sticky (duration 0) and the lines above them are not, so on a
+    // stopped pass the id goes where it will still be on screen when someone reads it.
+    const withHead = (text: string): string =>
+      headOn ? `${text}${NL}${describeHead(result)}` : text;
+    if (announcePass({ level: this.#levelNow(), result })) {
       const verbose = this.settings.verboseSyncNotice;
+      const head = headOn && !stopped;
       // A named list takes longer to read than "up to date", and a pass that moved nothing
-      // should not linger on screen.
-      const duration = !changed ? 4_000 : verbose ? 12_000 : 8_000;
-      const detail = describePass(result, { verbose });
+      // should not linger on screen. An id is worth a little longer than that, though: it is
+      // there to be read off, and often copied against the history window.
+      const duration = !changed ? (head ? 6_000 : 4_000) : verbose ? 12_000 : 8_000;
+      const detail = describePass(result, { verbose, head });
       new Notice(this.#prefixed(`${NL}${detail}`), duration);
     } else if (result.pulled > 0) {
       // Files changed under the user without them asking. This used to be the floor no setting
       // could remove; it is now its own category, because a device asked to be silent has a
       // status bar to say so and a popup it did not want is still a popup.
-      this.#say("changes", `changed ${result.pulled} local file(s)`);
+      this.#say(
+        "changes",
+        stopped
+          ? `changed ${result.pulled} local file(s)`
+          : withHead(`changed ${result.pulled} local file(s)`)
+      );
     }
     if (result.skipped.length > 0) {
       const detail = result.skipped
@@ -2135,16 +2245,18 @@ export default class LogSyncPlugin extends Plugin {
       );
     }
     if (result.status === "halted") {
-      this.#say("problems", `halted: ${result.reason}`, 0);
+      this.#say("problems", withHead(`halted: ${result.reason}`), 0);
       return;
     }
     if (result.status === "needs-decision") {
       const { deletes, overwrites, percent } = result.summary;
       this.#say(
         "problems",
-        `paused: the remote would delete ${deletes.length} and overwrite ` +
-          `${overwrites.length} file(s) here — ${percent}% of this vault. Run "Sync now" to ` +
-          `review and choose what happens.`,
+        withHead(
+          `paused: the remote would delete ${deletes.length} and overwrite ` +
+            `${overwrites.length} file(s) here — ${percent}% of this vault. Run "Sync now" to ` +
+            `review and choose what happens.`
+        ),
         0
       );
     }
@@ -2154,9 +2266,11 @@ export default class LogSyncPlugin extends Plugin {
       // has its own notice above saying so.
       this.#say(
         "problems",
-        "paused: it could not trace the remote's current snapshot back to the one " +
-          `this device last synced (${result.continuity.reason}). Nothing was published. Run ` +
-          '"Sync now" to see what was checked and decide.',
+        withHead(
+          "paused: it could not trace the remote's current snapshot back to the one " +
+            `this device last synced (${result.continuity.reason}). Nothing was published. Run ` +
+            '"Sync now" to see what was checked and decide.'
+        ),
         0
       );
     }
@@ -4828,31 +4942,68 @@ export class LogSyncSettingTab extends PluginSettingTab {
       // looks exactly like one that has nothing to report.
       containerEl.createEl("p", {
         cls: "r2do-hint",
-        text: Platform.isMobile
-          ? "Sync will not say anything at all — failures included. It keeps running and keeps " +
-            "recording what it did. Turn on the status bar below, or nothing on screen will " +
-            "tell you a sync has started failing."
-          : "Sync will not say anything at all — failures included. It keeps running and keeps " +
-            "recording what it did: the status bar still shows the state, and the sync log " +
-            "still has the detail.",
+        text:
+          (Platform.isMobile
+            ? "Sync will not say anything at all — failures included. It keeps running and " +
+              "keeps recording what it did. Turn on the status bar below, or nothing on " +
+              "screen will tell you a sync has started failing."
+            : "Sync will not say anything at all — failures included. It keeps running and " +
+              "keeps recording what it did: the status bar still shows the state, and the " +
+              "sync log still has the detail.") +
+          // Silence is the one choice on the page that has to describe itself exactly, and
+          // with the switch below on it is silence about the timer only. Leaving the sentence
+          // at "nothing at all" would be the page telling the user something untrue about
+          // their own settings.
+          (this.plugin.settings.alwaysReportManualSync
+            ? " This covers sync that runs on its own. A sync you start by hand still reports " +
+              "itself, until you turn that off below."
+            : ""),
       });
     }
 
+    // The level above governs sync nobody asked for. This governs the answer to a tap, which
+    // is the one thing it deliberately never covers — so it sits directly under the level and
+    // says so, rather than being discovered later as an exception to it.
     new Setting(containerEl)
-      .setName("Say when a sync starts")
+      .setName("Always report a sync you start by hand")
       .setDesc(
-        'Shows "syncing…" while a sync you started is running, and only then — a timer has ' +
-          "nobody to reassure. Kept out of the level above because it answers your tap rather " +
-          "than describing the vault, so it still works at Problems and Silent. Below All it " +
-          "is the only reply a manual sync that found nothing gives you, which is what it is " +
-          "for: leave it on if you sync by hand."
+        'Runs "syncing…" while a sync you started is working and reports what it did when it ' +
+          'finishes, whatever the level above says — the ribbon, "Sync now", or a hotkey. Force ' +
+          "push, force pull and rebuild history report their result under this too, but they " +
+          "announce themselves as they run whatever you set here: those answer a typed " +
+          "confirmation, and an answer to a click is never silenced. A timer is untouched — it " +
+          "has nobody waiting on it, which is the whole reason the level exists. What the " +
+          'summary contains is still yours: turn on "List the changed files" below for names, ' +
+          "or leave it off for counts."
       )
       .addToggle((t) =>
-        t.setValue(this.plugin.settings.notifyOnStart).onChange(async (v) => {
-          this.plugin.settings.notifyOnStart = v;
+        t.setValue(this.plugin.settings.alwaysReportManualSync).onChange(async (v) => {
+          this.plugin.settings.alwaysReportManualSync = v;
           await this.plugin.saveSettings();
+          // Redrawn because the opener below is the one thing this subsumes: while it is on,
+          // that switch has no state it can express. A dead control left on screen is worse
+          // than one that steps aside.
+          this.display();
         })
       );
+
+    if (!this.plugin.settings.alwaysReportManualSync) {
+      new Setting(containerEl)
+        .setName("Say when a sync starts")
+        .setDesc(
+          'Shows "syncing…" while a sync you started is running, and only then — a timer has ' +
+            "nobody to reassure. Kept out of the level above because it answers your tap rather " +
+            "than describing the vault, so it still works at Problems and Silent. With the " +
+            "switch above off, this is the only reply a manual sync that found nothing gives " +
+            "you: leave it on if you sync by hand."
+        )
+        .addToggle((t) =>
+          t.setValue(this.plugin.settings.notifyOnStart).onChange(async (v) => {
+            this.plugin.settings.notifyOnStart = v;
+            await this.plugin.saveSettings();
+          })
+        );
+    }
 
     new Setting(containerEl)
       .setName("List the changed files")
@@ -4865,6 +5016,22 @@ export class LogSyncSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(this.plugin.settings.verboseSyncNotice).onChange(async (v) => {
           this.plugin.settings.verboseSyncNotice = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Show the current snapshot")
+      .setDesc(
+        'Adds a line — "head at kmnpqrs" — to every pass notice, including a pass that changed ' +
+          'nothing, which is the point: "up to date" does not say up to date with what. The ' +
+          "last 7 characters, the random half of the id; the first ten are a timestamp and " +
+          "would look nearly the same on every snapshot. It is the same id the history window " +
+          "lists, so you can match one to the other."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.showHeadInNotice).onChange(async (v) => {
+          this.plugin.settings.showHeadInNotice = v;
           await this.plugin.saveSettings();
         })
       );

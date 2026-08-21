@@ -69,7 +69,14 @@ describe.skipIf(config === null)("Notices", () => {
     harness = await LiveHarness.start(config!, {
       files: { "off.md": "no summary wanted\n" },
       persisted: {
-        settings: { noticeLevel: "silent", notifyOnStart: false, syncSettings: false },
+        settings: {
+          noticeLevel: "silent",
+          notifyOnStart: false,
+          // The ladder on its own. `syncNow()` is a pass the user started, so the shipped
+          // default would report it whatever the level says — that is the next test.
+          alwaysReportManualSync: false,
+          syncSettings: false,
+        },
       },
     });
 
@@ -89,6 +96,31 @@ describe.skipIf(config === null)("Notices", () => {
     expect(harness.notices().slice(noticesBefore)).toEqual([]);
   });
 
+  it("the manual override: the same silenced vault still answers a sync you started", async () => {
+    // The mirror of the test above, one setting apart — and the shipped default. Every rung of
+    // the ladder reasons about sync running on its own; a person who just tapped "Sync now" is
+    // waiting for an answer, and gets one.
+    harness = await LiveHarness.start(config!, {
+      files: { "manual.md": "summary wanted\n" },
+      persisted: {
+        settings: { noticeLevel: "silent", notifyOnStart: false, syncSettings: false },
+      },
+    });
+
+    // Primed the same way, so what is left is a genuinely no-op pass: the case the level
+    // silences hardest, and the one an override that only survived on changed files would miss.
+    await harness.plugin.syncNow();
+    const noticesBefore = harness.notices().length;
+    const callsBefore = harness.http.calls;
+
+    await harness.plugin.syncNow();
+
+    expect(harness.http.calls).toBeGreaterThan(callsBefore);
+    const said = harness.notices().slice(noticesBefore);
+    expect(said.length).toBeGreaterThan(0);
+    expect(said[0]).toMatch(/syncing/);
+  });
+
   it("an ERROR notice survives the problems level, where the pass summary does not", async () => {
     // A second harness with a bad token produces a real 401, not a simulated one, per the
     // task's rule. This is the whole point of that rung: routine chatter goes, failures stay.
@@ -102,6 +134,7 @@ describe.skipIf(config === null)("Notices", () => {
         settings: {
           noticeLevel: "problems",
           notifyOnStart: false,
+          alwaysReportManualSync: false,
           syncSettings: false,
           // 401 is not retryable (src/queue.ts `isRetryable`), but pin this anyway so a
           // failure surfaces as exactly one attempt rather than however many the shipped

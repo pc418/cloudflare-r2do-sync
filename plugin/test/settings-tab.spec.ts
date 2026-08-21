@@ -185,8 +185,9 @@ describe("settings tab rendering", () => {
     "Snapshots listed in history",
     "Automatic retries",
     "What sync announces",
-    "Say when a sync starts",
+    "Always report a sync you start by hand",
     "List the changed files",
+    "Show the current snapshot",
     "Label",
     "Sync settings between devices",
     "Test connection",
@@ -266,8 +267,14 @@ describe("settings tab rendering", () => {
     ["Say when a sync starts", "notifyOnStart", false],
     ["List the changed files", "verboseSyncNotice", true],
     ["Sync on startup", "syncOnStartup", false],
+    ["Always report a sync you start by hand", "alwaysReportManualSync", false],
+    ["Show the current snapshot", "showHeadInNotice", true],
   ] as const)("wires the %s toggle to %s", async (row, key, target) => {
-    const plugin = fakePlugin();
+    // The opener only has a row of its own while the override is off — on, it has no state
+    // left to express and the page says so instead of showing a dead switch.
+    const plugin = fakePlugin(
+      row === "Say when a sync starts" ? { alwaysReportManualSync: false } : {}
+    );
     const tab = newTab(plugin);
     tab.display();
     const log = logOf(tab);
@@ -282,8 +289,14 @@ describe("settings tab rendering", () => {
     expect(plugin.saved).toBe(1);
     // Nothing else moved with it.
     const others = (
-      ["notifyOnStart", "verboseSyncNotice", "syncOnStartup"] as const
-    ).filter((k) => k !== key);
+      [
+        "notifyOnStart",
+        "verboseSyncNotice",
+        "syncOnStartup",
+        "alwaysReportManualSync",
+        "showHeadInNotice",
+      ] as const
+    ).filter((k) => k !== key && !(k === "alwaysReportManualSync" && row === "Say when a sync starts"));
     for (const other of others) {
       expect(plugin.settings[other]).toBe(DEFAULT_SETTINGS[other]);
     }
@@ -332,9 +345,37 @@ describe("settings tab rendering", () => {
   it("puts the level first, since everything under it is a detail of what it chose", () => {
     const { names } = render();
     const at = (name: string) => names.indexOf(name);
-    expect(at("What sync announces")).toBeLessThan(at("Say when a sync starts"));
-    expect(at("Say when a sync starts")).toBeLessThan(at("List the changed files"));
-    expect(at("List the changed files")).toBeLessThan(at("Label"));
+    expect(at("What sync announces")).toBeLessThan(at("Always report a sync you start by hand"));
+    expect(at("Always report a sync you start by hand")).toBeLessThan(at("List the changed files"));
+    expect(at("List the changed files")).toBeLessThan(at("Show the current snapshot"));
+    expect(at("Show the current snapshot")).toBeLessThan(at("Label"));
+
+    // And the opener, when it is shown at all, sits under the switch that subsumes it.
+    const quiet = render({ alwaysReportManualSync: false }).names;
+    expect(quiet.indexOf("Always report a sync you start by hand")).toBeLessThan(
+      quiet.indexOf("Say when a sync starts")
+    );
+    expect(quiet.indexOf("Say when a sync starts")).toBeLessThan(
+      quiet.indexOf("List the changed files")
+    );
+  });
+
+  it("hides the opener switch while the override already answers it", () => {
+    // Two switches where one fully decides the other is a page that cannot be read. The
+    // opener keeps its stored value — turning the override back off restores the row and
+    // whatever was chosen there — it simply has nothing to say while it is on.
+    expect(render().names).not.toContain("Say when a sync starts");
+    expect(render({ alwaysReportManualSync: false }).names).toContain("Say when a sync starts");
+  });
+
+  it("says what the manual override does not cover", () => {
+    const desc = render().log.settings.find(
+      (s) => s.name === "Always report a sync you start by hand"
+    )?.desc;
+    // The two questions someone reading this row actually has: does it make my timer chatty
+    // (no), and does it override the file list (no).
+    expect(desc).toContain("timer");
+    expect(desc).toContain("List the changed files");
   });
 
   it("warns that Silent means silent, and only there", () => {
@@ -348,6 +389,20 @@ describe("settings tab rendering", () => {
         level
       ).toBe(false);
     }
+  });
+
+  it("does not claim total silence while the override contradicts it", () => {
+    // The one paragraph on the page that has to describe itself exactly. With the override on,
+    // Silent is silence about the timer — a page that said "nothing at all" would be telling
+    // the user something untrue about their own settings.
+    const on = render({ noticeLevel: "silent" }).log.paragraphs.join(" ");
+    expect(on).toMatch(/start by hand still reports itself/);
+
+    const off = render({
+      noticeLevel: "silent",
+      alwaysReportManualSync: false,
+    }).log.paragraphs.join(" ");
+    expect(off).not.toMatch(/start by hand still reports itself/);
   });
 
   it("points a silenced phone at the status bar, which is all it has left", () => {

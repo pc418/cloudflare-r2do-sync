@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   DEFAULT_NOTICE_LEVEL,
   DEFAULT_NOTICE_START,
+  DEFAULT_ALWAYS_REPORT_MANUAL,
   LEGACY_NOTICE_KEYS,
   NOTICE_CATEGORIES,
   NOTICE_LEVELS,
@@ -12,6 +13,7 @@ import {
   isNoticeLevel,
   migrateLegacyNoticeLevel,
   noticeAllowed,
+  passNoticeLevel,
   passChangedSomething,
   policyForLevel,
   resolveNoticeLevel,
@@ -31,6 +33,7 @@ const base = {
   merged: 0,
   conflicts: [],
   conflictDetails: [],
+  currentHead: null,
 };
 
 const change = (
@@ -204,15 +207,65 @@ describe("announceStart", () => {
   // is no status bar to fall back on — a first sync leaves that gap open for minutes, which
   // reads exactly like a tap that missed.
   it("answers a sync the user started", () => {
-    expect(announceStart({ enabled: true, interactive: true })).toBe(true);
+    expect(announceStart({ enabled: true, interactive: true, alwaysManual: false })).toBe(true);
   });
 
   it("stays quiet for a timer, which has nobody to reassure", () => {
-    expect(announceStart({ enabled: true, interactive: false })).toBe(false);
+    expect(announceStart({ enabled: true, interactive: false, alwaysManual: false })).toBe(false);
   });
 
-  it("obeys its own switch and nothing else", () => {
-    expect(announceStart({ enabled: false, interactive: true })).toBe(false);
+  it("obeys its own switch when the manual override is off", () => {
+    expect(announceStart({ enabled: false, interactive: true, alwaysManual: false })).toBe(false);
+  });
+
+  it("opens for a hand-started pass under the override, switch or no switch", () => {
+    // The override promises a reply at both ends of a pass the user asked for. Leaving the
+    // opener behind would make it a promise about the half nobody is waiting through.
+    expect(announceStart({ enabled: false, interactive: true, alwaysManual: true })).toBe(true);
+  });
+
+  it("still has nobody to reassure on a timer, override or not", () => {
+    // The override is about answering a click. A background pass was not clicked.
+    expect(announceStart({ enabled: false, interactive: false, alwaysManual: true })).toBe(false);
+  });
+});
+
+describe("passNoticeLevel", () => {
+  it("leaves an unattended pass to the stored level", () => {
+    for (const level of NOTICE_LEVELS) {
+      expect(passNoticeLevel({ level, interactive: false, alwaysManual: true }), level).toBe(level);
+    }
+  });
+
+  it("leaves every pass to the stored level once the override is off", () => {
+    for (const level of NOTICE_LEVELS) {
+      expect(passNoticeLevel({ level, interactive: true, alwaysManual: false }), level).toBe(level);
+    }
+  });
+
+  it("reports a hand-started pass at the top of the ladder", () => {
+    for (const level of NOTICE_LEVELS) {
+      expect(passNoticeLevel({ level, interactive: true, alwaysManual: true }), level).toBe("all");
+    }
+  });
+
+  it("can only ever make a pass louder", () => {
+    // The override raises notices; nothing about it may take one away. `all` being the first
+    // rung is what guarantees that, so pin the two together rather than trusting the ordering
+    // to stay this way by accident.
+    expect(NOTICE_LEVELS[0]).toBe("all");
+    for (const level of NOTICE_LEVELS) {
+      const raised = passNoticeLevel({ level, interactive: true, alwaysManual: true });
+      for (const category of NOTICE_CATEGORIES) {
+        if (noticeAllowed(level, category)) {
+          expect(noticeAllowed(raised, category), `${level}/${category}`).toBe(true);
+        }
+      }
+    }
+  });
+
+  it("is on by default, because the ladder is about sync nobody asked for", () => {
+    expect(DEFAULT_ALWAYS_REPORT_MANUAL).toBe(true);
   });
 });
 
@@ -465,9 +518,18 @@ describe("shortSnapshot", () => {
     // The first ten characters are the creation time, so a seven-character prefix is constant
     // for ~33 seconds and says nothing the notice's own arrival time did not. This is the one
     // assertion that would fail if someone "fixed" it to slice from the front like git.
-    expect(shortSnapshot(id)).toBe("KMNPQRS");
+    expect(shortSnapshot(id)).toBe("kmnpqrs");
     expect(shortSnapshot(id)).toHaveLength(SHORT_SNAPSHOT_LENGTH);
-    expect(id.startsWith(shortSnapshot(id))).toBe(false);
+    expect(id.toLowerCase().startsWith(shortSnapshot(id))).toBe(false);
+  });
+
+  it("lower-cases, so no two surfaces can disagree about how an id looks", () => {
+    // Applied inside this function rather than at each call site, which is what makes it a
+    // property of the id rather than of whichever window happens to be showing it. Crockford
+    // base32 is case-insensitive by definition, so nothing is lost — the exported log note
+    // still carries the full 26 characters as generated.
+    expect(shortSnapshot(id)).toBe(shortSnapshot(id.toLowerCase()));
+    expect(shortSnapshot(id)).toBe(shortSnapshot(id).toLowerCase());
   });
 
   it("takes no switch, because every id on screen is the short one", () => {
@@ -480,7 +542,7 @@ describe("shortSnapshot", () => {
   it("leaves an id that is already short alone rather than padding or slicing it", () => {
     // Fakes and older tests use short ids; slicing one would report a suffix of something the
     // reader would recognise in full.
-    expect(shortSnapshot("01SNAP")).toBe("01SNAP");
+    expect(shortSnapshot("01SNAP")).toBe("01snap");
     expect(shortSnapshot("")).toBe("");
     expect(shortSnapshot("0123456")).toBe("0123456");
   });

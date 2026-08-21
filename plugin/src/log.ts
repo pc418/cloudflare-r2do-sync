@@ -115,19 +115,59 @@ const SYMBOL: Record<PassChange["action"], string> = {
 };
 
 /**
+ * The snapshot the vault sits on once the pass is over, for the notice.
+ *
+ * Exported because a pass that STOPPED — halted, or waiting on a decision — never reaches the
+ * summary below (its "up to date" would be a false statement), and those are the passes where
+ * "which version am I on?" is asked hardest. `#notify` appends this to the notice that explains
+ * the stop instead, so the switch means every pass on every status rather than every pass that
+ * finished.
+ *
+ * `currentHead`, never `result.head`: the whole point of the switch is that it answers on a
+ * pass that produced nothing, and only `committed`/`pulled` have a `head` of their own. A vault
+ * that has never committed says so instead of printing an empty id — there is no snapshot to
+ * name, and inventing a placeholder for one is how a display becomes a lie.
+ *
+ * Abbreviated by `shortSnapshot`, which takes the id's LAST seven characters. Ours are ULIDs,
+ * so the first ten are a millisecond clock: a prefix would be near-constant between neighbouring
+ * snapshots and would re-state what the notice's own arrival time already told you. The suffix
+ * is the random half, so it is the part that actually identifies the snapshot.
+ */
+export function describeHead(result: SyncResult): string {
+  return result.currentHead === null
+    ? "head: nothing committed yet"
+    : `head at ${shortSnapshot(result.currentHead)}`;
+}
+
+/**
  * What a pass moved, in one compact line - or, when `verbose`, a line per changed file with
  * its net line change and the snapshot it produced.
  *
  * The snapshot line is abbreviated like every other on-screen id; `formatLogNote` below is the
  * one place that keeps all 26, because it is a file rather than a screen.
+ *
+ * `head` adds the snapshot the vault is on **whatever the pass did**, "up to date" included.
+ * That is its whole reason to exist and the one thing `verbose` cannot do: verbose prints the
+ * snapshot a commit *produced*, so it says nothing on the passes where the question "which
+ * version am I on?" is hardest to answer from the screen. When both are on the head line is
+ * the only one printed — on a commit the two ids are the same value, and showing it twice under
+ * two names reads as two different snapshots.
  */
-export function describePass(result: SyncResult, opts: { verbose: boolean }): string {
+export function describePass(
+  result: SyncResult,
+  opts: { verbose: boolean; head?: boolean }
+): string {
   const groups: Array<{ arrow: string; changes: PassChange[] }> = [
     { arrow: "^", changes: result.pushedChanges },
     { arrow: "v", changes: result.pulledChanges },
   ].filter((g) => g.changes.length > 0);
 
-  if (groups.length === 0) return "up to date";
+  if (groups.length === 0) {
+    // Its own line here too, not appended to "up to date" with a separator. The id is what
+    // someone reads the notice FOR when they turned this on, and a line of its own is what
+    // makes it findable at a glance in a toast that may also be carrying a skipped-file list.
+    return opts.head === true ? `up to date${NL}${describeHead(result)}` : "up to date";
+  }
 
   const extras: string[] = [];
   if (result.conflictDetails.length > 0) {
@@ -136,7 +176,8 @@ export function describePass(result: SyncResult, opts: { verbose: boolean }): st
   if (result.skipped.length > 0) extras.push(`${result.skipped.length} skipped`);
 
   if (!opts.verbose) {
-    return [...groups.map((g) => `${g.arrow} ${headline(g.changes)}`), ...extras].join(SEP);
+    const line = [...groups.map((g) => `${g.arrow} ${headline(g.changes)}`), ...extras].join(SEP);
+    return opts.head === true ? `${line}${NL}${describeHead(result)}` : line;
   }
 
   const lines: string[] = [];
@@ -150,7 +191,9 @@ export function describePass(result: SyncResult, opts: { verbose: boolean }): st
     if (rest > 0) lines.push(`  ... ${rest} more`);
   }
   lines.push(...extras);
-  if (result.status === "committed") {
+  if (opts.head === true) {
+    lines.push(describeHead(result));
+  } else if (result.status === "committed") {
     lines.push(`snapshot ${shortSnapshot(result.head)}`);
   }
   return lines.join(NL);

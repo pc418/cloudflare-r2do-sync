@@ -21,6 +21,7 @@ const base = {
   merged: 0,
   conflicts: [],
   conflictDetails: [],
+  currentHead: null,
 };
 
 describe("relativeTime", () => {
@@ -88,6 +89,7 @@ describe("entryFromResult", () => {
     const res: SyncResult = {
       status: "committed",
       head: "01ABC",
+      currentHead: "01ABC",
       uploaded: 3,
       skipped: [{ path: "big.bin", reason: "too large" }],
       pushedChanges: [],
@@ -188,6 +190,7 @@ describe("summarise", () => {
     const s = summarise({
       status: "committed",
       head: "01ABC",
+      currentHead: "01ABC",
       uploaded: 2,
       skipped: [],
       pushedChanges: [],
@@ -240,6 +243,68 @@ const change = (
 
 const committed = (over: Partial<SyncResult> = {}): SyncResult =>
   ({ status: "committed", head: "01SNAPSHOT", ...base, ...over }) as SyncResult;
+
+describe("describePass — the current-snapshot switch", () => {
+  // A real ULID shape: ten characters of millisecond clock, then sixteen of randomness.
+  const ID = "01K2XQ7M4A" + "ZBCDEFGHJKMNPQRS";
+  const onHead = { ...base, currentHead: ID };
+
+  it("names the snapshot on a pass that did nothing, which is its whole reason to exist", () => {
+    // `verbose` cannot answer this: it prints the snapshot a COMMIT produced, and this pass
+    // produced none. "Up to date" without an id does not say up to date with *what*.
+    const line = describePass({ status: "unchanged", ...onHead }, { verbose: false, head: true });
+    expect(line).toBe(`up to date${String.fromCharCode(10)}head at ${ID.slice(-7).toLowerCase()}`);
+  });
+
+  it("takes the random tail of the id, never the timestamp head", () => {
+    const line = describePass({ status: "unchanged", ...onHead }, { verbose: false, head: true });
+    expect(line).toContain(ID.slice(-7).toLowerCase());
+    // The first ten characters are a clock — nearly identical between neighbouring snapshots,
+    // and a restatement of the notice's own arrival time.
+    expect(line).not.toContain(ID.slice(0, 7).toLowerCase());
+  });
+
+  it("says there is no snapshot rather than printing an empty one", () => {
+    // A vault that has never committed has no id. Inventing a placeholder is how a display
+    // starts lying about which version the user is on.
+    const line = describePass({ status: "unchanged", ...base }, { verbose: false, head: true });
+    expect(line).toBe(`up to date${String.fromCharCode(10)}head: nothing committed yet`);
+  });
+
+  it("adds nothing at all while the switch is off", () => {
+    for (const verbose of [false, true]) {
+      expect(describePass({ status: "unchanged", ...onHead }, { verbose })).toBe("up to date");
+    }
+  });
+
+  it("prints the id once on a commit, not twice under two names", () => {
+    // Verbose already ends a commit with `snapshot X`, and that is the same value. Two lines
+    // naming one snapshot differently reads as two snapshots.
+    const result = {
+      status: "committed" as const,
+      head: ID,
+      ...onHead,
+      pushedChanges: [{ path: "a.md", action: "add" as const, lines: 3 }],
+    };
+    const short = ID.slice(-7).toLowerCase();
+    const line = describePass(result, { verbose: true, head: true });
+    expect(line).toContain(`head at ${short}`);
+    expect(line.match(new RegExp(short, "g"))).toHaveLength(1);
+    // Off, the old verbose line is exactly as it was.
+    expect(describePass(result, { verbose: true })).toContain(`snapshot ${short}`);
+  });
+
+  it("puts the head on its own line once the pass has something to report", () => {
+    const result = {
+      status: "committed" as const,
+      head: ID,
+      ...onHead,
+      pushedChanges: [{ path: "a.md", action: "add" as const, lines: 3 }],
+    };
+    const line = describePass(result, { verbose: false, head: true });
+    expect(line.split(String.fromCharCode(10)).at(-1)).toBe(`head at ${ID.slice(-7).toLowerCase()}`);
+  });
+});
 
 describe("describePass", () => {
   it("says so plainly when nothing moved", () => {
@@ -349,8 +414,8 @@ describe("describePass", () => {
     expect(lines).toContain("  - gone.md (-4)");
     expect(lines).toContain("  >< merged.md (+2)");
     // The fixture id is a 10-character stand-in, so it is abbreviated like a real one would
-    // be — every id on screen is the 7-character form now, with no setting behind it.
-    expect(lines.at(-1)).toBe("snapshot NAPSHOT");
+    // be — every id on screen is the 7-character lower-case form now, with no setting behind it.
+    expect(lines.at(-1)).toBe("snapshot napshot");
   });
 
   // A realistic id: 10 characters of ULID timestamp then 16 of randomness.
@@ -365,7 +430,7 @@ describe("describePass", () => {
     const lines = describePass(withLongId(), { verbose: true }).split(
       String.fromCharCode(10)
     );
-    expect(lines.at(-1)).toBe("snapshot KMNPQRS");
+    expect(lines.at(-1)).toBe("snapshot kmnpqrs");
     // The file line is untouched: shortening is about the id, not about trimming the notice.
     expect(lines).toContain("  + a.md (+1)");
   });

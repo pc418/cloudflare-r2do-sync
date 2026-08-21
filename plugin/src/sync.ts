@@ -118,6 +118,20 @@ interface ResultBase {
   conflicts: string[];
   /** Every unmergeable pair this pass hit, parked or overwritten, in plan order. */
   conflictDetails: ConflictInfo[];
+  /**
+   * The snapshot this device is on when the pass ends, whatever the pass did — null before
+   * anything has ever been committed.
+   *
+   * On every status, which is the point: `committed` and `pulled` carry a `head` of their own
+   * describing what the pass *produced*, and an `unchanged` pass has nothing to produce, so
+   * without this there is no way to say which snapshot "up to date" is up to date *with*.
+   * A halt or an unanswered question carries it too, because a pass that stopped after
+   * absorbing a remote really is on that snapshot (`#persistAbsorbed`).
+   *
+   * Read from `#state` at the moment the result is built rather than threaded through each
+   * return, so it cannot drift from what was actually saved.
+   */
+  currentHead: string | null;
 }
 
 /** What the user chose when a pass would destroy an unusual share of the vault. */
@@ -877,6 +891,9 @@ export class SyncEngine {
 
   #result(extra: Partial<SyncResult> & { status: SyncResult["status"] }): SyncResult {
     return {
+      // Every `#state` assignment in a pass is followed by `#store.save`, so this is the head
+      // the device will still be on after a reload — not an in-flight value.
+      currentHead: this.#state?.lastSyncedHead ?? null,
       uploaded: 0,
       skipped: [],
       pushedChanges: [],
