@@ -2809,8 +2809,6 @@ export class SyncEngine {
    * success this codebase refuses to produce.
    */
   #assertRestorableDestination(path: string): void {
-    const bad = pathError(path);
-    if (bad !== null) throw new Error(`"${path}" is not a valid vault path: ${bad}`);
     const blocked = this.restoreDestinationBlock(path);
     if (blocked !== null) throw new Error(`refusing to restore into "${path}": ${blocked}`);
   }
@@ -2828,6 +2826,12 @@ export class SyncEngine {
    * credential file under another spelling, and a case-sensitive guard would wave it through.
    */
   restoreDestinationBlock(path: string): string | null {
+    // Validity lives here rather than beside the throw, so that everything choosing a
+    // destination asks one question. Numbering used to inherit this check through the sync
+    // policy, and dropping that left `numberedPath` free to push a long path past the 1,024-byte
+    // limit and hand the adapter something no later sync would accept.
+    const bad = pathError(path);
+    if (bad !== null) return `it is not a valid vault path: ${bad}`;
     const folded = foldPath(path);
     for (const dir of selfDirs(this.#configDir)) {
       const self = foldPath(dir);

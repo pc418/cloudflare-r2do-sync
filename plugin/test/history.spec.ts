@@ -508,6 +508,19 @@ describe("SyncEngine.restoreFile", () => {
     expect(vault.text(".obsidian/app.json")).toBe("{\"from\":\"local\"}");
   });
 
+  it("does not number a copy past the path-length limit", async () => {
+    const engine = makeEngine();
+
+    // `numberedPath` adds " (2)", which can push a long path over the 1,024-byte limit. That
+    // check used to come free with the sync-policy filter; without it the adapter is handed a
+    // path no later sync would accept.
+    const long = `${"n".repeat(1020)}.md`;
+    expect(engine.restoreDestinationBlock(long)).toBeNull();
+    expect(engine.restoreDestinationBlock(`${"n".repeat(1020)} (2).md`)).toContain(
+      "not a valid vault path"
+    );
+  });
+
   it("closes the plugin folder under any spelling a case-insensitive vault accepts", async () => {
     const engine = makeEngine();
 
