@@ -2939,18 +2939,31 @@ export class HistoryModal extends Modal {
         t.inputEl.type = "date";
         t.setPlaceholder("from");
         t.onChange((value) => {
-          this.#from = value;
-          void this.#renderList();
+          this.#setRange("from", value);
         });
       })
       .addText((t) => {
         t.inputEl.type = "date";
         t.setPlaceholder("to");
         t.onChange((value) => {
-          this.#to = value;
-          void this.#renderList();
+          this.#setRange("to", value);
         });
       });
+  }
+
+  /**
+   * Takes a date field's new value, and relists only if it changed what the list would be.
+   *
+   * A field can report every keystroke, and a half-typed date parses to nothing — so without
+   * this, typing `2026-08-20` would fire a run of identical unfiltered listings, each one a
+   * request, before the one that matters.
+   */
+  #setRange(which: "from" | "to", value: string): void {
+    const before = parseDateField(which === "from" ? this.#from : this.#to);
+    if (which === "from") this.#from = value;
+    else this.#to = value;
+    if (parseDateField(value) === before) return;
+    void this.#renderList();
   }
 
   async #renderList(): Promise<void> {

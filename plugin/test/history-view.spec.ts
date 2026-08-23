@@ -284,6 +284,34 @@ describe("the history window", () => {
     });
   });
 
+  it("does not relist while a date is still half-typed", async () => {
+    let calls = 0;
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async () => {
+          calls++;
+          return listing([snapshot()]);
+        },
+      })
+    );
+    modal.open();
+    await settle();
+    expect(calls).toBe(1);
+
+    const between = controlOf(modal, "Between");
+    // A date field can report every keystroke, and a half-typed date parses to nothing.
+    for (const partial of ["2", "20", "202", "2026", "2026-0"]) {
+      between.texts[0].change(partial);
+      await settle();
+    }
+    expect(calls).toBe(1);
+
+    between.texts[0].change("2026-08-10");
+    await settle();
+    expect(calls).toBe(2);
+  });
+
   it("names a grouped row by its bucket and the devices that committed into it", async () => {
     const modal = new HistoryModal(
       new App() as never,
