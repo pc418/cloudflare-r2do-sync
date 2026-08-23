@@ -2782,8 +2782,18 @@ export interface HistoryDeps {
 /** How many changed paths a history row previews before deferring to the snapshot window. */
 const CHANGE_PREVIEW = 5;
 
-/** One day, for turning a "to" date into the end of the day the user named rather than its start. */
-const DAY_MS = 24 * 60 * 60 * 1000;
+/**
+ * Local midnight of the day after the one this instant falls in.
+ *
+ * Built from calendar components rather than by adding 86,400,000 ms, because on a
+ * daylight-saving transition a day is not that long: spring forward and the arithmetic lands an
+ * hour into the *next* date, autumn back and it stops an hour short of the one the user named.
+ * A history range is explicitly a device-local calendar range, so its end has to be one too.
+ */
+function nextLocalDay(at: number): number {
+  const d = new Date(at);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime();
+}
 
 const UNKNOWN_CHANGES: Record<ChangesUnknown, string> = {
   unreadable: "changes unknown — this snapshot cannot be read with this device's key",
@@ -2978,7 +2988,7 @@ export class HistoryModal extends Modal {
     const opts: HistoryOptions = { changes: true, granularity: this.#granularity };
     if (from !== null) opts.from = from;
     // The field names a day the user wants included, so the range runs to the end of it.
-    if (to !== null) opts.to = to + DAY_MS;
+    if (to !== null) opts.to = nextLocalDay(to);
 
     let listing: HistoryListing;
     try {
@@ -3013,6 +3023,14 @@ export class HistoryModal extends Modal {
 
   /** Why a listing came back with nothing, distinguishing the reasons rather than guessing. */
   #emptyLine(listing: HistoryListing, ranged: boolean): string {
+    // "Nothing in that range" is a claim about the vault. It cannot be made when the dates were
+    // never actually searched — only the most recent syncs were, and the range may be older.
+    if (listing.fallback === "no-range") {
+      return (
+        "This vault's history index cannot be read, so dates could not be searched. None of " +
+        "the most recent syncs fall in that range; older ones were not looked at."
+      );
+    }
     if (ranged) return "No snapshots in that range.";
     // Snapshots exist, but not enough of the chain was reachable to complete a single bucket —
     // a bucket is only shown once its older edge is known. Rare, and never "this vault is new".
@@ -3034,6 +3052,13 @@ export class HistoryModal extends Modal {
     const retention =
       " Older snapshots are removed by the server's retention policy, so this list can be " +
       "shorter than the vault's full history.";
+    if (listing.fallback === "no-range") {
+      return (
+        `${unit} This vault's history index cannot be read, so dates could not be searched: ` +
+        `only the most recent syncs were looked at, and anything older than those is not shown ` +
+        `whether or not it falls in the range.${retention}`
+      );
+    }
     if (listing.fallback === "no-index") {
       return (
         `${unit} Grouping needs the server's history index, which this vault has not finished ` +

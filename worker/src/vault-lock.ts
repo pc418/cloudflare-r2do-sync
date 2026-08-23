@@ -101,8 +101,14 @@ export interface HistoryPage {
   complete: boolean;
 }
 
-/** An indexed snapshot as the chain walk reads it: the row, plus the splice it may carry. */
-interface ChainRow {
+/**
+ * An indexed snapshot as the chain walk reads it: the row, plus the splice it may carry.
+ *
+ * A type alias rather than an interface on purpose — `sql.exec<T>` constrains `T` to
+ * `Record<string, SqlStorageValue>`, and only an alias of an object literal carries the implicit
+ * index signature that satisfies it.
+ */
+type ChainRow = {
   id: string;
   parent: string | null;
   uploaded_at: number;
@@ -110,7 +116,7 @@ interface ChainRow {
   created_at: string | null;
   splice_parent: string | null;
   spliced: number | null;
-}
+};
 
 /** Manifests one `advanceHistoryDetail` call reads before handing control back. */
 const DEFAULT_HISTORY_DETAIL_CHUNK = 25;

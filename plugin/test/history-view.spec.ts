@@ -312,6 +312,33 @@ describe("the history window", () => {
     expect(calls).toBe(2);
   });
 
+  it("ends a range at the next local midnight, not 24 hours later", async () => {
+    const asked: Array<{ from?: number; to?: number }> = [];
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async (_limit, opts) => {
+          asked.push({ from: opts?.from, to: opts?.to });
+          return listing([snapshot()]);
+        },
+      })
+    );
+    modal.open();
+    await settle();
+
+    // Every date in a year, so whichever days this machine's zone shifts its clock on are
+    // covered. Adding 86,400,000 ms lands an hour into the next date in spring and an hour
+    // short of the named one in autumn; the range's end has to be a calendar boundary.
+    for (let day = 0; day < 365; day++) {
+      const d = new Date(2026, 0, 1 + day);
+      const field = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      controlOf(modal, "Between").texts[1].change(field);
+      await settle();
+      const expected = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime();
+      expect(asked.at(-1)!.to, field).toBe(expected);
+    }
+  });
+
   it("names a grouped row by its bucket and the devices that committed into it", async () => {
     const modal = new HistoryModal(
       new App() as never,

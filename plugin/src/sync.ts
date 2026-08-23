@@ -392,6 +392,12 @@ interface HistoryRow {
 export type HistoryFallback =
   /** The server could not answer the chain, so these are walked rows and cannot be grouped. */
   | "no-index"
+  /**
+   * The same, with a date range asked for. Kept separate because it is the more serious of the
+   * two: the walk reaches back `limit` snapshots from the head and no further, so a range older
+   * than that has nothing to find and an empty list would be a false answer, not a true one.
+   */
+  | "no-range"
   /** The server does not understand the paging cursor, so the listing stops at one page. */
   | "no-cursor";
 
@@ -441,14 +447,17 @@ function isRanged(opts: HistoryOptions): boolean {
   return opts.from !== undefined || opts.to !== undefined;
 }
 
+function inWindow(at: number, opts: HistoryOptions): boolean {
+  // A timestamp nothing could parse is never silently treated as inside the range.
+  if (!Number.isFinite(at)) return false;
+  if (opts.from !== undefined && at < opts.from) return false;
+  return opts.to === undefined || at < opts.to;
+}
+
 function inRange(plan: readonly HistoryRow[], opts: HistoryOptions): HistoryRow[] {
   if (!isRanged(opts)) return [...plan];
-  return plan.filter((row) => {
-    // A bucket is placed by the calendar unit it names, a sync by its own upload time.
-    const at = row.group?.start ?? row.at;
-    if (opts.from !== undefined && at < opts.from) return false;
-    return opts.to === undefined || at < opts.to;
-  });
+  // A bucket is placed by the calendar unit it names, a sync by its own upload time.
+  return plan.filter((row) => inWindow(row.group?.start ?? row.at, opts));
 }
 
 /**
@@ -2189,11 +2198,18 @@ export class SyncEngine {
     // than being slow — so anything short falls back rather than truncating what the user sees.
     if (chain === null) {
       const walked = await this.#listHistoryByWalk(limit, { changes: wantChanges });
-      const listing: HistoryListing = { rows: walked.rows, granularity: "sync", more: walked.more };
+      // The walk has no `uploadedAt` — only each manifest's own `createdAt`, a device clock —
+      // and it reaches back `limit` snapshots from the head and no further. So a range is
+      // filtered on what it does have, which keeps out-of-range rows off the screen, and is
+      // reported as unavailable, because a range older than the walk's reach would otherwise
+      // come back empty and read as "you have no history from then".
+      const rows = isRanged(opts) ? walked.rows.filter((r) => inWindow(Date.parse(r.createdAt), opts)) : walked.rows;
+      const listing: HistoryListing = { rows, granularity: "sync", more: walked.more };
       // Grouping the walk would save nothing: it fetches every manifest to learn each parent,
       // which is the entire cost. So the answer is flat rows and a note saying why, never a
       // shorter list that hides how it was built.
-      if (granularity !== "sync") listing.fallback = "no-index";
+      if (isRanged(opts)) listing.fallback = "no-range";
+      else if (granularity !== "sync") listing.fallback = "no-index";
       return listing;
     }
 
@@ -2306,7 +2322,13 @@ export class SyncEngine {
         seen.add(entry.id);
         entries.push(entry);
       }
-      if (!next.complete) break;
+      if (!next.complete) {
+        // The index has a hole here. If the listing already has everything it will show, the
+        // hole is past the end of it and costs nothing. If it does not, the same rule the first
+        // page follows applies: showing fewer snapshots than exist is worse than being slow, so
+        // hand the whole question to the walk rather than serve a knowingly short list.
+        return this.#chainReachesBack(entries, limit, granularity, opts) ? { entries, chainEnds: false } : null;
+      }
     }
 
     return { entries, chainEnds: previousOf(entries[entries.length - 1]) === null, fallback };

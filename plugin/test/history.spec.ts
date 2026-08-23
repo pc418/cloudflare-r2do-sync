@@ -1311,6 +1311,35 @@ describe("SyncEngine.listHistory paging the chain", () => {
     expect(listing.rows.length).toBeGreaterThan(0);
   });
 
+  it("hands a listing left short by an index hole to the walk", async () => {
+    const heads = await manyCommits(5);
+    server.maxHistoryPage = 2;
+    // The index stops partway down the chain. The first page is fine, a continuation is not.
+    server.unindexed.add(heads[1]);
+
+    const listing = await makeEngine().listHistory(40, { changes: true, granularity: "day" });
+
+    // Serving the prefix would show fewer snapshots than exist while looking like a complete
+    // grouped listing. The walk reaches them, and the listing says grouping was not available.
+    expect(listing.fallback).toBe("no-index");
+    expect(listing.granularity).toBe("sync");
+    expect(listing.rows.length).toBeGreaterThan(2);
+  });
+
+  it("keeps the indexed listing when the hole is past everything it would show", async () => {
+    const heads = await manyCommits(5);
+    server.maxHistoryPage = 2;
+    server.unindexed.add(heads[0]);
+
+    // Two buckets wanted, and the hole is at the far end of the chain — past the end of the
+    // list either way, so re-walking every manifest to reach it would buy nothing.
+    const listing = await makeEngine().listHistory(2, { changes: true, granularity: "day" });
+
+    expect(listing.granularity).toBe("day");
+    expect(listing.fallback).toBeUndefined();
+    expect(listing.more).toBe(true);
+  });
+
   it("throws when two pages do not join up", async () => {
     const heads = await manyCommits(4);
     server.maxHistoryPage = 2;
@@ -1418,6 +1447,38 @@ describe("SyncEngine.listHistory over a date range", () => {
     // snapshots exist past this list" would send the user after rows the range excludes.
     expect(listing.rows).toHaveLength(1);
     expect(listing.more).toBe(false);
+  });
+
+  it("never shows a snapshot outside the range when it had to walk", async () => {
+    const heads = await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+    server.serveHistoryIndex = false;
+
+    const listing = await makeEngine().listHistory(10, {
+      changes: true,
+      from: at(2026, 8, 19, 0),
+    });
+
+    // The walk has no upload times and reaches back only `limit` snapshots, so it cannot answer
+    // a date question — but it must not answer a different one either. Out-of-range rows stay
+    // off the screen, and the listing says the dates were never really searched.
+    expect(listing.fallback).toBe("no-range");
+    expect(listing.rows.map((r) => r.id)).not.toContain(heads[0]);
+  });
+
+  it("does not claim a range is empty when the dates were never searched", async () => {
+    await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+    server.serveHistoryIndex = false;
+
+    const listing = await makeEngine().listHistory(10, {
+      changes: true,
+      from: at(2020, 1, 1),
+      to: at(2020, 2, 1),
+    });
+
+    // Empty, but for a reason the caller has to be able to tell apart from "your vault holds
+    // nothing from then" — which would be a false statement about the user's own history.
+    expect(listing.rows).toEqual([]);
+    expect(listing.fallback).toBe("no-range");
   });
 
   it("says nothing is in an empty range rather than showing the newest history", async () => {
