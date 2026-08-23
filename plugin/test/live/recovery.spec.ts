@@ -279,7 +279,7 @@ describe.skipIf(config === null)("Safety and recovery", () => {
     expect(harness.plugin.settings.protectPercent).toBe(previous);
   });
 
-  it("Snapshots listed in history bounds the walk", async () => {
+  it("Rows listed in history bounds the walk", async () => {
     harness = await published({ "note.md": "one\n" });
     for (const text of ["two\n", "three\n"]) {
       await harness.write("note.md", text);
@@ -287,11 +287,33 @@ describe.skipIf(config === null)("Safety and recovery", () => {
     }
 
     harness.plugin.settings.historyLimit = 1;
+    // Every sync, deliberately: three commits seconds apart are one calendar day, so a grouped
+    // window would show one row whatever the limit said and prove nothing about the limit.
+    harness.plugin.settings.historyGranularity = "sync";
     harness.render();
     await harness.button("Snapshot history").click();
     await settle(500);
 
-    expect(Modal.shown.at(-1)!.contentEl.log.settings).toHaveLength(1);
+    expect(LiveHarness.historyRows(Modal.shown.at(-1)!.contentEl.log)).toHaveLength(1);
+  });
+
+  it("groups the same syncs into a single day when asked to", async () => {
+    harness = await published({ "note.md": "one\n" });
+    for (const text of ["two\n", "three\n"]) {
+      await harness.write("note.md", text);
+      await harness.plugin.syncNow();
+    }
+
+    harness.plugin.settings.historyGranularity = "day";
+    harness.render();
+    await harness.button("Snapshot history").click();
+    await settle(1000);
+
+    const rows = LiveHarness.historyRows(Modal.shown.at(-1)!.contentEl.log);
+    // Three commits in one day collapse to one row, and it says how many syncs it covers
+    // rather than presenting the day's diff as a single sync.
+    expect(rows).toHaveLength(1);
+    expect(rows[0].rendered.desc).toContain("spans 3 syncs");
   });
 });
 
@@ -304,14 +326,15 @@ describe.skipIf(config === null)("Safety and recovery", () => {
 async function openNewestSnapshot(harness: LiveHarness): Promise<{ restore(path: string): Promise<void> }> {
   harness.render();
   await harness.opens(() => harness!.button("Snapshot history").click());
-  await harness.waitFor(() => Modal.shown.at(-1)!.contentEl.log.rows.length > 0, {
-    label: "the history list to load",
-  });
+  await harness.waitFor(
+    () => LiveHarness.historyRows(Modal.shown.at(-1)!.contentEl.log).length > 0,
+    { label: "the history list to load" }
+  );
 
   // The FIRST row, deliberately: the list is newest-first, and `modalButton` scans from the
   // end, which would open the oldest snapshot and quietly test the wrong thing.
   const history = Modal.shown.at(-1)!.contentEl.log;
-  const browse = history.rows[0]?.buttons.find((b) => b.text === "Browse");
+  const browse = LiveHarness.historyRows(history)[0]?.buttons.find((b) => b.text === "Browse");
   if (browse === undefined) {
     throw new Error(`history listed no browsable snapshot: ${history.paragraphs.join(" | ")}`);
   }

@@ -119,25 +119,84 @@ export class FakeServer implements SyncApiLike {
    */
   readonly splices = new Map<string, { spliceParent: string; pruned: number }>();
   readonly historyRequests: number[] = [];
+  /** The cursor each request carried, so a test can assert how a listing paged. */
+  readonly historyCursors: Array<string | undefined> = [];
+  /**
+   * Upload times a test wants to place snapshots on particular days. Anything absent falls back
+   * to the manifest's own creation time, which is what the real index records.
+   */
+  readonly uploadedAt = new Map<string, number>();
+  /**
+   * A Worker predating the paging cursor: it ignores `before` and answers from the head. The
+   * client has to notice that on its own, and say so rather than paging the same rows forever.
+   */
+  ignoreCursor = false;
+  /**
+   * The server's own page cap, which no client can raise. Lowered by a test to make paging
+   * happen over a handful of snapshots instead of five hundred.
+   */
+  maxHistoryPage = 500;
+  /**
+   * Whether the server's index has finished backfilling. True by default, which is the steady
+   * state — and the state in which running off the end of a thinned chain is the ordinary end
+   * of retained history rather than a gap.
+   */
+  indexBackfilled = true;
 
-  async getHistory(limit: number): Promise<HistoryPage | null> {
+  /**
+   * Runs before a listing is answered, so a test can collect a snapshot *between* two pages —
+   * which is the only way to produce a cursor row that existed when the client read it and is
+   * gone by the time it asks to continue from it.
+   */
+  beforeHistory: ((cursor: string | undefined) => void) | null = null;
+
+  async getHistory(limit: number, opts: { before?: string } = {}): Promise<HistoryPage | null> {
+    this.beforeHistory?.(opts.before);
     this.historyRequests.push(limit);
+    this.historyCursors.push(opts.before);
     if (!this.serveHistoryIndex) return null;
+    const max = Math.min(limit, this.maxHistoryPage);
     const entries: HistoryEntry[] = [];
+
     let id = this.head;
-    while (id !== null && entries.length < limit) {
+    // Mirrors the Worker exactly, because the client's `chainEnds` is read off these answers:
+    // a splice into nothing is corruption (a sweep only splices onto a survivor), and the head
+    // is vouched for by nothing, so an unindexed head is divergence rather than an empty vault.
+    let viaSplice = false;
+    const anchored = opts.before !== undefined && !this.ignoreCursor;
+    if (opts.before !== undefined && !this.ignoreCursor) {
+      const from = this.manifests.get(opts.before);
+      if (from === undefined || this.unindexed.has(opts.before)) return { entries, complete: false };
+      viaSplice = this.splices.has(from.id);
+      id = this.splices.get(from.id)?.spliceParent ?? from.parent;
+    }
+
+    while (id !== null && entries.length < max) {
       const m = this.manifests.get(id);
-      if (m === undefined || this.unindexed.has(id)) return { entries, complete: false };
+      if (m === undefined || this.unindexed.has(id)) {
+        // A plain `parent` into nothing is the end of *retained* history once the index is
+        // built: the oldest snapshot a thinned vault keeps names a parent a sweep collected.
+        // An unfinished backfill, a splice into nothing, or a head nothing vouches for are all
+        // holes instead, and have to keep sending the client to the manifests.
+        const end =
+          (anchored || entries.length > 0) &&
+          !viaSplice &&
+          this.indexBackfilled &&
+          !this.unindexed.has(id);
+        return { entries, complete: end };
+      }
       const splice = this.splices.get(m.id) ?? null;
+      const stamped = this.uploadedAt.get(m.id) ?? Date.parse(m.createdAt);
       entries.push({
         id: m.id,
         parent: m.parent,
-        uploadedAt: 1_754_000_000_000 + entries.length,
+        uploadedAt: Number.isFinite(stamped) ? stamped : 1_754_000_000_000,
         device: m.device,
         createdAt: m.createdAt,
         spliceParent: splice?.spliceParent ?? null,
         pruned: splice?.pruned ?? null,
       });
+      viaSplice = splice !== null;
       id = splice?.spliceParent ?? m.parent;
     }
     return { entries, complete: true };

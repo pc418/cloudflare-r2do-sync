@@ -101,6 +101,23 @@ export interface HistoryPage {
   complete: boolean;
 }
 
+/**
+ * An indexed snapshot as the chain walk reads it: the row, plus the splice it may carry.
+ *
+ * A type alias rather than an interface on purpose — `sql.exec<T>` constrains `T` to
+ * `Record<string, SqlStorageValue>`, and only an alias of an object literal carries the implicit
+ * index signature that satisfies it.
+ */
+type ChainRow = {
+  id: string;
+  parent: string | null;
+  uploaded_at: number;
+  device: string | null;
+  created_at: string | null;
+  splice_parent: string | null;
+  spliced: number | null;
+};
+
 /** Manifests one `advanceHistoryDetail` call reads before handing control back. */
 const DEFAULT_HISTORY_DETAIL_CHUNK = 25;
 
@@ -603,36 +620,50 @@ export class VaultLock extends DurableObject<Env> {
    *
    * Reads no R2. A row the index does not reach ends the walk with `complete: false` rather
    * than pretending the vault's history stops there.
+   *
+   * `opts.before` continues an earlier page. It names a row the client already holds, and the
+   * server resolves that row's own link — never a start id from the client — so a continuation
+   * cannot be handed a chain whose links do not join up, which is the same reason a page is
+   * validated as a chain at all. A cursor row that is gone (a sweep can collect one between two
+   * pages) is an incomplete page, not an error: it is a listing the client must not read as the
+   * end of history.
    */
-  listHistory(limit: number, opts: { splices?: boolean } = {}): HistoryPage {
+  listHistory(limit: number, opts: { splices?: boolean; before?: string } = {}): HistoryPage {
     const max = Math.max(1, Math.min(limit, MAX_HISTORY_PAGE));
     const entries: HistoryEntry[] = [];
     const seen = new Set<string>();
     let id = this.#storedHead();
+
+    // Whether the link just followed was a splice. A splice is written by a sweep and always
+    // names a survivor, so a splice leading nowhere is corruption. A plain `parent` leading
+    // nowhere is the ordinary end of retained history — see `#reachedRetainedEnd`.
+    let viaSplice = false;
+    // Whether anything vouches for the id being looked up. A cursor was itself found in the
+    // index before its link was followed, and every id past the first was read off a row. The
+    // *head* is vouched for by nothing: it comes from the head pointer, so a head that is not
+    // indexed is index/R2 divergence — never a vault that has run out of history.
+    const anchored = opts.before !== undefined;
+
+    if (opts.before !== undefined) {
+      const from = this.#chainRow(opts.before);
+      if (from === undefined) return { entries, complete: false };
+      // Same rule the uncursored walk applies at a gap: a client that did not ask for splices
+      // reads `parent` as "the next row", so it must not be stepped over a collected stretch.
+      if (from.splice_parent !== null && opts.splices !== true) return { entries, complete: false };
+      seen.add(opts.before);
+      viaSplice = from.splice_parent !== null;
+      id = from.splice_parent ?? from.parent;
+    }
 
     while (id !== null && entries.length < max) {
       // The one-use rule makes a repeat impossible unless the index itself is corrupt, and a
       // walk that trusted it anyway would spin until the limit. Same guard as the client's.
       if (seen.has(id)) return { entries, complete: false };
       seen.add(id);
-      const row = this.ctx.storage.sql
-        .exec<{
-          id: string;
-          parent: string | null;
-          uploaded_at: number;
-          device: string | null;
-          created_at: string | null;
-          splice_parent: string | null;
-          spliced: number | null;
-        }>(
-          `SELECT i.id, i.parent, i.uploaded_at, i.device, i.created_at, s.splice_parent, s.spliced
-             FROM manifest_index i
-             LEFT JOIN manifest_splices s ON s.survivor_id = i.id
-            WHERE i.id = ?`,
-          id
-        )
-        .toArray()[0];
-      if (row === undefined) return { entries, complete: false };
+      const row = this.#chainRow(id);
+      if (row === undefined) {
+        return { entries, complete: this.#reachedRetainedEnd(viaSplice, anchored || entries.length > 0) };
+      }
       entries.push({
         id: row.id,
         parent: row.parent,
@@ -647,9 +678,49 @@ export class VaultLock extends DurableObject<Env> {
       // up to the gap and says the listing is short — which is exactly what it is, and what
       // sends such a client to walk the manifests itself rather than believe history ends.
       if (row.splice_parent !== null && opts.splices !== true) return { entries, complete: false };
+      viaSplice = row.splice_parent !== null;
       id = row.splice_parent ?? row.parent;
     }
     return { entries, complete: true };
+  }
+
+  /**
+   * Whether a link into nothing is the end of retained history rather than a hole in the index.
+   *
+   * The oldest snapshot the vault still keeps names a `parent` a sweep collected long ago, and
+   * that parent is gone from `manifest_index` — so the walk always runs off the end of a thinned
+   * chain. Calling that "incomplete" made every client refuse the whole page and walk the
+   * manifests instead, which is the opposite of what the index exists for: on a mature vault the
+   * fast path never engaged at all.
+   *
+   * Two conditions make the distinction safe. The backfill must be finished — while it is still
+   * running, a missing row means the index has not reached that far, which genuinely is a gap.
+   * And the link followed must be a plain `parent`: a sweep re-splices survivors over every
+   * stretch it collects *mid-chain*, so only an open run at the chain's end is left dangling
+   * (`applyGcSplices` drops it rather than splicing it onto nothing). A `splice_parent` naming a
+   * snapshot that is not indexed is therefore corruption, and must keep failing closed.
+   *
+   * `anchored` is the third: something has to vouch for the id that came up missing. A cursor
+   * was found in the index before its link was followed, and every id past the first was read
+   * off a row that exists. The *head* is vouched for by nothing — so an unindexed head is
+   * index/R2 divergence, and calling it "the end of retained history" would hand the client an
+   * empty, complete page, which `#collectChain` reads as a vault with no snapshots at all.
+   */
+  #reachedRetainedEnd(viaSplice: boolean, anchored: boolean): boolean {
+    return anchored && !viaSplice && this.#gcIndexReady();
+  }
+
+  /** One indexed snapshot with the link it is actually followed by. Undefined when unindexed. */
+  #chainRow(id: string): ChainRow | undefined {
+    return this.ctx.storage.sql
+      .exec<ChainRow>(
+        `SELECT i.id, i.parent, i.uploaded_at, i.device, i.created_at, s.splice_parent, s.spliced
+           FROM manifest_index i
+           LEFT JOIN manifest_splices s ON s.survivor_id = i.id
+          WHERE i.id = ?`,
+        id
+      )
+      .toArray()[0];
   }
 
   /**

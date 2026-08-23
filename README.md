@@ -275,6 +275,11 @@ curl -X POST "$WORKER_URL/api/tokens" -H "authorization: Bearer $ADMIN_TOKEN" \
 - **Preview, history, log.** **Preview sync** shows what a pass would change without changing
   anything; **Snapshot history** browses and restores past snapshots; **Sync log** exports
   recent passes to a note. **Sync hotkey** binds "Sync now" (`⇧⌘S` offered when free).
+- **History by day, week, or every sync**, with an optional date range. A grouped row is one
+  calendar day (or week): its newest snapshot, compared against the newest of the day before,
+  and labelled with how many syncs that covers. Grouping is what makes the window reach months
+  instead of days on a vault that syncs often — a day costs one request, a sync costs one each.
+  Browsing and restoring from a grouped row works exactly as from a single snapshot.
 - **Forcing a direction**, when one side is simply wrong: **Pull remote over local** keeps
   unpublished local changes as `.conflict-…` copies; **Push local over remote** publishes
   without merging. Both preview what they will touch and require a typed confirmation, and
@@ -293,7 +298,7 @@ curl -X POST "$WORKER_URL/api/tokens" -H "authorization: Bearer $ADMIN_TOKEN" \
 |---|---|---|
 | **Parallel lanes** | 4 | Files processed at once; higher is faster but heavier on a phone or slow link |
 | **Sync log length** | 50 | Passes kept for troubleshooting |
-| **Snapshots listed in history** | 40 | Each one is a request |
+| **Rows listed in history** | 40 | Each one is a request. A row is one sync, one day or one week, whichever the history window is grouped by |
 | **Automatic retries** | 3 | Backoff after a failed pass; a *halted* sync is never retried — it needs a person |
 | **What sync announces** | Activity | One ordered choice: **All** (every pass), **Activity** (only passes that changed something), **Problems** (conflicts and errors), **Silent** (nothing). State still shows in the status bar and the sync log at every level — only the pop-ups stop |
 | **Say when a sync starts** | off | The "syncing…" pop-up while a sync *you* started runs. Separate from the level above because it answers your tap, so it works at every level. Turn it on if you sync by hand — below **All** it is the only reply a manual sync that found nothing gives you |

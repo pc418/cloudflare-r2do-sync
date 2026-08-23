@@ -290,6 +290,9 @@ export interface StartOptions {
   holdLayout?: boolean;
 }
 
+/** The history window's own controls, which share a render log with its snapshot rows. */
+const HISTORY_CONTROLS = new Set(["Group by", "Between"]);
+
 export class LiveHarness {
   readonly app: LiveApp;
   readonly plugin: LogSyncPlugin;
@@ -384,6 +387,17 @@ export class LiveHarness {
     const tab = this.recorded.settingTabs[0];
     if (tab === undefined) throw new Error("the plugin registered no settings tab");
     return tab;
+  }
+
+  /**
+   * The snapshot rows in a history window, with its controls filtered out.
+   *
+   * The Group by and Between controls are `Setting`s in the same render log as the rows, so
+   * `log.rows[0]` is a control rather than the newest snapshot — a test reading it directly
+   * would open the wrong thing, or quietly pass on an empty list.
+   */
+  static historyRows(log: RenderLog): Setting[] {
+    return log.rows.filter((r) => !HISTORY_CONTROLS.has(r.rendered.name));
   }
 
   /** Renders the settings page and returns what it drew. */

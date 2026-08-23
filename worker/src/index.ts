@@ -264,7 +264,14 @@ app.get("/api/history", accessAuth, async (c) => {
   // does not ask is one that reads `parent` as "the next row", and gets the chain cut at the
   // first gap instead of a page whose links do not join up.
   const splices = c.req.query("splices") === "1";
-  return c.json(await vault(c.env).listHistory(limit, { splices }));
+  // Continues an earlier page. Validated like every other manifest id on this surface — the
+  // value reaches a SQL parameter either way, but a route that accepts an id shape it does not
+  // recognise is one whose errors stop describing the vault.
+  const before = c.req.query("before");
+  if (before !== undefined && !ULID_RE.test(before)) {
+    return c.json(errJson("bad_cursor", "before must be a manifest id"), 422);
+  }
+  return c.json(await vault(c.env).listHistory(limit, { splices, before }));
 });
 
 app.post("/api/history/index", adminAuth, async (c) => {

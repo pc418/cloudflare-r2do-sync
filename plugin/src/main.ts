@@ -63,9 +63,17 @@ import {
   type SnapshotChange,
   type SnapshotChanges,
   type SnapshotInfo,
+  type HistoryListing,
+  type HistoryOptions,
   type SyncPreview,
   type SyncResult,
 } from "./sync";
+import {
+  HISTORY_GRANULARITIES,
+  isHistoryGranularity,
+  type HistoryGranularity,
+  type SnapshotGroup,
+} from "./history-groups";
 import type { FileEntry } from "./types";
 import { decodeText, type ConflictMode } from "./merge";
 import {
@@ -166,8 +174,14 @@ export interface Settings {
   lanes: number;
   /** Passes kept in the log. Larger means a longer trail and a larger `data.json`. */
   logEntries: number;
-  /** Snapshots the history browser lists — each one is a manifest fetch. */
+  /** Rows the history browser lists — one per sync, per day or per week. */
   historyLimit: number;
+  /**
+   * The unit those rows count in. Device-local, like `lanes` and the notice level: it is a
+   * view preference, and "days on my phone, every sync on my desktop" is an ordinary thing to
+   * want. `historyLimit` stays shared because it is a cost, not a view.
+   */
+  historyGranularity: HistoryGranularity;
   /** Automatic retries after a failed pass, before it is reported and left alone. */
   retryAttempts: number;
   /** Folder the exported report is written to. Empty means the vault root. */
@@ -248,6 +262,9 @@ export const DEFAULT_SETTINGS: Settings = {
   lanes: DEFAULT_LANES,
   logEntries: MAX_LOG_ENTRIES,
   historyLimit: 40,
+  // Days, because a vault committing a dozen times a day buries its own past under forty sync
+  // rows — about three days of it. Every sync is one click away in the window.
+  historyGranularity: "day",
   retryAttempts: 3,
   logNoteFolder: "",
   noticePrefix: "Cloudflare R2DO Sync",
@@ -542,6 +559,11 @@ export default class LogSyncPlugin extends Plugin {
     // toggle. Preserve every custom exclude list verbatim.
     if (this.settings.excludes === ".obsidian/**\n.trash/**") {
       this.settings.excludes = ".trash/**";
+    }
+    // A hand-edited or downgraded `data.json` can name a unit this build does not have. Left
+    // alone it would fall through to weeks and silently show a history nobody asked for.
+    if (!isHistoryGranularity(this.settings.historyGranularity)) {
+      this.settings.historyGranularity = DEFAULT_SETTINGS.historyGranularity;
     }
     // The five per-category notice booleans became one level in 0.7.2. Resolved from the SAVED
     // object rather than from `this.settings`, because the spread above has already merged the
@@ -1328,7 +1350,19 @@ export default class LogSyncPlugin extends Plugin {
       inspectRestore: (id, path) => engine.inspectRestore(id, path),
       restoreFile: (id, path, opts) => engine.restoreFile(id, path, opts),
       restoreAll: (id) => this.#withVaultRewrite(RESTORE_ALL_BLOCK, () => engine.restoreAll(id)),
+      syncsPath: (path) => engine.syncsPath(path),
+      restoreDestinationBlock: (path) => engine.restoreDestinationBlock(path),
       historyLimit: this.settings.historyLimit,
+      granularity: this.settings.historyGranularity,
+      // Remembered across openings, because the unit someone reads history in is a standing
+      // preference. Kept device-local for the same reason the notice level is: "days on my
+      // phone, every sync on my desktop" is ordinary, and a shared value cannot say it.
+      // `#persist`, never `saveSettings`: this is device-local and saveSettings retires the
+      // scheduler and schedules a shared-settings push, neither of which a dropdown warrants.
+      rememberGranularity: (g) => {
+        this.settings.historyGranularity = g;
+        void this.#persist();
+      },
       syncNow: () => this.syncNow(),
     }).open();
   }
@@ -2728,7 +2762,7 @@ class PreviewModal extends Modal {
  * them without a whole plugin behind them. `SyncEngine` supplies all but the last two.
  */
 export interface HistoryDeps {
-  listHistory(limit: number, opts?: { changes?: boolean }): Promise<SnapshotInfo[]>;
+  listHistory(limit: number, opts?: HistoryOptions): Promise<HistoryListing>;
   snapshotFiles(id: string): Promise<Record<string, FileEntry>>;
   inspectRestore(id: string, path: string): Promise<RestoreInspection>;
   restoreFile(
@@ -2737,14 +2771,35 @@ export interface HistoryDeps {
     opts?: { destination?: string; overwrite?: boolean }
   ): Promise<RestoreOutcome>;
   restoreAll(id: string): Promise<{ written: number; removed: number }>;
-  /** How many snapshots to list; each one is a manifest fetch. */
+  /** Whether this device syncs a path, so a restore onto one it does not can say so. */
+  syncsPath(path: string): boolean;
+  /** Why a destination is closed, so the window asks for another instead of writing into it. */
+  restoreDestinationBlock(path: string): string | null;
+  /** How many rows to list; each one is a manifest fetch. */
   historyLimit: number;
+  /** The unit the window opens in. */
+  granularity: HistoryGranularity;
+  /** Remembers a granularity the user picked, so the window reopens the way they left it. */
+  rememberGranularity(granularity: HistoryGranularity): void;
   /** Publishes a restored vault, so the snapshot the user chose becomes the new head. */
   syncNow(): Promise<void>;
 }
 
 /** How many changed paths a history row previews before deferring to the snapshot window. */
 const CHANGE_PREVIEW = 5;
+
+/**
+ * Local midnight of the day after the one this instant falls in.
+ *
+ * Built from calendar components rather than by adding 86,400,000 ms, because on a
+ * daylight-saving transition a day is not that long: spring forward and the arithmetic lands an
+ * hour into the *next* date, autumn back and it stops an hour short of the one the user named.
+ * A history range is explicitly a device-local calendar range, so its end has to be one too.
+ */
+function nextLocalDay(at: number): number {
+  const d = new Date(at);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime();
+}
 
 const UNKNOWN_CHANGES: Record<ChangesUnknown, string> = {
   unreadable: "changes unknown — this snapshot cannot be read with this device's key",
@@ -2804,68 +2859,260 @@ export function describeChangedFile(c: SnapshotChange): string {
   return `${verb} · ${c.path} · ${amount}`;
 }
 
+/** What a grouped row is called: the calendar unit it stands for, in the reader's own locale. */
+export function describeGroup(group: SnapshotGroup): string {
+  const start = new Date(group.start);
+  if (group.granularity === "week") {
+    return `Week of ${start.toLocaleDateString(undefined, {
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    })}`;
+  }
+  return start.toLocaleDateString(undefined, {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
+
+/** The devices behind a row, however many committed into it. */
+function describeDevices(snap: SnapshotInfo): string {
+  const devices = snap.group?.devices ?? [];
+  if (devices.length === 0) return snap.device;
+  return devices.join(", ");
+}
+
+/** A `yyyy-mm-dd` field's value as a local instant, or null when it is empty or nonsense. */
+export function parseDateField(value: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  if (m === null) return null;
+  // Built from local components on purpose: the user typed a day in their own calendar, and
+  // `new Date("2026-08-20")` would parse it as UTC midnight and shift it for half the world.
+  const at = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return Number.isNaN(at.getTime()) ? null : at.getTime();
+}
+
+const GRANULARITY_LABELS: Record<HistoryGranularity, string> = {
+  sync: "Every sync",
+  day: "Day",
+  week: "Week",
+};
+
 export class HistoryModal extends Modal {
+  #granularity: HistoryGranularity;
+  #from = "";
+  #to = "";
+  /** Redrawn on every control change; the controls above it are built once and left alone. */
+  #listEl: HTMLElement | null = null;
+  /** Guards against a slow listing landing after a newer one the user asked for. */
+  #generation = 0;
+
   constructor(
     app: App,
     private readonly deps: HistoryDeps
   ) {
     super(app);
+    this.#granularity = deps.granularity;
   }
 
   async onOpen(): Promise<void> {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: "Snapshot history" });
-    const status = contentEl.createEl("p", { text: "Loading…" });
+    this.#renderControls(contentEl);
+    this.#listEl = contentEl.createDiv();
+    await this.#renderList();
+  }
 
-    let history: SnapshotInfo[];
+  #renderControls(contentEl: HTMLElement): void {
+    // A block body, not an expression one: Obsidian's fluent setters return the component,
+    // which is structurally thenable and trips the floating-promise lint.
+    new Setting(contentEl)
+      .setName("Group by")
+      .setDesc(
+        "A day or a week is one row: its newest snapshot, compared against the one before " +
+          "the group. Fewer rows reach much further back, and cost one request each."
+      )
+      .addDropdown((d) => {
+        for (const g of HISTORY_GRANULARITIES) d.addOption(g, GRANULARITY_LABELS[g]);
+        d.setValue(this.#granularity);
+        d.onChange((value) => {
+          if (!isHistoryGranularity(value)) return;
+          this.#granularity = value;
+          this.deps.rememberGranularity(value);
+          void this.#renderList();
+        });
+      });
+
+    // Deliberately not remembered: a range is a question being asked now, and restoring last
+    // week's on the next opening would silently hide history the user did not mean to hide.
+    new Setting(contentEl)
+      .setName("Between")
+      .setDesc("Optional. Leave both empty for the most recent history.")
+      .addText((t) => {
+        t.inputEl.type = "date";
+        t.setPlaceholder("from");
+        t.onChange((value) => {
+          this.#setRange("from", value);
+        });
+      })
+      .addText((t) => {
+        t.inputEl.type = "date";
+        t.setPlaceholder("to");
+        t.onChange((value) => {
+          this.#setRange("to", value);
+        });
+      });
+  }
+
+  /**
+   * Takes a date field's new value, and relists only if it changed what the list would be.
+   *
+   * A field can report every keystroke, and a half-typed date parses to nothing — so without
+   * this, typing `2026-08-20` would fire a run of identical unfiltered listings, each one a
+   * request, before the one that matters.
+   */
+  #setRange(which: "from" | "to", value: string): void {
+    const before = parseDateField(which === "from" ? this.#from : this.#to);
+    if (which === "from") this.#from = value;
+    else this.#to = value;
+    if (parseDateField(value) === before) return;
+    void this.#renderList();
+  }
+
+  async #renderList(): Promise<void> {
+    const list = this.#listEl;
+    if (list === null) return;
+    const generation = ++this.#generation;
+    list.empty();
+    const status = list.createEl("p", { text: "Loading…" });
+
+    const from = parseDateField(this.#from);
+    const to = parseDateField(this.#to);
+    const opts: HistoryOptions = { changes: true, granularity: this.#granularity };
+    if (from !== null) opts.from = from;
+    // The field names a day the user wants included, so the range runs to the end of it.
+    if (to !== null) opts.to = nextLocalDay(to);
+
+    let listing: HistoryListing;
     try {
-      history = await this.deps.listHistory(this.deps.historyLimit, { changes: true });
+      listing = await this.deps.listHistory(this.deps.historyLimit, opts);
     } catch (e) {
+      if (generation !== this.#generation) return;
       status.setText(`Could not read history: ${message(e)}`);
       return;
     }
+    // A slower earlier request landing after a newer one would redraw the list the user just
+    // navigated away from, under controls that no longer describe it.
+    if (generation !== this.#generation) return;
 
-    if (history.length === 0) {
-      status.setText("The remote has no snapshots yet.");
+    if (listing.rows.length === 0) {
+      // Three different truths, and only one of them is "this vault is new". Saying that for
+      // either of the others would tell someone their history is gone when it is not.
+      status.setText(this.#emptyLine(listing, from !== null || to !== null));
       return;
     }
-    status.setText(
-      `Newest first, with what each one changed. Older snapshots are removed by the server's ` +
-        `retention policy, so this list can be shorter than the vault's full history.`
-    );
+    status.setText(this.#summaryLine(listing));
 
-    for (const snap of history) {
-      const when = new Date(snap.createdAt).toLocaleString();
-      const summary = snap.changes === undefined ? null : describeChanges(snap.changes);
-      const setting = new Setting(contentEl)
-        .setName(`${when} — ${snap.device}`)
-        .setDesc(
-          snap.readable
-            ? `${summary ?? `${snap.fileCount} file(s)`} · ${snap.fileCount} file(s) total · ${shortSnapshot(snap.id)}`
-            : `unreadable with this device's key · ${shortSnapshot(snap.id)}`
-        );
-      if (!snap.readable) continue;
-      setting.addButton((b) =>
-        b.setButtonText("Browse").onClick(() => {
-          this.close();
-          new SnapshotModal(this.app, this.deps, snap).open();
-        })
+    for (const snap of listing.rows) this.#renderRow(list, snap);
+
+    if (listing.more) {
+      list.createEl("p", {
+        text:
+          "Older snapshots exist past this list. Raise “rows listed in history” in settings, " +
+          "or narrow the dates, to reach them.",
+      });
+    }
+  }
+
+  /** Why a listing came back with nothing, distinguishing the reasons rather than guessing. */
+  #emptyLine(listing: HistoryListing, ranged: boolean): string {
+    // "Nothing in that range" is a claim about the vault. It cannot be made when the dates were
+    // never actually searched — only the most recent syncs were, and the range may be older.
+    if (listing.fallback === "no-range") {
+      return (
+        "This vault's history index cannot be read, so dates could not be searched. None of " +
+        "the most recent syncs fall in that range; older ones were not looked at."
       );
+    }
+    if (ranged) return "No snapshots in that range.";
+    // Snapshots exist, but not enough of the chain was reachable to complete a single bucket —
+    // a bucket is only shown once its older edge is known. Rare, and never "this vault is new".
+    if (listing.more) {
+      return (
+        `There is history here, but this window could not reach far enough back to complete a ` +
+        `whole ${listing.granularity}. Switch to “Every sync” to see it.`
+      );
+    }
+    return "The remote has no snapshots yet.";
+  }
 
-      // The changed paths themselves, capped: the whole point is seeing what moved without
-      // opening anything, but a window of forty snapshots cannot carry forty full file lists.
-      const changes = snap.changes;
-      if (changes === undefined || "unknown" in changes || changes.files.length === 0) continue;
-      const list = contentEl.createDiv();
-      for (const change of changes.files.slice(0, CHANGE_PREVIEW)) {
-        list.createEl("p", { text: describeChangedFile(change) });
-      }
-      if (changes.files.length > CHANGE_PREVIEW) {
-        list.createEl("p", {
-          text: `…and ${changes.files.length - CHANGE_PREVIEW} more — Browse to see them all.`,
-        });
-      }
+  /** What the list is, including anything it could not do. Never silently a different thing. */
+  #summaryLine(listing: HistoryListing): string {
+    const unit =
+      listing.granularity === "sync"
+        ? "Newest first, with what each sync changed."
+        : `Newest first, one row per ${listing.granularity}, with what each one changed.`;
+    const retention =
+      " Older snapshots are removed by the server's retention policy, so this list can be " +
+      "shorter than the vault's full history.";
+    if (listing.fallback === "no-range") {
+      return (
+        `${unit} This vault's history index cannot be read, so dates could not be searched: ` +
+        `only the most recent syncs were looked at, and anything older than those is not shown ` +
+        `whether or not it falls in the range.${retention}`
+      );
+    }
+    if (listing.fallback === "no-index") {
+      return (
+        `${unit} Grouping needs the server's history index, which this vault has not finished ` +
+        `building, so every sync is listed instead.${retention}`
+      );
+    }
+    if (listing.fallback === "no-cursor") {
+      return (
+        `${unit} This server is too old to page further back, so the list stops at its first ` +
+        `page.${retention}`
+      );
+    }
+    return unit + retention;
+  }
+
+  #renderRow(list: HTMLElement, snap: SnapshotInfo): void {
+    const name =
+      snap.group === undefined
+        ? `${new Date(snap.createdAt).toLocaleString()} — ${snap.device}`
+        : `${describeGroup(snap.group)} — ${describeDevices(snap)}`;
+    const summary = snap.changes === undefined ? null : describeChanges(snap.changes);
+    const setting = new Setting(list)
+      .setName(name)
+      .setDesc(
+        snap.readable
+          ? `${summary ?? `${snap.fileCount} file(s)`} · ${snap.fileCount} file(s) total · ${shortSnapshot(snap.id)}`
+          : `unreadable with this device's key · ${shortSnapshot(snap.id)}`
+      );
+    if (!snap.readable) return;
+    setting.addButton((b) => {
+      b.setButtonText("Browse").onClick(() => {
+        this.close();
+        new SnapshotModal(this.app, this.deps, snap).open();
+      });
+    });
+
+    // The changed paths themselves, capped: the whole point is seeing what moved without
+    // opening anything, but a window of forty rows cannot carry forty full file lists.
+    const changes = snap.changes;
+    if (changes === undefined || "unknown" in changes || changes.files.length === 0) return;
+    const files = list.createDiv();
+    for (const change of changes.files.slice(0, CHANGE_PREVIEW)) {
+      files.createEl("p", { text: describeChangedFile(change) });
+    }
+    if (changes.files.length > CHANGE_PREVIEW) {
+      files.createEl("p", {
+        text: `…and ${changes.files.length - CHANGE_PREVIEW} more — Browse to see them all.`,
+      });
     }
   }
 
@@ -2982,7 +3229,11 @@ export class SnapshotModal extends Modal {
       new Notice(`${path} is already identical to this snapshot — nothing to restore`);
       return;
     }
-    if (seen.current === "absent") {
+    // A snapshot can hold a file whose own path is a closed destination. Nothing is there to
+    // preserve, but writing in place is refused — so the window has to ask where to put it
+    // rather than hand back a throw the user cannot act on.
+    const blocked = this.deps.restoreDestinationBlock(path);
+    if (seen.current === "absent" && blocked === null) {
       // Bound to "nothing was there", so a file that appears in the meantime is not clobbered
       // by a decision taken before it existed.
       await this.#run(path, { expectedHash: seen.currentHash });
@@ -2991,6 +3242,7 @@ export class SnapshotModal extends Modal {
     new RestoreDestinationModal(this.app, {
       path,
       inspection: seen,
+      blocked,
       onRestore: (choice) => this.#run(path, choice),
     }).open();
   }
@@ -3001,7 +3253,11 @@ export class SnapshotModal extends Modal {
   ): Promise<void> {
     try {
       const out = await this.deps.restoreFile(this.snap.id, path, choice);
-      new Notice(describeRestore(out));
+      // A restore no longer asks the sync policy for permission, so the policy has to be
+      // reported instead: a file written onto a path this device does not scan is never
+      // published, and "Restored" alone would let the user assume it now is.
+      const local = out.kind !== "identical" && !this.deps.syncsPath(out.path);
+      new Notice(describeRestore(out) + (local ? unsyncedPathNote(out.path) : ""), local ? 10_000 : undefined);
     } catch (e) {
       new Notice(`Could not restore ${path}: ${message(e)}`, 10_000);
     }
@@ -3056,6 +3312,20 @@ export function unsyncedWarning(unsyncedEdits: boolean): string {
         "permanent.";
 }
 
+/**
+ * The caveat on a restore that landed somewhere this device does not sync.
+ *
+ * Said plainly rather than dressed as a warning: the write succeeded and the file is there. What
+ * the user cannot know without being told is that nothing will ever publish it, so it will not
+ * appear on another device and will not survive a fresh install of the vault.
+ */
+export function unsyncedPathNote(path: string): string {
+  return (
+    ` — but this device does not sync ${path}, so the file stays on this device only and is ` +
+    `never published.`
+  );
+}
+
 /** What a finished restore did, in the words the user needs to find the file afterwards. */
 export function describeRestore(out: RestoreOutcome): string {
   switch (out.kind) {
@@ -3084,6 +3354,8 @@ export class RestoreDestinationModal extends Modal {
     private readonly opts: {
       path: string;
       inspection: RestoreInspection;
+      /** Why the original path cannot be written to, when that is why this window is open. */
+      blocked?: string | null;
       onRestore: (choice: {
         destination?: string;
         overwrite?: boolean;
@@ -3099,10 +3371,18 @@ export class RestoreDestinationModal extends Modal {
     const { path, inspection } = this.opts;
     contentEl.empty();
     contentEl.createEl("h2", { text: `Restore ${path}` });
-    contentEl.createEl("p", {
-      text: `A different version of this file is at ${path} right now.`,
-    });
-    contentEl.createEl("p", { text: unsyncedWarning(inspection.unsyncedEdits) });
+    const blocked = this.opts.blocked ?? null;
+    if (blocked !== null) {
+      // Not "a different version is here" — nothing may be written here at all, whatever is or
+      // is not on disk. Saying which it is decides whether the overwrite button makes sense.
+      contentEl.createEl("p", { text: `${path} cannot be written to: ${blocked}.` });
+      contentEl.createEl("p", { text: "Choose somewhere else to put the restored copy." });
+    } else {
+      contentEl.createEl("p", {
+        text: `A different version of this file is at ${path} right now.`,
+      });
+      contentEl.createEl("p", { text: unsyncedWarning(inspection.unsyncedEdits) });
+    }
 
     let destination = inspection.suggestion;
     new Setting(contentEl)
@@ -3128,7 +3408,13 @@ export class RestoreDestinationModal extends Modal {
             await this.opts.onRestore({ destination });
           })
       )
-      .addButton((b) =>
+      .addButton((b) => {
+        // Replacing the file in place is precisely what a closed destination forbids, so the
+        // button is not offered at all rather than offered and then refused by the engine.
+        if (blocked !== null) {
+          b.setButtonText("Replace current file").setDisabled(true);
+          return;
+        }
         b
           .setButtonText("Replace current file")
           .setWarning()
@@ -3157,8 +3443,8 @@ export class RestoreDestinationModal extends Modal {
                 });
               },
             }).open();
-          })
-      )
+          });
+      })
       .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
   }
 
@@ -4896,8 +5182,10 @@ export class LogSyncSettingTab extends PluginSettingTab {
       );
 
     this.#number(containerEl, {
-      name: "Snapshots listed in history",
-      desc: "How far back the history browser walks (1–200). Each one is a request.",
+      name: "Rows listed in history",
+      desc:
+        "How many rows the history browser lists (1–200). Each one is a request. A row is one " +
+        "sync, one day or one week, whichever the window is grouped by.",
       value: this.plugin.settings.historyLimit,
       range: "1–200",
       accept: (n) => n >= 1 && n <= 200,

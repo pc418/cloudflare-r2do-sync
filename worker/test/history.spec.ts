@@ -34,6 +34,17 @@ async function history(limit?: number): Promise<Response> {
   return SELF.fetch(`${BASE}/api/history${q}`, authed(token));
 }
 
+interface Page {
+  complete: boolean;
+  entries: Array<{ id: string; parent: string | null; spliceParent?: string | null; pruned?: number | null }>;
+}
+
+async function page(query: string): Promise<Page> {
+  const res = await SELF.fetch(`${BASE}/api/history?${query}`, authed(token));
+  if (res.status !== 200) throw new Error(`history failed: ${res.status} ${await res.text()}`);
+  return (await res.json()) as Page;
+}
+
 function lockStub(): DurableObjectStub<VaultLock> {
   return env.VAULT_LOCK.get(env.VAULT_LOCK.idFromName("default")) as DurableObjectStub<VaultLock>;
 }
@@ -87,14 +98,18 @@ describe("GET /api/history", () => {
     const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
     const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
 
-    // A vault whose older history predates the index: the row is simply not there. Reporting
+    // A vault whose older history predates the index: the row is simply not there, and the
+    // backfill has not finished, so nothing can vouch for what is behind it. Reporting
     // `complete: true` would tell the client the vault has one snapshot, which is a lie about
     // the user's own history — the same mistake as reading a 5xx as a 404.
+    //
+    // The unfinished backfill is the whole premise and has to be set up, not assumed: once it
+    // *is* finished, a row that is not there was collected, and the walk has reached the end of
+    // retained history rather than a hole. That case is its own test.
     await runInDurableObject(lockStub(), (lock: VaultLock) => {
-      (lock as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
-        "DELETE FROM manifest_index WHERE id = ?",
-        a
-      );
+      const ctx = (lock as unknown as { ctx: DurableObjectState }).ctx;
+      ctx.storage.sql.exec("DELETE FROM manifest_index WHERE id = ?", a);
+      ctx.storage.sql.exec("DELETE FROM meta WHERE key = ?", "gc_index_backfilled");
     });
 
     const body = (await (await history()).json()) as { complete: boolean; entries: Array<{ id: string }> };
@@ -132,6 +147,164 @@ describe("GET /api/history", () => {
 
   it("requires an access token", async () => {
     expect((await SELF.fetch(`${BASE}/api/history`)).status).toBe(401);
+  });
+
+  it("continues from a cursor without repeating or skipping a snapshot", async () => {
+    const h = await seedBlob("one");
+    let head: string | null = null;
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      head = await publish(makeManifest({ parent: head, files: { "a.md": { h } } }), head);
+      ids.push(head);
+    }
+    const newestFirst = [...ids].reverse();
+
+    const first = await page("limit=2");
+    expect(first.entries.map((e) => e.id)).toEqual(newestFirst.slice(0, 2));
+
+    // The cursor names a row the client already holds; the server resolves that row's own link
+    // rather than taking a start id, so the seam cannot be handed a chain that does not join.
+    const second = await page(`limit=2&before=${first.entries[1].id}`);
+    expect(second.entries.map((e) => e.id)).toEqual(newestFirst.slice(2, 4));
+    expect(second.complete).toBe(true);
+
+    const third = await page(`limit=2&before=${second.entries[1].id}`);
+    expect(third.entries.map((e) => e.id)).toEqual(newestFirst.slice(4));
+    // Ran out of chain rather than out of limit, and said so by ending with a null link.
+    expect(third.entries[0].parent).toBeNull();
+    expect(third.complete).toBe(true);
+  });
+
+  it("is empty and complete when the cursor is the last snapshot", async () => {
+    const h = await seedBlob("one");
+    const only = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+
+    // Nothing older exists. That is a finished listing, not a broken one.
+    expect(await page(`before=${only}`)).toEqual({ entries: [], complete: true });
+  });
+
+  it("reports an incomplete page when the cursor row itself was collected", async () => {
+    const h = await seedBlob("one");
+    const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+    const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
+
+    await runInDurableObject(lockStub(), (lock: VaultLock) => {
+      (lock as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
+        "DELETE FROM manifest_index WHERE id = ?",
+        b
+      );
+    });
+
+    // A sweep can collect a cursor row between two pages. That is not an error and not
+    // evidence about history — it is a page the client must not treat as the end, so it says
+    // so and the client walks instead.
+    expect(await page(`before=${b}`)).toEqual({ entries: [], complete: false });
+    expect(a).not.toBe(b);
+  });
+
+  it("cuts a cursor page at a splice the client did not opt into", async () => {
+    const h = await seedBlob("one");
+    const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+    const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
+    const c = await publish(makeManifest({ parent: b, files: { "a.md": { h } } }), b);
+
+    // b's commits were thinned away: c now reaches a directly, and only a client that
+    // understands splices may be handed that link.
+    await runInDurableObject(lockStub(), (lock: VaultLock) => {
+      (lock as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
+        "INSERT INTO manifest_splices (survivor_id, splice_parent, spliced) VALUES (?, ?, ?)",
+        c,
+        a,
+        1
+      );
+    });
+
+    const cut = await page(`limit=5&before=${c}`);
+    expect(cut).toEqual({ entries: [], complete: false });
+
+    const followed = await page(`limit=5&before=${c}&splices=1`);
+    expect(followed.entries.map((e) => e.id)).toEqual([a]);
+    expect(followed.complete).toBe(true);
+  });
+
+  it("calls the end of a thinned chain complete, not a hole in the index", async () => {
+    const h = await seedBlob("one");
+    const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+    const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
+
+    // What every mature vault looks like: a sweep collected `a`, so the oldest snapshot the
+    // vault still keeps names a parent that is gone from the index. There is nothing older to
+    // splice onto, so the link is left dangling — `applyGcSplices` drops an open run at the
+    // chain's end rather than splicing it onto nothing.
+    await runInDurableObject(lockStub(), (lock: VaultLock) => {
+      (lock as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
+        "DELETE FROM manifest_index WHERE id = ?",
+        a
+      );
+    });
+
+    // Reporting this as incomplete made every client refuse the page and walk the manifests
+    // instead, so the index's fast path never engaged on a vault that had ever been swept.
+    const body = await page("limit=500&splices=1");
+    expect(body.entries.map((e) => e.id)).toEqual([b]);
+    expect(body.complete).toBe(true);
+    // The link itself is untouched: the client still sees that `b` had a parent.
+    expect(body.entries[0].parent).toBe(a);
+  });
+
+  it("does not call a vault with an unindexed head empty", async () => {
+    const h = await seedBlob("one");
+    const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+    const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
+
+    // Index/R2 divergence: the head pointer names a snapshot the index does not have. Nothing
+    // vouches for the head the way a cursor or a previous row vouches for what follows it, so
+    // this is corruption — not a vault that ran out of history. An empty *complete* page is
+    // exactly the shape a client reads as "this vault has no snapshots at all".
+    await runInDurableObject(lockStub(), (lock: VaultLock) => {
+      (lock as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
+        "DELETE FROM manifest_index WHERE id = ?",
+        b
+      );
+    });
+
+    const body = await page("limit=500&splices=1");
+    expect(body.entries).toEqual([]);
+    expect(body.complete).toBe(false);
+    expect(a).not.toBe(b);
+  });
+
+  it("fails closed when a splice names a snapshot the index does not have", async () => {
+    const h = await seedBlob("one");
+    const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+    const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
+    const c = await publish(makeManifest({ parent: b, files: { "a.md": { h } } }), b);
+
+    await runInDurableObject(lockStub(), (lock: VaultLock) => {
+      const ctx = (lock as unknown as { ctx: DurableObjectState }).ctx;
+      ctx.storage.sql.exec(
+        "INSERT INTO manifest_splices (survivor_id, splice_parent, spliced) VALUES (?, ?, ?)",
+        c, a, 1
+      );
+      ctx.storage.sql.exec("DELETE FROM manifest_index WHERE id = ?", a);
+      expect(b).not.toBe(c);
+    });
+
+    // A sweep only ever splices onto a survivor, so a splice into nothing is corruption — not
+    // the ordinary dangling `parent` at the end of retained history. It must not be waved
+    // through as a complete listing.
+    const body = await page("limit=500&splices=1");
+    expect(body.complete).toBe(false);
+  });
+
+  it("refuses a cursor that is not a manifest id", async () => {
+    for (const bad of ["", "abc", "../etc", "01".repeat(40)]) {
+      const res = await SELF.fetch(
+        `${BASE}/api/history?before=${encodeURIComponent(bad)}`,
+        authed(token)
+      );
+      expect(res.status).toBe(422);
+    }
   });
 
   it("never exposes the encrypted path map", async () => {

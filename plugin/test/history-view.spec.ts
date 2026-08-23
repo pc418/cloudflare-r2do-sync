@@ -8,7 +8,13 @@ import {
   type HistoryDeps,
 } from "../src/main";
 import { App, Modal, Notice, Setting, type FakeElement } from "./obsidian-fake";
-import type { RestoreInspection, RestoreOutcome, SnapshotInfo } from "../src/sync";
+import type {
+  HistoryListing,
+  RestoreInspection,
+  RestoreOutcome,
+  SnapshotInfo,
+} from "../src/sync";
+import type { HistoryGranularity } from "../src/history-groups";
 import type { FileEntry } from "../src/types";
 
 // Vitest aliases "obsidian" to the fake at runtime; tsc still sees the real types. Bridge here.
@@ -16,8 +22,17 @@ function contentOf(modal: object): FakeElement {
   return (modal as { contentEl: FakeElement }).contentEl;
 }
 
+/** The window's controls sit in the same render log as its rows; these are the controls. */
+const CONTROLS = new Set(["Group by", "Between"]);
+
 function rowsOf(modal: object): Setting[] {
-  return contentOf(modal).log.rows;
+  return contentOf(modal).log.rows.filter((r) => !CONTROLS.has(r.rendered.name));
+}
+
+function controlOf(modal: object, name: string): Setting {
+  const row = contentOf(modal).log.rows.find((r) => r.rendered.name === name);
+  if (row === undefined) throw new Error(`no control named ${name}`);
+  return row;
 }
 
 /** The fake records whether a window is still up; the real `Modal` type does not expose it. */
@@ -46,20 +61,32 @@ function snapshot(over: Partial<SnapshotInfo> = {}): SnapshotInfo {
   };
 }
 
+/** The ordinary listing shape: these rows, nothing older, nothing the engine could not do. */
+function listing(rows: SnapshotInfo[], over: Partial<HistoryListing> = {}): HistoryListing {
+  return { rows, granularity: "sync", more: false, ...over };
+}
+
 interface Calls {
   restore: Array<{ path: string; opts: { destination?: string; overwrite?: boolean } | undefined }>;
   restoreAll: string[];
   syncs: number;
+  granularity: HistoryGranularity[];
 }
 
 function deps(
   over: Partial<HistoryDeps> = {},
-  calls: Calls = { restore: [], restoreAll: [], syncs: 0 }
+  calls: Calls = { restore: [], restoreAll: [], syncs: 0, granularity: [] }
 ): HistoryDeps & { calls: Calls } {
   return {
     calls,
     historyLimit: 40,
-    listHistory: async () => [],
+    granularity: "sync",
+    rememberGranularity: (g) => {
+      calls.granularity.push(g);
+    },
+    listHistory: async () => listing([]),
+    syncsPath: () => true,
+    restoreDestinationBlock: () => null,
     snapshotFiles: async () => ({}),
     inspectRestore: async () => ({
       entry: entry(),
@@ -90,14 +117,14 @@ beforeEach(() => {
 
 describe("the history window", () => {
   it("asks for diffs, and lists what each snapshot changed", async () => {
-    const asked: Array<{ limit: number; changes: boolean }> = [];
+    const asked: Array<{ limit: number; changes: boolean; granularity?: HistoryGranularity }> = [];
     const modal = new HistoryModal(
       new App() as never,
       deps({
         historyLimit: 12,
         listHistory: async (limit, opts) => {
-          asked.push({ limit, changes: opts?.changes === true });
-          return [
+          asked.push({ limit, changes: opts?.changes === true, granularity: opts?.granularity });
+          return listing([
             snapshot({
               changes: {
                 files: [
@@ -115,14 +142,14 @@ describe("the history window", () => {
                 initial: false,
               },
             }),
-          ];
+          ]);
         },
       })
     );
     modal.open();
     await settle();
 
-    expect(asked).toEqual([{ limit: 12, changes: true }]);
+    expect(asked).toEqual([{ limit: 12, changes: true, granularity: "sync" }]);
     const texts = contentOf(modal).texts();
     // The changed paths are on the page without opening anything.
     expect(texts).toContain("added · b.md · +3 lines");
@@ -142,7 +169,7 @@ describe("the history window", () => {
     const modal = new HistoryModal(
       new App() as never,
       deps({
-        listHistory: async () => [
+        listHistory: async () => listing([
           snapshot({
             changes: {
               files,
@@ -156,7 +183,7 @@ describe("the history window", () => {
               initial: false,
             },
           }),
-        ],
+        ]),
       })
     );
     modal.open();
@@ -171,10 +198,10 @@ describe("the history window", () => {
     const modal = new HistoryModal(
       new App() as never,
       deps({
-        listHistory: async () => [
+        listHistory: async () => listing([
           snapshot({ changes: { unknown: "parent-missing" } }),
           snapshot({ id: "01OLD", changes: { unknown: "parent-unreadable" } }),
-        ],
+        ]),
       })
     );
     modal.open();
@@ -184,6 +211,321 @@ describe("the history window", () => {
     expect(rowsOf(modal)[1].rendered.desc).toContain("cannot be read with this device's key");
     // Crucially, neither claims nothing changed.
     expect(contentOf(modal).texts().join(" ")).not.toContain("no file changes");
+  });
+
+  it("opens the window in the remembered unit, and asks for that unit", async () => {
+    const asked: Array<HistoryGranularity | undefined> = [];
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        granularity: "day",
+        listHistory: async (_limit, opts) => {
+          asked.push(opts?.granularity);
+          return listing([], { granularity: "day" });
+        },
+      })
+    );
+    modal.open();
+    await settle();
+
+    expect(asked).toEqual(["day"]);
+    expect(controlOf(modal, "Group by").dropdowns[0].getValue()).toBe("day");
+  });
+
+  it("relists in the unit the user picks, and remembers it", async () => {
+    const asked: Array<HistoryGranularity | undefined> = [];
+    const calls: Calls = { restore: [], restoreAll: [], syncs: 0, granularity: [] };
+    const modal = new HistoryModal(
+      new App() as never,
+      deps(
+        {
+          listHistory: async (_limit, opts) => {
+            asked.push(opts?.granularity);
+            return listing([snapshot()], { granularity: opts?.granularity ?? "sync" });
+          },
+        },
+        calls
+      )
+    );
+    modal.open();
+    await settle();
+
+    controlOf(modal, "Group by").dropdowns[0].change("week");
+    await settle();
+
+    expect(asked).toEqual(["sync", "week"]);
+    // Remembered, so the window reopens the way it was left rather than resetting each time.
+    expect(calls.granularity).toEqual(["week"]);
+  });
+
+  it("turns the typed dates into a range that includes the day named as its end", async () => {
+    const asked: Array<{ from?: number; to?: number }> = [];
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async (_limit, opts) => {
+          asked.push({ from: opts?.from, to: opts?.to });
+          return listing([snapshot()]);
+        },
+      })
+    );
+    modal.open();
+    await settle();
+
+    const between = controlOf(modal, "Between");
+    between.texts[0].change("2026-08-10");
+    await settle();
+    between.texts[1].change("2026-08-12");
+    await settle();
+
+    // Local components, not `Date.parse` of the string: a UTC reading would shift the day for
+    // half the world. And "to the 12th" has to include the 12th, so the range ends at its close.
+    expect(asked.at(-1)).toEqual({
+      from: new Date(2026, 7, 10).getTime(),
+      to: new Date(2026, 7, 13).getTime(),
+    });
+  });
+
+  it("does not relist while a date is still half-typed", async () => {
+    let calls = 0;
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async () => {
+          calls++;
+          return listing([snapshot()]);
+        },
+      })
+    );
+    modal.open();
+    await settle();
+    expect(calls).toBe(1);
+
+    const between = controlOf(modal, "Between");
+    // A date field can report every keystroke, and a half-typed date parses to nothing.
+    for (const partial of ["2", "20", "202", "2026", "2026-0"]) {
+      between.texts[0].change(partial);
+      await settle();
+    }
+    expect(calls).toBe(1);
+
+    between.texts[0].change("2026-08-10");
+    await settle();
+    expect(calls).toBe(2);
+  });
+
+  it("ends a range at the next local midnight, not 24 hours later", async () => {
+    const asked: Array<{ from?: number; to?: number }> = [];
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async (_limit, opts) => {
+          asked.push({ from: opts?.from, to: opts?.to });
+          return listing([snapshot()]);
+        },
+      })
+    );
+    modal.open();
+    await settle();
+
+    // Every date in a year, so whichever days this machine's zone shifts its clock on are
+    // covered. Adding 86,400,000 ms lands an hour into the next date in spring and an hour
+    // short of the named one in autumn; the range's end has to be a calendar boundary.
+    for (let day = 0; day < 365; day++) {
+      const d = new Date(2026, 0, 1 + day);
+      const field = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      controlOf(modal, "Between").texts[1].change(field);
+      await settle();
+      const expected = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime();
+      expect(asked.at(-1)!.to, field).toBe(expected);
+    }
+  });
+
+  it("names a grouped row by its bucket and the devices that committed into it", async () => {
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        granularity: "day",
+        listHistory: async () =>
+          listing(
+            [
+              snapshot({
+                group: {
+                  granularity: "day",
+                  start: new Date(2026, 7, 20).getTime(),
+                  syncs: 4,
+                  devices: ["phone", "laptop"],
+                },
+              }),
+            ],
+            { granularity: "day" }
+          ),
+      })
+    );
+    modal.open();
+    await settle();
+
+    const name = rowsOf(modal)[0].rendered.name;
+    expect(name).toContain("2026");
+    expect(name).toContain("phone, laptop");
+  });
+
+  it("says older snapshots exist rather than letting the list imply history ends", async () => {
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({ listHistory: async () => listing([snapshot()], { more: true }) })
+    );
+    modal.open();
+    await settle();
+
+    expect(contentOf(modal).texts().join(" ")).toContain("Older snapshots exist past this list");
+  });
+
+  it("says why the rows are not grouped when the server could not answer the chain", async () => {
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        granularity: "day",
+        listHistory: async () =>
+          listing([snapshot()], { granularity: "sync", fallback: "no-index" }),
+      })
+    );
+    modal.open();
+    await settle();
+
+    // Serving flat rows under a "grouped by day" control, silently, would misdescribe the list.
+    expect(contentOf(modal).texts().join(" ")).toContain("history index");
+  });
+
+  it("says the server is too old to page rather than implying the list is all there is", async () => {
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        granularity: "day",
+        listHistory: async () =>
+          listing([snapshot()], { granularity: "day", fallback: "no-cursor" }),
+      })
+    );
+    modal.open();
+    await settle();
+
+    expect(contentOf(modal).texts().join(" ")).toContain("too old to page");
+  });
+
+  it("does not call a vault new when it could not complete a single bucket", async () => {
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        granularity: "day",
+        listHistory: async () => listing([], { granularity: "day", more: true }),
+      })
+    );
+    modal.open();
+    await settle();
+
+    const texts = contentOf(modal).texts().join(" ");
+    expect(texts).toContain("could not reach far enough back");
+    // The one thing it must never say: that the remote holds nothing.
+    expect(texts).not.toContain("no snapshots yet");
+  });
+
+  it("says a range is empty rather than falling back to the newest history", async () => {
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({ listHistory: async () => listing([]) })
+    );
+    modal.open();
+    await settle();
+
+    controlOf(modal, "Between").texts[0].change("2030-01-01");
+    await settle();
+
+    const texts = contentOf(modal).texts().join(" ");
+    expect(texts).toContain("No snapshots in that range");
+    expect(texts).not.toContain("no snapshots yet");
+  });
+
+  it("asks where to put a file whose own path may not be written to", async () => {
+    const calls: Calls = { restore: [], restoreAll: [], syncs: 0, granularity: [] };
+    const modal = new SnapshotModal(new App() as never, deps({
+      snapshotFiles: async () => ({ ".obsidian/plugins/obsidian-log-sync/data.json": entry() }),
+      inspectRestore: async () => ({
+        entry: entry(),
+        currentHash: null,
+        current: "absent",
+        unsyncedEdits: false,
+        suggestion: "data (restored 2026-08-05).json",
+      }),
+      restoreDestinationBlock: () => "that is this plugin's own folder",
+    }, calls), snapshot());
+    modal.open();
+    await settle();
+
+    rowsOf(modal).flatMap((r) => r.buttons).find((b) => b.text === "Restore")!.click();
+    await settle();
+
+    // Nothing is on disk, so the old path wrote straight in and surfaced a throw the user could
+    // do nothing about. The bytes are meant to stay recoverable, so it has to ask instead.
+    const opened = Modal.shown.at(-1)!;
+    expect(opened).toBeInstanceOf(RestoreDestinationModal);
+    const texts = contentOf(opened).texts().join(" ");
+    expect(texts).toContain("cannot be written to");
+    expect(calls.restore).toEqual([]);
+
+    // And the one button that would write in place is not on offer.
+    const replace = contentOf(opened).log.rows.flatMap((r) => r.buttons).find((b) => b.text === "Replace current file");
+    expect(replace?.disabled).toBe(true);
+  });
+
+  it("warns that a restored file on an unsynced path is never published", async () => {
+    const snap = snapshot();
+    const modal = new SnapshotModal(new App() as never, deps({
+      snapshotFiles: async () => ({ ".obsidian/app.json": entry() }),
+      inspectRestore: async () => ({
+        entry: entry(),
+        currentHash: null,
+        current: "absent",
+        unsyncedEdits: false,
+        suggestion: ".obsidian/app.json",
+      }),
+      restoreFile: async () => ({ kind: "written", path: ".obsidian/app.json", requested: ".obsidian/app.json" }),
+      syncsPath: () => false,
+    }), snap);
+    modal.open();
+    await settle();
+
+    const restore = rowsOf(modal).flatMap((r) => r.buttons).find((b) => b.text === "Restore");
+    restore!.click();
+    await settle();
+
+    // The write succeeded, and saying only "Restored" would let the user believe the file is
+    // now safe on every device. It is on this one, and nowhere else, ever.
+    const said = Notice.shown.at(-1)!;
+    expect(said).toContain("Restored");
+    expect(said).toContain("does not sync");
+  });
+
+  it("does not add the unsynced caveat to an ordinary restore", async () => {
+    const snap = snapshot();
+    const modal = new SnapshotModal(new App() as never, deps({
+      snapshotFiles: async () => ({ "a.md": entry() }),
+      inspectRestore: async () => ({
+        entry: entry(),
+        currentHash: null,
+        current: "absent",
+        unsyncedEdits: false,
+        suggestion: "a.md",
+      }),
+      restoreFile: async () => ({ kind: "written", path: "a.md", requested: "a.md" }),
+      syncsPath: () => true,
+    }), snap);
+    modal.open();
+    await settle();
+
+    rowsOf(modal).flatMap((r) => r.buttons).find((b) => b.text === "Restore")!.click();
+    await settle();
+
+    expect(Notice.shown.at(-1)!).not.toContain("does not sync");
   });
 
   it("opens the snapshot window with the diff it already has", async () => {
@@ -203,7 +545,7 @@ describe("the history window", () => {
     const modal = new HistoryModal(
       new App() as never,
       deps({
-        listHistory: async () => [snap],
+        listHistory: async () => listing([snap]),
         snapshotFiles: async () => ({ "a.md": entry() }),
       })
     );
