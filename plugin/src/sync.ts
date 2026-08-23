@@ -2208,7 +2208,8 @@ export class SyncEngine {
     // exist, but none of them belong in this list, and offering to fetch them would be noise.
     const oldest = chain.entries[chain.entries.length - 1];
     const settled =
-      chain.chainEnds || (opts.from !== undefined && oldest.uploadedAt < opts.from);
+      chain.chainEnds ||
+      (opts.from !== undefined && oldest !== undefined && oldest.uploadedAt < opts.from);
     const listing: HistoryListing = {
       rows,
       granularity,
@@ -2267,7 +2268,10 @@ export class SyncEngine {
     const pageSize = pages === 1 ? limit : CHAIN_PAGE;
 
     const first = await this.#api.getHistory(pageSize);
-    if (first === null || !first.complete || first.entries.length === 0) return null;
+    if (first === null || !first.complete) return null;
+    // A complete, empty page is a vault with no snapshots — not a server that cannot answer.
+    // Sending that to the walk would report a missing index for a chain that is simply empty.
+    if (first.entries.length === 0) return { entries: [], chainEnds: true };
 
     const entries = [...first.entries];
     const seen = new Set(entries.map((e) => e.id));

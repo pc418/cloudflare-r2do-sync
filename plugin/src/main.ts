@@ -2980,11 +2980,9 @@ export class HistoryModal extends Modal {
     if (generation !== this.#generation) return;
 
     if (listing.rows.length === 0) {
-      status.setText(
-        from !== null || to !== null
-          ? "No snapshots in that range."
-          : "The remote has no snapshots yet."
-      );
+      // Three different truths, and only one of them is "this vault is new". Saying that for
+      // either of the others would tell someone their history is gone when it is not.
+      status.setText(this.#emptyLine(listing, from !== null || to !== null));
       return;
     }
     status.setText(this.#summaryLine(listing));
@@ -2998,6 +2996,20 @@ export class HistoryModal extends Modal {
           "or narrow the dates, to reach them.",
       });
     }
+  }
+
+  /** Why a listing came back with nothing, distinguishing the reasons rather than guessing. */
+  #emptyLine(listing: HistoryListing, ranged: boolean): string {
+    if (ranged) return "No snapshots in that range.";
+    // Snapshots exist, but not enough of the chain was reachable to complete a single bucket —
+    // a bucket is only shown once its older edge is known. Rare, and never "this vault is new".
+    if (listing.more) {
+      return (
+        `There is history here, but this window could not reach far enough back to complete a ` +
+        `whole ${listing.granularity}. Switch to “Every sync” to see it.`
+      );
+    }
+    return "The remote has no snapshots yet.";
   }
 
   /** What the list is, including anything it could not do. Never silently a different thing. */

@@ -355,6 +355,23 @@ describe("the history window", () => {
     expect(contentOf(modal).texts().join(" ")).toContain("too old to page");
   });
 
+  it("does not call a vault new when it could not complete a single bucket", async () => {
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        granularity: "day",
+        listHistory: async () => listing([], { granularity: "day", more: true }),
+      })
+    );
+    modal.open();
+    await settle();
+
+    const texts = contentOf(modal).texts().join(" ");
+    expect(texts).toContain("could not reach far enough back");
+    // The one thing it must never say: that the remote holds nothing.
+    expect(texts).not.toContain("no snapshots yet");
+  });
+
   it("says a range is empty rather than falling back to the newest history", async () => {
     const modal = new HistoryModal(
       new App() as never,

@@ -1229,6 +1229,18 @@ describe("SyncEngine.listHistory grouped by calendar bucket", () => {
     expect(listing.fallback).toBe("no-index");
   });
 
+  it("calls an empty vault empty rather than an index that could not answer", async () => {
+    server.serveHistoryIndex = true;
+
+    const listing = await makeEngine().listHistory(10, { changes: true, granularity: "day" });
+
+    // A complete, empty page is a vault with no snapshots. Sending it to the walk instead
+    // would report a missing index for a chain that is simply empty.
+    expect(listing.rows).toEqual([]);
+    expect(listing.fallback).toBeUndefined();
+    expect(listing.more).toBe(false);
+  });
+
   it("reports nothing older when the whole chain fits", async () => {
     await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
 
