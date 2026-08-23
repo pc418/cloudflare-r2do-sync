@@ -634,6 +634,11 @@ export class VaultLock extends DurableObject<Env> {
     const seen = new Set<string>();
     let id = this.#storedHead();
 
+    // Whether the link just followed was a splice. A splice is written by a sweep and always
+    // names a survivor, so a splice leading nowhere is corruption. A plain `parent` leading
+    // nowhere is the ordinary end of retained history — see `#reachedRetainedEnd`.
+    let viaSplice = false;
+
     if (opts.before !== undefined) {
       const from = this.#chainRow(opts.before);
       if (from === undefined) return { entries, complete: false };
@@ -641,6 +646,7 @@ export class VaultLock extends DurableObject<Env> {
       // reads `parent` as "the next row", so it must not be stepped over a collected stretch.
       if (from.splice_parent !== null && opts.splices !== true) return { entries, complete: false };
       seen.add(opts.before);
+      viaSplice = from.splice_parent !== null;
       id = from.splice_parent ?? from.parent;
     }
 
@@ -650,7 +656,7 @@ export class VaultLock extends DurableObject<Env> {
       if (seen.has(id)) return { entries, complete: false };
       seen.add(id);
       const row = this.#chainRow(id);
-      if (row === undefined) return { entries, complete: false };
+      if (row === undefined) return { entries, complete: this.#reachedRetainedEnd(viaSplice) };
       entries.push({
         id: row.id,
         parent: row.parent,
@@ -665,9 +671,30 @@ export class VaultLock extends DurableObject<Env> {
       // up to the gap and says the listing is short — which is exactly what it is, and what
       // sends such a client to walk the manifests itself rather than believe history ends.
       if (row.splice_parent !== null && opts.splices !== true) return { entries, complete: false };
+      viaSplice = row.splice_parent !== null;
       id = row.splice_parent ?? row.parent;
     }
     return { entries, complete: true };
+  }
+
+  /**
+   * Whether a link into nothing is the end of retained history rather than a hole in the index.
+   *
+   * The oldest snapshot the vault still keeps names a `parent` a sweep collected long ago, and
+   * that parent is gone from `manifest_index` — so the walk always runs off the end of a thinned
+   * chain. Calling that "incomplete" made every client refuse the whole page and walk the
+   * manifests instead, which is the opposite of what the index exists for: on a mature vault the
+   * fast path never engaged at all.
+   *
+   * Two conditions make the distinction safe. The backfill must be finished — while it is still
+   * running, a missing row means the index has not reached that far, which genuinely is a gap.
+   * And the link followed must be a plain `parent`: a sweep re-splices survivors over every
+   * stretch it collects *mid-chain*, so only an open run at the chain's end is left dangling
+   * (`applyGcSplices` drops it rather than splicing it onto nothing). A `splice_parent` naming a
+   * snapshot that is not indexed is therefore corruption, and must keep failing closed.
+   */
+  #reachedRetainedEnd(viaSplice: boolean): boolean {
+    return !viaSplice && this.#gcIndexReady();
   }
 
   /** One indexed snapshot with the link it is actually followed by. Undefined when unindexed. */

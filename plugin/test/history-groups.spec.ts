@@ -104,6 +104,21 @@ describe("groupHistory", () => {
     expect(groups[1].compareTo).toBe("id2");
   });
 
+  it("keeps the oldest bucket of a swept vault, whose chain never reaches a null parent", () => {
+    // Every vault that has ever been collected looks like this: the oldest snapshot it still
+    // keeps names the parent a sweep took away. Testing for a null parent here instead of
+    // trusting the caller dropped that bucket forever — which is what "Group by does nothing"
+    // looked like, because the fallback it triggered served a flat list instead.
+    const entries = chain([at(2026, 8, 20, 9), at(2026, 8, 19, 9)]);
+    entries[entries.length - 1].parent = "01COLLECTEDBYASWEEP";
+
+    const groups = groupHistory(entries, "day", { chainEnds: true });
+    expect(groups.map((g) => g.pick.id)).toEqual(["id0", "id1"]);
+    // Nothing older is reachable, so the oldest bucket is an initial diff — the snapshots
+    // behind it are gone, not merely unfetched.
+    expect(groups[1].compareTo).toBeNull();
+  });
+
   it("keeps the trailing bucket once the chain really ends", () => {
     const entries = chain([at(2026, 8, 20, 9), at(2026, 8, 19, 9)]);
 

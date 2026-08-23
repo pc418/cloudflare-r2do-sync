@@ -2292,6 +2292,12 @@ export class SyncEngine {
     const entries = [...first.entries];
     const seen = new Set(entries.map((e) => e.id));
     let fallback: HistoryFallback | undefined;
+    // Nothing older is *fetchable*, which is not the same as the chain having a null parent:
+    // the oldest snapshot a thinned vault retains still names the parent a sweep collected, so
+    // `parent === null` never comes true on a mature vault. The only unambiguous signal is a
+    // continuation that comes back empty and complete — deliberately not "a page shorter than
+    // we asked for", which cannot tell the chain running out from the server's own page cap.
+    let exhausted = false;
 
     for (let page = 1; page < pages; page++) {
       const tail = entries[entries.length - 1];
@@ -2308,7 +2314,10 @@ export class SyncEngine {
         // Incomplete and empty is the index failing to resolve the cursor — a sweep can collect
         // one between two pages — which is a hole in the index, not the end of the vault's
         // history, and is handled exactly like a hole found part-way down a page.
-        if (next.complete) break;
+        if (next.complete) {
+          exhausted = true;
+          break;
+        }
         return this.#shortOfWhatItShows(entries, limit, granularity, opts);
       }
       if (next.entries[0].id !== expected) {
@@ -2333,7 +2342,8 @@ export class SyncEngine {
       if (!next.complete) return this.#shortOfWhatItShows(entries, limit, granularity, opts);
     }
 
-    return { entries, chainEnds: previousOf(entries[entries.length - 1]) === null, fallback };
+    const oldest = entries[entries.length - 1];
+    return { entries, chainEnds: previousOf(oldest) === null || exhausted, fallback };
   }
 
   /**

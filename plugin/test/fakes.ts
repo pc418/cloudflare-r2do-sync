@@ -136,6 +136,12 @@ export class FakeServer implements SyncApiLike {
    * happen over a handful of snapshots instead of five hundred.
    */
   maxHistoryPage = 500;
+  /**
+   * Whether the server's index has finished backfilling. True by default, which is the steady
+   * state — and the state in which running off the end of a thinned chain is the ordinary end
+   * of retained history rather than a gap.
+   */
+  indexBackfilled = true;
 
   /**
    * Runs before a listing is answered, so a test can collect a snapshot *between* two pages —
@@ -161,7 +167,12 @@ export class FakeServer implements SyncApiLike {
 
     while (id !== null && entries.length < max) {
       const m = this.manifests.get(id);
-      if (m === undefined || this.unindexed.has(id)) return { entries, complete: false };
+      if (m === undefined || this.unindexed.has(id)) {
+        // A link into nothing is the end of *retained* history once the index is built: the
+        // oldest snapshot a thinned vault keeps names a parent a sweep collected. Only an
+        // index that has not finished backfilling turns that into a hole.
+        return { entries, complete: this.indexBackfilled && !this.unindexed.has(id) };
+      }
       const splice = this.splices.get(m.id) ?? null;
       const stamped = this.uploadedAt.get(m.id) ?? Date.parse(m.createdAt);
       entries.push({

@@ -1,4 +1,4 @@
-import { previousOf, type HistoryEntry } from "./types";
+import type { HistoryEntry } from "./types";
 
 /**
  * How the history window counts its rows: one per sync, or one per calendar bucket.
@@ -76,9 +76,11 @@ function weekStart(ms: number): number {
  *
  * **The trailing bucket is dropped unless the chain ended.** A bucket at the end of a page may
  * be missing older members that live on the next page, and diffing it would describe part of a
- * day as though it were all of it. The caller accumulates entries across pages and re-groups
- * the whole accumulation, so a dropped bucket returns complete rather than being lost — the
- * same discipline the sweep applies to an open run of pruned snapshots at the chain's end.
+ * day as though it were all of it. `chainEnds` means *nothing older can be fetched* — not that
+ * the oldest entry's parent is null, which never comes true on a vault that has been swept.
+ * The caller accumulates entries across pages and re-groups the whole accumulation, so a
+ * dropped bucket returns complete rather than being lost — the same discipline the sweep
+ * applies to an open run of pruned snapshots at the chain's end.
  */
 export function groupHistory(
   entries: readonly HistoryEntry[],
@@ -98,8 +100,12 @@ export function groupHistory(
 
   // Whether the last bucket is whole. It is only when the page ran out of chain rather than out
   // of rows — otherwise its older members are on a page nobody has fetched yet.
-  const last = entries[entries.length - 1];
-  const complete = last !== undefined && opts.chainEnds && previousOf(last) === null;
+  //
+  // `chainEnds` is the caller's answer and the only one: it means nothing older can be fetched,
+  // which is NOT the same as the oldest entry having a null parent. A vault that has ever been
+  // swept keeps an oldest snapshot whose manifest still names the parent that was collected, so
+  // a null-parent test here would drop the oldest bucket of every mature vault forever.
+  const complete = entries.length > 0 && opts.chainEnds;
   const usable = complete ? buckets : buckets.slice(0, -1);
 
   return usable.map((bucket, i): HistoryGroup => {

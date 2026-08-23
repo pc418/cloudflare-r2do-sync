@@ -1229,6 +1229,30 @@ describe("SyncEngine.listHistory grouped by calendar bucket", () => {
     expect(listing.fallback).toBe("no-index");
   });
 
+  it("groups a thinned chain instead of falling back — what every swept vault looks like", async () => {
+    const heads = await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+    // A sweep collected everything before the oldest retained snapshot. Its manifest still
+    // names that parent, so the chain never reaches a null link — the index simply stops. This
+    // is the steady state of any vault that has ever been collected, and reading it as "the
+    // index is incomplete" made the grouped path fall back to the walk on every such vault,
+    // which is what "Group by does nothing" looked like from the outside.
+    const oldest = server.manifests.get(heads[0])!;
+    server.manifests.set(heads[0], { ...oldest, parent: "01COLLECTEDBYASWEEPXXXXXXX" });
+
+    const listing = await makeEngine().listHistory(40, { changes: true, granularity: "day" });
+
+    expect(listing.granularity).toBe("day");
+    expect(listing.fallback).toBeUndefined();
+    expect(listing.rows.map((r) => r.id)).toEqual([heads[2], heads[1], heads[0]]);
+    // Everything retained is on screen, so nothing is offered that cannot be fetched.
+    expect(listing.more).toBe(false);
+    // The oldest bucket has nothing readable behind it, so its diff is initial rather than
+    // a false "changes unknown" — the snapshots behind it are gone, not unreadable.
+    const first = listing.rows[2].changes;
+    if (first === undefined || "unknown" in first) throw new Error("expected a real diff");
+    expect(first.initial).toBe(true);
+  });
+
   it("calls an empty vault empty rather than an index that could not answer", async () => {
     server.serveHistoryIndex = true;
 

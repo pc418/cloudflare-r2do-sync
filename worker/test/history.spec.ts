@@ -98,14 +98,18 @@ describe("GET /api/history", () => {
     const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
     const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
 
-    // A vault whose older history predates the index: the row is simply not there. Reporting
+    // A vault whose older history predates the index: the row is simply not there, and the
+    // backfill has not finished, so nothing can vouch for what is behind it. Reporting
     // `complete: true` would tell the client the vault has one snapshot, which is a lie about
     // the user's own history — the same mistake as reading a 5xx as a 404.
+    //
+    // The unfinished backfill is the whole premise and has to be set up, not assumed: once it
+    // *is* finished, a row that is not there was collected, and the walk has reached the end of
+    // retained history rather than a hole. That case is its own test.
     await runInDurableObject(lockStub(), (lock: VaultLock) => {
-      (lock as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
-        "DELETE FROM manifest_index WHERE id = ?",
-        a
-      );
+      const ctx = (lock as unknown as { ctx: DurableObjectState }).ctx;
+      ctx.storage.sql.exec("DELETE FROM manifest_index WHERE id = ?", a);
+      ctx.storage.sql.exec("DELETE FROM meta WHERE key = ?", "gc_index_backfilled");
     });
 
     const body = (await (await history()).json()) as { complete: boolean; entries: Array<{ id: string }> };
@@ -221,6 +225,54 @@ describe("GET /api/history", () => {
     const followed = await page(`limit=5&before=${c}&splices=1`);
     expect(followed.entries.map((e) => e.id)).toEqual([a]);
     expect(followed.complete).toBe(true);
+  });
+
+  it("calls the end of a thinned chain complete, not a hole in the index", async () => {
+    const h = await seedBlob("one");
+    const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+    const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
+
+    // What every mature vault looks like: a sweep collected `a`, so the oldest snapshot the
+    // vault still keeps names a parent that is gone from the index. There is nothing older to
+    // splice onto, so the link is left dangling — `applyGcSplices` drops an open run at the
+    // chain's end rather than splicing it onto nothing.
+    await runInDurableObject(lockStub(), (lock: VaultLock) => {
+      (lock as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
+        "DELETE FROM manifest_index WHERE id = ?",
+        a
+      );
+    });
+
+    // Reporting this as incomplete made every client refuse the page and walk the manifests
+    // instead, so the index's fast path never engaged on a vault that had ever been swept.
+    const body = await page("limit=500&splices=1");
+    expect(body.entries.map((e) => e.id)).toEqual([b]);
+    expect(body.complete).toBe(true);
+    // The link itself is untouched: the client still sees that `b` had a parent.
+    expect(body.entries[0].parent).toBe(a);
+  });
+
+  it("fails closed when a splice names a snapshot the index does not have", async () => {
+    const h = await seedBlob("one");
+    const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+    const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
+    const c = await publish(makeManifest({ parent: b, files: { "a.md": { h } } }), b);
+
+    await runInDurableObject(lockStub(), (lock: VaultLock) => {
+      const ctx = (lock as unknown as { ctx: DurableObjectState }).ctx;
+      ctx.storage.sql.exec(
+        "INSERT INTO manifest_splices (survivor_id, splice_parent, spliced) VALUES (?, ?, ?)",
+        c, a, 1
+      );
+      ctx.storage.sql.exec("DELETE FROM manifest_index WHERE id = ?", a);
+      expect(b).not.toBe(c);
+    });
+
+    // A sweep only ever splices onto a survivor, so a splice into nothing is corruption — not
+    // the ordinary dangling `parent` at the end of retained history. It must not be waved
+    // through as a complete listing.
+    const body = await page("limit=500&splices=1");
+    expect(body.complete).toBe(false);
   });
 
   it("refuses a cursor that is not a manifest id", async () => {
