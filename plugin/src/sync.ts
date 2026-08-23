@@ -27,6 +27,7 @@ import {
   numberedPath,
   pathError,
   restoreCopyPath,
+  selfDirs,
 } from "./paths";
 import { DEFAULT_LANES, clampLanes, mapPool } from "./pool";
 import { createUlidFactory } from "./ulid";
@@ -2640,7 +2641,7 @@ export class SyncEngine {
    * the same size is not.
    */
   async inspectRestore(id: string, path: string): Promise<RestoreInspection> {
-    this.#assertRestorable(path);
+    this.#assertRestorableSource(path);
     const manifest = await this.#api.getManifest(id);
     const entry = (await this.#remoteFiles(manifest))[path];
     if (entry === undefined) throw new Error(`"${path}" is not in snapshot ${id}`);
@@ -2670,8 +2671,8 @@ export class SyncEngine {
     opts: { destination?: string; overwrite?: boolean; expectedHash?: string | null } = {}
   ): Promise<RestoreOutcome> {
     const requested = opts.destination ?? path;
-    this.#assertRestorable(path);
-    if (requested !== path) this.#assertRestorable(requested);
+    this.#assertRestorableSource(path);
+    this.#assertRestorableDestination(requested);
     // An overwrite is approval for destroying one specific version. Without naming it, the
     // approval is unbounded and applies to whatever happens to be there when the click lands.
     if (opts.overwrite === true && opts.expectedHash === undefined) {
@@ -2746,18 +2747,60 @@ export class SyncEngine {
     );
   }
 
+  /**
+   * Whether this device would sync a path, which a restore no longer asks before writing.
+   *
+   * It still has to be *said*: a file restored onto a path this device does not scan is never
+   * published, and stays behind if the vault is reinstalled elsewhere. Reporting "Restored" and
+   * leaving the user to assume it is now safe would be the ambiguous success this codebase
+   * refuses — so the window appends the caveat rather than the engine refusing the write.
+   */
+  syncsPath(path: string): boolean {
+    return !this.#notScanned(path);
+  }
+
   /** sha256 of what is at `path` right now, or null when nothing is. */
   async #localHash(path: string): Promise<string | null> {
     if ((await this.#vault.stat(path)) === null) return null;
     return await sha256Hex(await this.#vault.read(path));
   }
 
-  /** Rejects a restore source or destination this device has no business touching. */
-  #assertRestorable(path: string): void {
+  /**
+   * Rejects a snapshot path that could not be a vault path at all.
+   *
+   * Deliberately says nothing about what this device *syncs*. A manual restore is not a sync:
+   * the remote holds the bytes, the user asked for them by name, and the sync policy exists to
+   * decide what gets published automatically, not to decide what its owner may read back. A
+   * config file carried through snapshots by another device is exactly the thing someone opens
+   * history to recover, and refusing it left the only copy visible but unreachable.
+   */
+  #assertRestorableSource(path: string): void {
     const bad = pathError(path);
     if (bad !== null) throw new Error(`"${path}" is not a valid vault path: ${bad}`);
-    if (this.#notScanned(path)) {
-      throw new Error(`"${path}" is not synced by this device — refusing to restore it`);
+  }
+
+  /**
+   * Rejects a destination a write cannot honestly land on.
+   *
+   * The destination is the only thing a restore can harm, and the user chooses it, so this is
+   * as narrow as it can be: a path the vault could not hold, and this plugin's own folder.
+   *
+   * That folder is not a policy carve-out. It stores this device's access token and master key,
+   * and the running plugin rewrites `data.json` from memory on its next save — so a restore
+   * there either reports success over bytes that are about to be discarded, or swaps this
+   * device's identity underneath the session that is writing it. Both are the ambiguous
+   * success this codebase refuses to produce.
+   */
+  #assertRestorableDestination(path: string): void {
+    const bad = pathError(path);
+    if (bad !== null) throw new Error(`"${path}" is not a valid vault path: ${bad}`);
+    for (const dir of selfDirs(this.#configDir)) {
+      if (path === dir || path.startsWith(`${dir}/`)) {
+        throw new Error(
+          `refusing to restore into "${path}": that is this plugin's own folder, which holds ` +
+            `this device's credentials and is rewritten from memory while the plugin runs`
+        );
+      }
     }
   }
 

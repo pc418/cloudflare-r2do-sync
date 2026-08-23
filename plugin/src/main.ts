@@ -1350,6 +1350,7 @@ export default class LogSyncPlugin extends Plugin {
       inspectRestore: (id, path) => engine.inspectRestore(id, path),
       restoreFile: (id, path, opts) => engine.restoreFile(id, path, opts),
       restoreAll: (id) => this.#withVaultRewrite(RESTORE_ALL_BLOCK, () => engine.restoreAll(id)),
+      syncsPath: (path) => engine.syncsPath(path),
       historyLimit: this.settings.historyLimit,
       granularity: this.settings.historyGranularity,
       // Remembered across openings, because the unit someone reads history in is a standing
@@ -2769,6 +2770,8 @@ export interface HistoryDeps {
     opts?: { destination?: string; overwrite?: boolean }
   ): Promise<RestoreOutcome>;
   restoreAll(id: string): Promise<{ written: number; removed: number }>;
+  /** Whether this device syncs a path, so a restore onto one it does not can say so. */
+  syncsPath(path: string): boolean;
   /** How many rows to list; each one is a manifest fetch. */
   historyLimit: number;
   /** The unit the window opens in. */
@@ -3242,7 +3245,11 @@ export class SnapshotModal extends Modal {
   ): Promise<void> {
     try {
       const out = await this.deps.restoreFile(this.snap.id, path, choice);
-      new Notice(describeRestore(out));
+      // A restore no longer asks the sync policy for permission, so the policy has to be
+      // reported instead: a file written onto a path this device does not scan is never
+      // published, and "Restored" alone would let the user assume it now is.
+      const local = out.kind !== "identical" && !this.deps.syncsPath(out.path);
+      new Notice(describeRestore(out) + (local ? unsyncedPathNote(out.path) : ""), local ? 10_000 : undefined);
     } catch (e) {
       new Notice(`Could not restore ${path}: ${message(e)}`, 10_000);
     }
@@ -3295,6 +3302,20 @@ export function unsyncedWarning(unsyncedEdits: boolean): string {
     : "That version matches what this device last synced. Whether the remote still keeps a " +
         "snapshot holding it depends on the retention window, so replacing it may still be " +
         "permanent.";
+}
+
+/**
+ * The caveat on a restore that landed somewhere this device does not sync.
+ *
+ * Said plainly rather than dressed as a warning: the write succeeded and the file is there. What
+ * the user cannot know without being told is that nothing will ever publish it, so it will not
+ * appear on another device and will not survive a fresh install of the vault.
+ */
+export function unsyncedPathNote(path: string): string {
+  return (
+    ` — but this device does not sync ${path}, so the file stays on this device only and is ` +
+    `never published.`
+  );
 }
 
 /** What a finished restore did, in the words the user needs to find the file afterwards. */

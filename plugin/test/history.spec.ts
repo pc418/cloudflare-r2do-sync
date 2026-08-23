@@ -445,14 +445,78 @@ describe("SyncEngine.restoreFile", () => {
     expect(vault.writes).toEqual([]);
   });
 
-  it("refuses a chosen destination this device would never sync", async () => {
+  it("writes to a destination this device does not sync, because the user chose it", async () => {
     const engine = makeEngine();
     const heads = await threeCommits(engine);
 
-    await expect(
-      engine.restoreFile(heads[0], "a.md", { destination: ".obsidian/sneaky.md" })
-    ).rejects.toThrow(/not synced/);
-    expect(vault.files.has(".obsidian/sneaky.md")).toBe(false);
+    // A restore is not a sync. The sync policy decides what gets published automatically; it
+    // has no business deciding where its owner may put a file they asked for by name.
+    const out = await engine.restoreFile(heads[0], "a.md", { destination: ".obsidian/chosen.md" });
+
+    expect(out).toEqual({ kind: "written", path: ".obsidian/chosen.md", requested: ".obsidian/chosen.md" });
+    expect(vault.text(".obsidian/chosen.md")).toBe("one");
+  });
+
+  it("restores a config file the remote carries, in place", async () => {
+    const engine = makeEngine({ excludes: [] });
+    vault.set("a.md", "one");
+    await engine.sync();
+    // Carried through snapshots by a device that does sync the config folder. This device does
+    // not, which used to make the only copy visible in history and impossible to get back.
+    await server.seedRemoteCommit({ "a.md": "one", ".obsidian/app.json": "{\"theme\":\"moonstone\"}" });
+    await engine.sync();
+
+    const out = await engine.restoreFile(server.head!, ".obsidian/app.json");
+
+    expect(out.kind).toBe("written");
+    expect(vault.text(".obsidian/app.json")).toBe("{\"theme\":\"moonstone\"}");
+  });
+
+  it("restores third-party plugin code to a path the user picked", async () => {
+    const engine = makeEngine({ excludes: [] });
+    vault.set("a.md", "one");
+    await engine.sync();
+    await server.seedRemoteCommit({ "a.md": "one", ".obsidian/plugins/other/main.js": "console.log(1)" });
+    await engine.sync();
+
+    // Hard-skipped for *sync* because nobody should publish executable config by accident.
+    // Recovering a copy of it on request is a different act, and the user names the target.
+    const out = await engine.restoreFile(server.head!, ".obsidian/plugins/other/main.js", {
+      destination: "recovered-main.js.txt",
+    });
+
+    expect(out.kind).toBe("written");
+    expect(vault.text("recovered-main.js.txt")).toBe("console.log(1)");
+  });
+
+  it("leaves a restored unsynced file alone on the next pass rather than deleting it", async () => {
+    const engine = makeEngine({ excludes: [] });
+    vault.set("a.md", "one");
+    await engine.sync();
+    await server.seedRemoteCommit({ "a.md": "one", ".obsidian/app.json": "{}" });
+    await engine.sync();
+
+    await engine.restoreFile(server.head!, ".obsidian/app.json");
+    expect(vault.text(".obsidian/app.json")).toBe("{}");
+
+    // The obvious worry about writing onto a path the device does not scan: that the next pass
+    // treats it as a stray local file. It does not — an unscanned path is not in the local
+    // inventory, so there is no deletion to plan.
+    vault.set("b.md", "two", 1_754_000_400_000);
+    await engine.sync();
+
+    expect(vault.text(".obsidian/app.json")).toBe("{}");
+    expect(vault.removes).not.toContain(".obsidian/app.json");
+  });
+
+  it("says a restored file is not synced, so nobody assumes it was published", async () => {
+    const engine = makeEngine({ excludes: [".private/**"] });
+
+    expect(engine.syncsPath("notes/a.md")).toBe(true);
+    // Both the config folder this device does not sync and the user's own exclude are paths a
+    // restore will now happily write to, and both need the caveat afterwards.
+    expect(engine.syncsPath(".obsidian/app.json")).toBe(false);
+    expect(engine.syncsPath(".private/secret.md")).toBe(false);
   });
 
   it("refuses an overwrite that does not name the version it replaces", async () => {
@@ -601,7 +665,7 @@ describe("SyncEngine.inspectRestore", () => {
     await expect(engine.restoreFile(heads[2], "b.md")).rejects.toThrow(/not in snapshot/);
   });
 
-  it("refuses to restore a path this device would never sync", async () => {
+  it("refuses to write into this plugin's own folder, wherever the bytes came from", async () => {
     const engine = makeEngine({ excludes: [] });
     vault.set("a.md", "one");
     await engine.sync();
@@ -611,9 +675,27 @@ describe("SyncEngine.inspectRestore", () => {
     });
     await engine.sync();
 
+    // The one destination that stays closed, and not as policy: that folder holds this device's
+    // access token and master key, and the running plugin rewrites `data.json` from memory on
+    // its next save. A restore there either reports success over bytes about to be discarded or
+    // swaps this device's identity mid-session. Both are the ambiguous success this refuses.
     await expect(
       engine.restoreFile(server.head!, ".obsidian/plugins/obsidian-log-sync/data.json")
-    ).rejects.toThrow(/not synced/);
+    ).rejects.toThrow(/this plugin's own folder/);
+
+    // Closed as a *destination*, so choosing it for unrelated bytes is refused too.
+    await expect(
+      engine.restoreFile(server.head!, "a.md", {
+        destination: ".obsidian/plugins/obsidian-log-sync/data.json",
+      })
+    ).rejects.toThrow(/this plugin's own folder/);
+
+    // But the bytes themselves are readable and can be recovered somewhere else.
+    const out = await engine.restoreFile(server.head!, ".obsidian/plugins/obsidian-log-sync/data.json", {
+      destination: "recovered-data.json.txt",
+    });
+    expect(out.kind).toBe("written");
+    expect(vault.text("recovered-data.json.txt")).toBe("secret");
   });
 });
 

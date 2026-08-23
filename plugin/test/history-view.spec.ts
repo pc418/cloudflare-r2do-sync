@@ -85,6 +85,7 @@ function deps(
       calls.granularity.push(g);
     },
     listHistory: async () => listing([]),
+    syncsPath: () => true,
     snapshotFiles: async () => ({}),
     inspectRestore: async () => ({
       entry: entry(),
@@ -441,6 +442,57 @@ describe("the history window", () => {
     const texts = contentOf(modal).texts().join(" ");
     expect(texts).toContain("No snapshots in that range");
     expect(texts).not.toContain("no snapshots yet");
+  });
+
+  it("warns that a restored file on an unsynced path is never published", async () => {
+    const snap = snapshot();
+    const modal = new SnapshotModal(new App() as never, deps({
+      snapshotFiles: async () => ({ ".obsidian/app.json": entry() }),
+      inspectRestore: async () => ({
+        entry: entry(),
+        currentHash: null,
+        current: "absent",
+        unsyncedEdits: false,
+        suggestion: ".obsidian/app.json",
+      }),
+      restoreFile: async () => ({ kind: "written", path: ".obsidian/app.json", requested: ".obsidian/app.json" }),
+      syncsPath: () => false,
+    }), snap);
+    modal.open();
+    await settle();
+
+    const restore = rowsOf(modal).flatMap((r) => r.buttons).find((b) => b.text === "Restore");
+    restore!.click();
+    await settle();
+
+    // The write succeeded, and saying only "Restored" would let the user believe the file is
+    // now safe on every device. It is on this one, and nowhere else, ever.
+    const said = Notice.shown.at(-1)!;
+    expect(said).toContain("Restored");
+    expect(said).toContain("does not sync");
+  });
+
+  it("does not add the unsynced caveat to an ordinary restore", async () => {
+    const snap = snapshot();
+    const modal = new SnapshotModal(new App() as never, deps({
+      snapshotFiles: async () => ({ "a.md": entry() }),
+      inspectRestore: async () => ({
+        entry: entry(),
+        currentHash: null,
+        current: "absent",
+        unsyncedEdits: false,
+        suggestion: "a.md",
+      }),
+      restoreFile: async () => ({ kind: "written", path: "a.md", requested: "a.md" }),
+      syncsPath: () => true,
+    }), snap);
+    modal.open();
+    await settle();
+
+    rowsOf(modal).flatMap((r) => r.buttons).find((b) => b.text === "Restore")!.click();
+    await settle();
+
+    expect(Notice.shown.at(-1)!).not.toContain("does not sync");
   });
 
   it("opens the snapshot window with the diff it already has", async () => {
