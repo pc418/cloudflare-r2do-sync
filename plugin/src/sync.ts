@@ -2297,12 +2297,20 @@ export class SyncEngine {
       const tail = entries[entries.length - 1];
       const expected = previousOf(tail);
       if (expected === null) break;
-      if (this.#chainReachesBack(entries, limit, granularity, opts)) break;
+      // One past the limit, because "is there more after this list" is answered by whether a
+      // further row exists — so the walk stops once it has the rows plus that evidence.
+      if (this.#chainCovers(entries, limit + 1, granularity, opts)) break;
 
       const next = await this.#api.getHistory(CHAIN_PAGE, { before: tail.id });
-      // A cursor row a sweep collected between two pages, or an index that stops here. Neither
-      // is an error; both mean this is as far back as the index can be trusted to reach.
-      if (next === null || next.entries.length === 0) break;
+      if (next === null) break;
+      if (next.entries.length === 0) {
+        // Complete and empty is the cursor having been the last snapshot: the chain ends here.
+        // Incomplete and empty is the index failing to resolve the cursor — a sweep can collect
+        // one between two pages — which is a hole in the index, not the end of the vault's
+        // history, and is handled exactly like a hole found part-way down a page.
+        if (next.complete) break;
+        return this.#shortOfWhatItShows(entries, limit, granularity, opts);
+      }
       if (next.entries[0].id !== expected) {
         // A Worker predating the cursor ignores the parameter and answers the head page again.
         // That is a server capability, not a corrupt chain, and must not be reported as one.
@@ -2322,22 +2330,37 @@ export class SyncEngine {
         seen.add(entry.id);
         entries.push(entry);
       }
-      if (!next.complete) {
-        // The index has a hole here. If the listing already has everything it will show, the
-        // hole is past the end of it and costs nothing. If it does not, the same rule the first
-        // page follows applies: showing fewer snapshots than exist is worse than being slow, so
-        // hand the whole question to the walk rather than serve a knowingly short list.
-        return this.#chainReachesBack(entries, limit, granularity, opts) ? { entries, chainEnds: false } : null;
-      }
+      if (!next.complete) return this.#shortOfWhatItShows(entries, limit, granularity, opts);
     }
 
     return { entries, chainEnds: previousOf(entries[entries.length - 1]) === null, fallback };
   }
 
-  /** Whether the chain collected so far already reaches past what the listing will show. */
-  #chainReachesBack(
+  /**
+   * What to do about a hole in the index found part-way through paging.
+   *
+   * If everything the listing will show is already collected, the hole is past the end of it and
+   * costs nothing — keep the rows. If it is not, the rule the *first* page follows applies:
+   * showing fewer snapshots than exist is worse than being slow, so hand the whole question to
+   * the walk rather than serve a knowingly short list under a complete-looking listing.
+   */
+  #shortOfWhatItShows(
     entries: readonly HistoryEntry[],
     limit: number,
+    granularity: HistoryGranularity,
+    opts: HistoryOptions
+  ): { entries: HistoryEntry[]; chainEnds: boolean } | null {
+    // `limit`, not `limit + 1`: the extra row the paging loop wants exists only to decide
+    // whether to say "there is more", and `chainEnds: false` already says it.
+    return this.#chainCovers(entries, limit, granularity, opts)
+      ? { entries: [...entries], chainEnds: false }
+      : null;
+  }
+
+  /** Whether the chain collected so far already yields at least `need` of the rows to be shown. */
+  #chainCovers(
+    entries: readonly HistoryEntry[],
+    need: number,
     granularity: HistoryGranularity,
     opts: HistoryOptions
   ): boolean {
@@ -2345,8 +2368,8 @@ export class SyncEngine {
     const chainEnds = previousOf(oldest) === null;
     if (!isRanged(opts)) {
       return granularity === "sync"
-        ? entries.length > limit
-        : countGroups(entries, granularity, { chainEnds }) > limit;
+        ? entries.length >= need
+        : countGroups(entries, granularity, { chainEnds }) >= need;
     }
 
     // With a range, only rows *inside* it count. A `to` in the past filters out everything
@@ -2356,7 +2379,7 @@ export class SyncEngine {
       granularity === "sync"
         ? this.#flatPlan(entries)
         : this.#groupPlan(entries, granularity, chainEnds);
-    if (inRange(planned, opts).length > limit) return true;
+    if (inRange(planned, opts).length >= need) return true;
     // Nothing older than the range's start can matter, so the walk is finished once past it.
     return opts.from !== undefined && oldest.uploadedAt < opts.from;
   }

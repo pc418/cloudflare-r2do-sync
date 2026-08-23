@@ -137,7 +137,15 @@ export class FakeServer implements SyncApiLike {
    */
   maxHistoryPage = 500;
 
+  /**
+   * Runs before a listing is answered, so a test can collect a snapshot *between* two pages —
+   * which is the only way to produce a cursor row that existed when the client read it and is
+   * gone by the time it asks to continue from it.
+   */
+  beforeHistory: ((cursor: string | undefined) => void) | null = null;
+
   async getHistory(limit: number, opts: { before?: string } = {}): Promise<HistoryPage | null> {
+    this.beforeHistory?.(opts.before);
     this.historyRequests.push(limit);
     this.historyCursors.push(opts.before);
     if (!this.serveHistoryIndex) return null;

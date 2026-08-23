@@ -1326,6 +1326,40 @@ describe("SyncEngine.listHistory paging the chain", () => {
     expect(listing.rows.length).toBeGreaterThan(2);
   });
 
+  it("falls back when the cursor row itself is collected between two pages", async () => {
+    const heads = await manyCommits(5);
+    server.maxHistoryPage = 2;
+    // A sweep collects the row page two would continue from, after page one named it. The
+    // server answers that with an *empty* page marked incomplete — a hole in the index, not
+    // the end of the vault's history, and reading it as the latter hides everything behind it.
+    let call = 0;
+    server.beforeHistory = () => {
+      if (++call === 2) server.unindexed.add(heads[3]);
+    };
+
+    const listing = await makeEngine().listHistory(40, { changes: true, granularity: "day" });
+
+    expect(listing.fallback).toBe("no-index");
+    expect(listing.rows.length).toBeGreaterThan(2);
+  });
+
+  it("keeps an indexed listing holding exactly the rows it will show", async () => {
+    const heads = await manyCommits(5);
+    server.maxHistoryPage = 2;
+    // The hole sits immediately past the third bucket, which is exactly the limit — so it
+    // hides nothing this list would draw, and re-walking every manifest to reach it buys
+    // nothing. An off-by-one here silently degrades a perfectly good grouped listing.
+    server.unindexed.add(heads[0]);
+
+    const listing = await makeEngine().listHistory(3, { changes: true, granularity: "day" });
+
+    expect(listing.granularity).toBe("day");
+    expect(listing.fallback).toBeUndefined();
+    expect(listing.rows).toHaveLength(3);
+    // The hole is still real, so the list does not pretend to be the end of history.
+    expect(listing.more).toBe(true);
+  });
+
   it("keeps the indexed listing when the hole is past everything it would show", async () => {
     const heads = await manyCommits(5);
     server.maxHistoryPage = 2;
