@@ -184,14 +184,18 @@ export class SyncApi {
    * walk would not — it removes the walk. Null rather than a throw for 404: an older Worker
    * simply has no such route, and that is a reason to fall back, not to fail the window.
    */
-  async getHistory(limit: number): Promise<HistoryPage | null> {
+  async getHistory(limit: number, opts: { before?: string } = {}): Promise<HistoryPage | null> {
     let res: HttpResponse;
+    // Continues an earlier page from a row this client already holds. The server resolves that
+    // row's own link, so the seam between two pages is one the server vouched for rather than
+    // one assembled here out of two independent requests.
+    const cursor = opts.before === undefined ? "" : `&before=${encodeURIComponent(opts.before)}`;
     try {
       // `splices=1` says this client understands a chain whose links step over collected
       // commits. Without it a thinning server cuts the page at the first gap, which is the
       // right answer for a client that would read the links as parent-to-parent.
       res = await this.#request(
-        `/api/history?limit=${encodeURIComponent(String(limit))}&splices=1`
+        `/api/history?limit=${encodeURIComponent(String(limit))}&splices=1${cursor}`
       );
     } catch (e) {
       // Only "no such route" is evidence about the server's age. Anything else — 401, 429,

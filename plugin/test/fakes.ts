@@ -119,20 +119,47 @@ export class FakeServer implements SyncApiLike {
    */
   readonly splices = new Map<string, { spliceParent: string; pruned: number }>();
   readonly historyRequests: number[] = [];
+  /** The cursor each request carried, so a test can assert how a listing paged. */
+  readonly historyCursors: Array<string | undefined> = [];
+  /**
+   * Upload times a test wants to place snapshots on particular days. Anything absent falls back
+   * to the manifest's own creation time, which is what the real index records.
+   */
+  readonly uploadedAt = new Map<string, number>();
+  /**
+   * A Worker predating the paging cursor: it ignores `before` and answers from the head. The
+   * client has to notice that on its own, and say so rather than paging the same rows forever.
+   */
+  ignoreCursor = false;
+  /**
+   * The server's own page cap, which no client can raise. Lowered by a test to make paging
+   * happen over a handful of snapshots instead of five hundred.
+   */
+  maxHistoryPage = 500;
 
-  async getHistory(limit: number): Promise<HistoryPage | null> {
+  async getHistory(limit: number, opts: { before?: string } = {}): Promise<HistoryPage | null> {
     this.historyRequests.push(limit);
+    this.historyCursors.push(opts.before);
     if (!this.serveHistoryIndex) return null;
+    const max = Math.min(limit, this.maxHistoryPage);
     const entries: HistoryEntry[] = [];
+
     let id = this.head;
-    while (id !== null && entries.length < limit) {
+    if (opts.before !== undefined && !this.ignoreCursor) {
+      const from = this.manifests.get(opts.before);
+      if (from === undefined || this.unindexed.has(opts.before)) return { entries, complete: false };
+      id = this.splices.get(from.id)?.spliceParent ?? from.parent;
+    }
+
+    while (id !== null && entries.length < max) {
       const m = this.manifests.get(id);
       if (m === undefined || this.unindexed.has(id)) return { entries, complete: false };
       const splice = this.splices.get(m.id) ?? null;
+      const stamped = this.uploadedAt.get(m.id) ?? Date.parse(m.createdAt);
       entries.push({
         id: m.id,
         parent: m.parent,
-        uploadedAt: 1_754_000_000_000 + entries.length,
+        uploadedAt: Number.isFinite(stamped) ? stamped : 1_754_000_000_000,
         device: m.device,
         createdAt: m.createdAt,
         spliceParent: splice?.spliceParent ?? null,

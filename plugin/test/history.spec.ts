@@ -54,7 +54,7 @@ describe("SyncEngine.listHistory", () => {
     const engine = makeEngine();
     const heads = await threeCommits(engine);
 
-    const history = await engine.listHistory(10);
+    const history = (await engine.listHistory(10)).rows;
 
     expect(history.map((h) => h.id)).toEqual([heads[2], heads[1], heads[0]]);
     expect(history.map((h) => h.fileCount)).toEqual([1, 2, 1]);
@@ -66,11 +66,11 @@ describe("SyncEngine.listHistory", () => {
     const engine = makeEngine();
     await threeCommits(engine);
 
-    expect(await engine.listHistory(2)).toHaveLength(2);
+    expect((await engine.listHistory(2)).rows).toHaveLength(2);
   });
 
   it("returns nothing for an empty remote", async () => {
-    expect(await makeEngine().listHistory(10)).toEqual([]);
+    expect((await makeEngine().listHistory(10)).rows).toEqual([]);
   });
 
   it("stops cleanly when an ancestor has been garbage-collected", async () => {
@@ -78,7 +78,7 @@ describe("SyncEngine.listHistory", () => {
     const heads = await threeCommits(engine);
     server.manifests.delete(heads[0]);
 
-    const history = await engine.listHistory(10);
+    const history = (await engine.listHistory(10)).rows;
 
     expect(history.map((h) => h.id)).toEqual([heads[2], heads[1]]);
   });
@@ -91,7 +91,7 @@ describe("SyncEngine.listHistory", () => {
     const root = server.manifests.get(heads[0])!;
     server.manifests.set(heads[0], { ...root, parent: heads[2] });
 
-    const history = await engine.listHistory(10);
+    const history = (await engine.listHistory(10)).rows;
 
     expect(history.map((h) => h.id)).toEqual([heads[2], heads[1], heads[0]]);
   });
@@ -102,7 +102,7 @@ describe("SyncEngine.listHistory", () => {
     await engine.sync();
     server.seedRemoteEncryptedCommit({ keyId: "not-our-key" });
 
-    const history = await engine.listHistory(10);
+    const history = (await engine.listHistory(10)).rows;
 
     expect(history[0].readable).toBe(false);
     expect(history[0].fileCount).toBeNull();
@@ -132,7 +132,7 @@ describe("SyncEngine.listHistory with changes", () => {
     const engine = makeEngine();
     const heads = await edits(engine);
 
-    const history = await engine.listHistory(10, { changes: true });
+    const history = (await engine.listHistory(10, { changes: true })).rows;
 
     const changes = history[0].changes;
     if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
@@ -152,7 +152,7 @@ describe("SyncEngine.listHistory with changes", () => {
     const engine = makeEngine();
     await edits(engine);
 
-    const changes = (await engine.listHistory(10, { changes: true }))[0].changes;
+    const changes = (await engine.listHistory(10, { changes: true })).rows[0].changes;
     if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
 
     // a.md +2, b.md +1 arriving, c.md -1 leaving.
@@ -170,7 +170,7 @@ describe("SyncEngine.listHistory with changes", () => {
     vault.set("shot.png", new Uint8Array([0x89, 0x00, 0x01]), 1_754_000_100_000);
     await engine.sync();
 
-    const changes = (await engine.listHistory(10, { changes: true }))[0].changes;
+    const changes = (await engine.listHistory(10, { changes: true })).rows[0].changes;
     if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
     expect(changes.added).toBe(1);
     expect(changes.linesUnknown).toBe(1);
@@ -193,7 +193,7 @@ describe("SyncEngine.listHistory with changes", () => {
     vault.set("old.md", ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"].join("\n"), 1_754_000_100_000);
     await engine.sync();
 
-    const changes = (await engine.listHistory(10, { changes: true }))[0].changes;
+    const changes = (await engine.listHistory(10, { changes: true })).rows[0].changes;
     if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
     const change = changes.files.find((f) => f.path === "old.md")!;
     // Reporting +10 here would be a fabricated figure: the true delta is +3, and this device
@@ -214,7 +214,7 @@ describe("SyncEngine.listHistory with changes", () => {
     vault.set("b.md", ["x", "y"].join("\n"), 1_754_000_100_000);
     await engine.sync();
 
-    const changes = (await engine.listHistory(10, { changes: true }))[0].changes;
+    const changes = (await engine.listHistory(10, { changes: true })).rows[0].changes;
     if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
     expect(changes.files.map((f) => f.lines)).toEqual([null, null]);
     expect(changes.linesUnknown).toBe(2);
@@ -229,7 +229,7 @@ describe("SyncEngine.listHistory with changes", () => {
     vault.set("a.md", ["1", "2", "3", "4", "5"].join("\n"), 1_754_000_100_000);
     await engine.sync();
 
-    const changes = (await engine.listHistory(10, { changes: true }))[0].changes;
+    const changes = (await engine.listHistory(10, { changes: true })).rows[0].changes;
     if (changes === undefined || "unknown" in changes) throw new Error("expected a diff");
     expect(changes.files[0].lines).toBe(2);
     expect(changes.linesUnknown).toBe(0);
@@ -239,7 +239,7 @@ describe("SyncEngine.listHistory with changes", () => {
     const engine = makeEngine();
     const heads = await edits(engine);
 
-    const history = await engine.listHistory(10, { changes: true });
+    const history = (await engine.listHistory(10, { changes: true })).rows;
     const oldest = history[history.length - 1];
 
     expect(oldest.id).toBe(heads[0]);
@@ -254,7 +254,7 @@ describe("SyncEngine.listHistory with changes", () => {
     const engine = makeEngine();
     await edits(engine);
 
-    const history = await engine.listHistory(1, { changes: true });
+    const history = (await engine.listHistory(1, { changes: true })).rows;
 
     expect(history).toHaveLength(1);
     const changes = history[0].changes;
@@ -271,7 +271,7 @@ describe("SyncEngine.listHistory with changes", () => {
     await engine.listHistory(1);
 
     expect(server.manifestFetches.length - before).toBe(1);
-    expect((await engine.listHistory(1))[0].changes).toBeUndefined();
+    expect((await engine.listHistory(1)).rows[0].changes).toBeUndefined();
   });
 
   it("says the parent is missing rather than reporting an empty diff", async () => {
@@ -279,7 +279,7 @@ describe("SyncEngine.listHistory with changes", () => {
     const heads = await edits(engine);
     server.manifests.delete(heads[0]);
 
-    const history = await engine.listHistory(10, { changes: true });
+    const history = (await engine.listHistory(10, { changes: true })).rows;
 
     expect(history.map((h) => h.id)).toEqual([heads[1]]);
     expect(history[0].changes).toEqual({ unknown: "parent-missing" });
@@ -330,7 +330,7 @@ describe("SyncEngine.listHistory with changes", () => {
     // A readable snapshot on top, whose parent is the unreadable one.
     await server.seedRemoteCommit({ "a.md": "one", "later.md": "later" });
 
-    const history = await engine.listHistory(10, { changes: true });
+    const history = (await engine.listHistory(10, { changes: true })).rows;
 
     expect(history[0].changes).toEqual({ unknown: "parent-unreadable" });
     expect(history[1].changes).toEqual({ unknown: "unreadable" });
@@ -344,7 +344,7 @@ describe("SyncEngine.listHistory with changes", () => {
     // A second snapshot holding exactly the same files, as a forced push would produce.
     await server.seedRemoteCommit({ "a.md": "one" });
 
-    const history = await engine.listHistory(10, { changes: true });
+    const history = (await engine.listHistory(10, { changes: true })).rows;
 
     expect(history[0].parent).toBe(first);
     const changes = history[0].changes;
@@ -703,7 +703,7 @@ describe("history with encryption on", () => {
     vault.delete("b.md");
     await engine.sync();
 
-    const history = await engine.listHistory(10);
+    const history = (await engine.listHistory(10)).rows;
     expect(history[1].fileCount).toBe(2);
     expect(history[1].readable).toBe(true);
 
@@ -723,12 +723,12 @@ describe("SyncEngine.listHistory over the server index", () => {
   it("produces exactly what the walk produces", async () => {
     const engine = makeEngine();
     await threeCommits(engine);
-    const walked = await engine.listHistory(10, { changes: true });
+    const walked = (await engine.listHistory(10, { changes: true })).rows;
 
     // A different route to the same answer, or it is not a fast path — it is a second
     // implementation of history with its own opinions.
     server.serveHistoryIndex = true;
-    const indexed = await makeEngine().listHistory(10, { changes: true });
+    const indexed = (await makeEngine().listHistory(10, { changes: true })).rows;
 
     expect(indexed).toEqual(walked);
   });
@@ -740,7 +740,7 @@ describe("SyncEngine.listHistory over the server index", () => {
 
     const fresh = makeEngine();
     server.manifestFetches.length = 0;
-    const history = await fresh.listHistory(10, { changes: true });
+    const history = (await fresh.listHistory(10, { changes: true })).rows;
 
     expect(history.map((h) => h.id)).toEqual([heads[2], heads[1], heads[0]]);
     expect(server.historyRequests).toEqual([10]);
@@ -754,9 +754,9 @@ describe("SyncEngine.listHistory over the server index", () => {
     await threeCommits(engine);
     server.serveHistoryIndex = true;
 
-    const first = await engine.listHistory(10, { changes: true });
+    const first = (await engine.listHistory(10, { changes: true })).rows;
     server.manifestFetches.length = 0;
-    const second = await engine.listHistory(10, { changes: true });
+    const second = (await engine.listHistory(10, { changes: true })).rows;
 
     // A manifest id is permanent and one-use and its parent link never moves, so a row that
     // has been built can never be wrong. Nothing to invalidate, nothing to refetch.
@@ -773,10 +773,10 @@ describe("SyncEngine.listHistory over the server index", () => {
     vault.set("c.md", "sea", 1_754_000_300_000);
     await engine.sync();
     const newest = server.head!;
-    const parent = (await engine.listHistory(10))[1].id;
+    const parent = (await engine.listHistory(10)).rows[1].id;
     server.manifestFetches.length = 0;
 
-    const history = await engine.listHistory(10, { changes: true });
+    const history = (await engine.listHistory(10, { changes: true })).rows;
 
     expect(history[0].id).toBe(newest);
     expect(history[0].changes).toEqual(expect.objectContaining({ added: 1, removed: 0 }));
@@ -790,7 +790,7 @@ describe("SyncEngine.listHistory over the server index", () => {
     const heads = await threeCommits(engine);
     server.serveHistoryIndex = false;
 
-    const history = await makeEngine().listHistory(10, { changes: true });
+    const history = (await makeEngine().listHistory(10, { changes: true })).rows;
 
     expect(history.map((h) => h.id)).toEqual([heads[2], heads[1], heads[0]]);
   });
@@ -804,7 +804,7 @@ describe("SyncEngine.listHistory over the server index", () => {
     // history — worse than being slow.
     server.unindexed.add(heads[0]);
 
-    const history = await makeEngine().listHistory(10, { changes: true });
+    const history = (await makeEngine().listHistory(10, { changes: true })).rows;
 
     expect(history.map((h) => h.id)).toEqual([heads[2], heads[1], heads[0]]);
   });
@@ -815,7 +815,7 @@ describe("SyncEngine.listHistory over the server index", () => {
     server.serveHistoryIndex = true;
     server.manifests.delete(heads[0]);
 
-    const history = await makeEngine().listHistory(10, { changes: true });
+    const history = (await makeEngine().listHistory(10, { changes: true })).rows;
 
     // Retention trimmed it. The readable prefix is still shown, and the row that lost its
     // parent says so rather than reporting a diff against nothing.
@@ -841,7 +841,7 @@ describe("SyncEngine.listHistory over the server index", () => {
     server.serveHistoryIndex = true;
 
     const other = makeEngine({ crypto: await VaultCrypto.fromText("B".repeat(43) + "=") });
-    const history = await other.listHistory(10, { changes: true });
+    const history = (await other.listHistory(10, { changes: true })).rows;
 
     expect(history).toHaveLength(1);
     expect(history[0].readable).toBe(false);
@@ -979,7 +979,7 @@ describe("SyncEngine.listHistory across collected commits", () => {
     const heads = await threeCommits(engine);
     thinMiddle(heads);
 
-    const history = await makeEngine().listHistory(10, { changes: true });
+    const history = (await makeEngine().listHistory(10, { changes: true })).rows;
 
     expect(history.map((h) => h.id)).toEqual([heads[2], heads[0]]);
     const changes = history[0].changes;
@@ -1002,7 +1002,7 @@ describe("SyncEngine.listHistory across collected commits", () => {
     const heads = await threeCommits(engine);
     server.serveHistoryIndex = true;
 
-    const before = await engine.listHistory(10, { changes: true });
+    const before = (await engine.listHistory(10, { changes: true })).rows;
     expect(before.map((h) => h.id)).toEqual([heads[2], heads[1], heads[0]]);
     const firstRow = before[0].changes;
     if (firstRow === undefined || "unknown" in firstRow) throw new Error("expected a real diff");
@@ -1011,7 +1011,7 @@ describe("SyncEngine.listHistory across collected commits", () => {
     // The same engine, after a sweep moved the link its top row was diffed against. A cache
     // keyed by id alone would keep answering with the old, narrower diff.
     thinMiddle(heads);
-    const after = await engine.listHistory(10, { changes: true });
+    const after = (await engine.listHistory(10, { changes: true })).rows;
     const changes = after[0].changes;
     if (changes === undefined || "unknown" in changes) throw new Error("expected a real diff");
     expect(changes.spans).toBe(2);
@@ -1029,7 +1029,7 @@ describe("SyncEngine.listHistory across collected commits", () => {
     server.manifests.delete(heads[1]);
     server.manifests.delete(heads[0]);
 
-    const history = await makeEngine().listHistory(10, { changes: true });
+    const history = (await makeEngine().listHistory(10, { changes: true })).rows;
     expect(history.map((h) => h.id)).toEqual([heads[2]]);
     expect(history[0].changes).toEqual({ unknown: "parent-missing" });
   });
@@ -1062,7 +1062,7 @@ describe("SyncEngine.listHistory does not trust the index over the manifests", (
     server.getHistory = async () => listed;
     server.manifests.delete(heads[0]);
 
-    const history = await makeEngine().listHistory(10, { changes: true });
+    const history = (await makeEngine().listHistory(10, { changes: true })).rows;
 
     expect(history.map((h) => h.id)).toEqual([heads[2], heads[1]]);
     expect(history[1].changes).toEqual({ unknown: "parent-missing" });
@@ -1099,9 +1099,293 @@ describe("SyncEngine.listHistory does not trust the index over the manifests", (
       entries: real!.entries.map((e) => ({ ...e, device: "wrong", createdAt: "1999-01-01T00:00:00.000Z" })),
     });
 
-    const history = await makeEngine().listHistory(10, { changes: true });
+    const history = (await makeEngine().listHistory(10, { changes: true })).rows;
 
     expect(history[0].device).toBe("real-device");
     expect(history[0].createdAt).not.toBe("1999-01-01T00:00:00.000Z");
+  });
+});
+
+// Grouping the listing by calendar bucket. `historyLimit` counts rows, and on a vault that
+// commits a dozen times a day forty sync rows is about three days — against a server retaining
+// ninety plus a weekly tier forever. Grouping changes the unit and costs one boundary manifest
+// per bucket instead of one per sync.
+describe("SyncEngine.listHistory grouped by calendar bucket", () => {
+  /** A local wall-clock instant, so the buckets are the same ones in every timezone. */
+  function at(y: number, m: number, d: number, h = 12): number {
+    return new Date(y, m - 1, d, h).getTime();
+  }
+
+  /** Three commits, placed on the days a test wants them, with the index serving the chain. */
+  async function commitsOn(days: number[]): Promise<string[]> {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = true;
+    // heads[0] is the oldest; the days list is given newest-first to read like the window.
+    heads.forEach((id, i) => server.uploadedAt.set(id, days[heads.length - 1 - i]));
+    return heads;
+  }
+
+  it("collapses a day to its newest snapshot, diffed against the day before", async () => {
+    const heads = await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 19)]);
+
+    const listing = await makeEngine().listHistory(10, { changes: true, granularity: "day" });
+
+    // Two buckets: the 20th holds heads[2]; the 19th holds heads[1] and heads[0], and is
+    // represented by its newest.
+    expect(listing.rows.map((r) => r.id)).toEqual([heads[2], heads[1]]);
+    expect(listing.granularity).toBe("day");
+    expect(listing.rows[0].group?.syncs).toBe(1);
+    expect(listing.rows[1].group?.syncs).toBe(2);
+    // The 19th's row covers both of its syncs and is an initial diff, because nothing older
+    // exists — not "unknown", which would claim we could not tell.
+    const oldest = listing.rows[1].changes;
+    if (oldest === undefined || "unknown" in oldest) throw new Error("expected a real diff");
+    expect(oldest.initial).toBe(true);
+    expect(oldest.spans).toBe(2);
+  });
+
+  it("fetches one boundary manifest per bucket, not one per sync", async () => {
+    const heads = await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 19)]);
+
+    const fresh = makeEngine();
+    server.manifestFetches.length = 0;
+    await fresh.listHistory(10, { changes: true, granularity: "day" });
+
+    // heads[0] is inside the older bucket and never becomes a boundary, so it is never fetched.
+    expect([...server.manifestFetches].sort()).toEqual([heads[1], heads[2]].sort());
+  });
+
+  it("keeps the pick's own parent, so the manifest cross-check still applies", async () => {
+    const heads = await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 19)]);
+
+    const listing = await makeEngine().listHistory(10, { changes: true, granularity: "day" });
+
+    // The row stands for a bucket, but `parent` is still the snapshot's authenticated link —
+    // never the older bucket's pick, which nothing authenticates.
+    expect(listing.rows[0].parent).toBe(heads[1]);
+  });
+
+  it("groups by week, holding a Sunday in the week that began on Monday", async () => {
+    // 2026-08-17 is a Monday and the 23rd the Sunday closing that week.
+    const heads = await commitsOn([at(2026, 8, 24), at(2026, 8, 23), at(2026, 8, 17)]);
+
+    const listing = await makeEngine().listHistory(10, { changes: true, granularity: "week" });
+
+    expect(listing.rows.map((r) => r.id)).toEqual([heads[2], heads[1]]);
+    expect(listing.rows[1].group?.syncs).toBe(2);
+    expect(listing.rows[1].group?.start).toBe(at(2026, 8, 17, 0));
+  });
+
+  it("shares a fetched diff between a grouped row and a sync row over the same pair", async () => {
+    // One commit per day, so every bucket holds exactly one sync and each day row describes
+    // precisely the same two snapshots its sync row does.
+    const heads = await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+    const engine = makeEngine();
+    await engine.listHistory(10, { changes: true, granularity: "sync" });
+
+    server.manifestFetches.length = 0;
+    const grouped = await engine.listHistory(10, { changes: true, granularity: "day" });
+
+    expect(grouped.rows.map((r) => r.id)).toEqual([heads[2], heads[1], heads[0]]);
+    // Nothing refetched: the cache is keyed by the pair a diff describes, which both views agree
+    // on here. The bucket label is attached afterwards rather than baked into the cached row.
+    expect(server.manifestFetches).toEqual([]);
+    expect(grouped.rows[0].group?.granularity).toBe("day");
+  });
+
+  it("does not hand a grouped label to a sync listing built from the same cache", async () => {
+    await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+    const engine = makeEngine();
+    await engine.listHistory(10, { changes: true, granularity: "day" });
+
+    const flat = await engine.listHistory(10, { changes: true, granularity: "sync" });
+
+    // A row that says "Thursday" in a list of individual syncs would be a lie about what it is.
+    expect(flat.rows.every((r) => r.group === undefined)).toBe(true);
+  });
+
+  it("lists every sync when asked to, exactly as it always did", async () => {
+    const heads = await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 19)]);
+
+    const listing = await makeEngine().listHistory(10, { changes: true });
+
+    expect(listing.rows.map((r) => r.id)).toEqual([heads[2], heads[1], heads[0]]);
+    expect(listing.granularity).toBe("sync");
+    expect(listing.rows.every((r) => r.group === undefined)).toBe(true);
+  });
+
+  it("falls back to every sync, and says why, when the index cannot answer", async () => {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = false;
+
+    const listing = await makeEngine().listHistory(10, { changes: true, granularity: "day" });
+
+    // Grouping the walk would save nothing — it fetches every manifest to learn each parent —
+    // so the honest answer is flat rows plus a stated reason, never a quietly shorter list.
+    expect(listing.rows.map((r) => r.id)).toEqual([heads[2], heads[1], heads[0]]);
+    expect(listing.granularity).toBe("sync");
+    expect(listing.fallback).toBe("no-index");
+  });
+
+  it("reports nothing older when the whole chain fits", async () => {
+    await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+
+    expect((await makeEngine().listHistory(10, { granularity: "day" })).more).toBe(false);
+  });
+
+  it("says older snapshots exist when the limit cut the list", async () => {
+    await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+
+    const listing = await makeEngine().listHistory(2, { changes: true, granularity: "day" });
+
+    expect(listing.rows).toHaveLength(2);
+    // Without this a list cut by a limit reads as the end of the vault's history.
+    expect(listing.more).toBe(true);
+  });
+});
+
+// Paging the chain. A grouped row can hold a whole day's commits, so forty of them on a busy
+// vault reaches past the server's page cap — and a listing that stopped there would show a
+// fraction of what was asked for while looking complete.
+describe("SyncEngine.listHistory paging the chain", () => {
+  /** More commits than one page holds, each its own day so every one is its own bucket. */
+  async function manyCommits(count: number): Promise<string[]> {
+    const engine = makeEngine();
+    const heads: string[] = [];
+    for (let i = 0; i < count; i++) {
+      vault.set("a.md", `v${i}`, 1_754_000_000_000 + i * 1000);
+      await engine.sync();
+      heads.push(server.head!);
+    }
+    server.serveHistoryIndex = true;
+    heads.forEach((id, i) => server.uploadedAt.set(id, new Date(2026, 7, 1 + i, 12).getTime()));
+    return heads;
+  }
+
+  it("asks once when a flat listing fits in a page", async () => {
+    await manyCommits(3);
+    server.historyCursors.length = 0;
+
+    await makeEngine().listHistory(10, { changes: true });
+
+    // No cursor, one request: a flat listing asks for its limit and is done, as it always was.
+    expect(server.historyCursors).toEqual([undefined]);
+  });
+
+  it("continues past the first page from the row it already holds", async () => {
+    const heads = await manyCommits(5);
+    server.historyCursors.length = 0;
+
+    // A server whose pages hold two rows, and five buckets wanted: the listing has to page.
+    server.maxHistoryPage = 2;
+    const listing = await makeEngine().listHistory(5, { changes: true, granularity: "day" });
+
+    expect(listing.rows.map((r) => r.id)).toEqual([...heads].reverse());
+    expect(listing.more).toBe(false);
+  });
+
+  it("stops and says so when the server ignores the cursor", async () => {
+    await manyCommits(5);
+    server.maxHistoryPage = 2;
+    server.ignoreCursor = true;
+
+    const listing = await makeEngine().listHistory(40, { changes: true, granularity: "day" });
+
+    // An older Worker answering the head page again is a capability gap, not a corrupt chain,
+    // and reporting it as corruption would tell the user their history is broken when it is not.
+    expect(listing.fallback).toBe("no-cursor");
+    expect(listing.rows.length).toBeGreaterThan(0);
+  });
+
+  it("throws when two pages do not join up", async () => {
+    const heads = await manyCommits(4);
+    server.maxHistoryPage = 2;
+    // A server answering a continuation with a snapshot that is not the one it was asked for,
+    // and not the head either. A listing built over that seam would diff two snapshots with
+    // history between them and present it as one step.
+    const real = server.getHistory.bind(server);
+    let call = 0;
+    server.getHistory = async (limit: number, opts: { before?: string } = {}) => {
+      const page = await real(limit, opts);
+      if (call++ > 0 && page !== null && page.entries.length > 0) {
+        page.entries[0] = { ...page.entries[0], id: heads[0] };
+      }
+      return page;
+    };
+
+    await expect(
+      makeEngine().listHistory(40, { changes: true, granularity: "day" })
+    ).rejects.toThrow(/starts at/);
+  });
+});
+
+// A date range. Paging back until the range is covered is what makes "what did I do in July"
+// answerable on a vault whose July is far past the first page.
+describe("SyncEngine.listHistory over a date range", () => {
+  function at(y: number, m: number, d: number, h = 12): number {
+    return new Date(y, m - 1, d, h).getTime();
+  }
+
+  async function commitsOn(days: number[]): Promise<string[]> {
+    const engine = makeEngine();
+    const heads = await threeCommits(engine);
+    server.serveHistoryIndex = true;
+    heads.forEach((id, i) => server.uploadedAt.set(id, days[heads.length - 1 - i]));
+    return heads;
+  }
+
+  it("shows only the syncs inside the range", async () => {
+    const heads = await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+
+    const listing = await makeEngine().listHistory(10, {
+      changes: true,
+      from: at(2026, 8, 19, 0),
+      to: at(2026, 8, 20, 0),
+    });
+
+    expect(listing.rows.map((r) => r.id)).toEqual([heads[1]]);
+  });
+
+  it("still diffs the oldest row in range against the snapshot before it", async () => {
+    const heads = await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+
+    const listing = await makeEngine().listHistory(10, {
+      changes: true,
+      from: at(2026, 8, 19, 0),
+      to: at(2026, 8, 20, 0),
+    });
+
+    // The comparison reaches outside the range on purpose: "what changed on the first day you
+    // asked about" is unanswerable otherwise, and an initial diff there would be a lie.
+    const changes = listing.rows[0].changes;
+    if (changes === undefined || "unknown" in changes) throw new Error("expected a real diff");
+    expect(changes.initial).toBe(false);
+    expect(heads[0]).not.toBe(heads[1]);
+  });
+
+  it("places a grouped row by its bucket rather than by its newest sync", async () => {
+    const heads = await commitsOn([at(2026, 8, 20, 23), at(2026, 8, 19), at(2026, 8, 18)]);
+
+    const listing = await makeEngine().listHistory(10, {
+      changes: true,
+      granularity: "day",
+      from: at(2026, 8, 20, 0),
+    });
+
+    // The 20th's bucket starts at local midnight, which is what "from the 20th" has to mean.
+    expect(listing.rows.map((r) => r.id)).toEqual([heads[2]]);
+  });
+
+  it("says nothing is in an empty range rather than showing the newest history", async () => {
+    await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+
+    const listing = await makeEngine().listHistory(10, {
+      changes: true,
+      from: at(2026, 9, 1, 0),
+    });
+
+    expect(listing.rows).toEqual([]);
   });
 });

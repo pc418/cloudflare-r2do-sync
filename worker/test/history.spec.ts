@@ -34,6 +34,17 @@ async function history(limit?: number): Promise<Response> {
   return SELF.fetch(`${BASE}/api/history${q}`, authed(token));
 }
 
+interface Page {
+  complete: boolean;
+  entries: Array<{ id: string; parent: string | null; spliceParent?: string | null; pruned?: number | null }>;
+}
+
+async function page(query: string): Promise<Page> {
+  const res = await SELF.fetch(`${BASE}/api/history?${query}`, authed(token));
+  if (res.status !== 200) throw new Error(`history failed: ${res.status} ${await res.text()}`);
+  return (await res.json()) as Page;
+}
+
 function lockStub(): DurableObjectStub<VaultLock> {
   return env.VAULT_LOCK.get(env.VAULT_LOCK.idFromName("default")) as DurableObjectStub<VaultLock>;
 }
@@ -132,6 +143,94 @@ describe("GET /api/history", () => {
 
   it("requires an access token", async () => {
     expect((await SELF.fetch(`${BASE}/api/history`)).status).toBe(401);
+  });
+
+  it("continues from a cursor without repeating or skipping a snapshot", async () => {
+    const h = await seedBlob("one");
+    let head: string | null = null;
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      head = await publish(makeManifest({ parent: head, files: { "a.md": { h } } }), head);
+      ids.push(head);
+    }
+    const newestFirst = [...ids].reverse();
+
+    const first = await page("limit=2");
+    expect(first.entries.map((e) => e.id)).toEqual(newestFirst.slice(0, 2));
+
+    // The cursor names a row the client already holds; the server resolves that row's own link
+    // rather than taking a start id, so the seam cannot be handed a chain that does not join.
+    const second = await page(`limit=2&before=${first.entries[1].id}`);
+    expect(second.entries.map((e) => e.id)).toEqual(newestFirst.slice(2, 4));
+    expect(second.complete).toBe(true);
+
+    const third = await page(`limit=2&before=${second.entries[1].id}`);
+    expect(third.entries.map((e) => e.id)).toEqual(newestFirst.slice(4));
+    // Ran out of chain rather than out of limit, and said so by ending with a null link.
+    expect(third.entries[0].parent).toBeNull();
+    expect(third.complete).toBe(true);
+  });
+
+  it("is empty and complete when the cursor is the last snapshot", async () => {
+    const h = await seedBlob("one");
+    const only = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+
+    // Nothing older exists. That is a finished listing, not a broken one.
+    expect(await page(`before=${only}`)).toEqual({ entries: [], complete: true });
+  });
+
+  it("reports an incomplete page when the cursor row itself was collected", async () => {
+    const h = await seedBlob("one");
+    const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+    const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
+
+    await runInDurableObject(lockStub(), (lock: VaultLock) => {
+      (lock as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
+        "DELETE FROM manifest_index WHERE id = ?",
+        b
+      );
+    });
+
+    // A sweep can collect a cursor row between two pages. That is not an error and not
+    // evidence about history — it is a page the client must not treat as the end, so it says
+    // so and the client walks instead.
+    expect(await page(`before=${b}`)).toEqual({ entries: [], complete: false });
+    expect(a).not.toBe(b);
+  });
+
+  it("cuts a cursor page at a splice the client did not opt into", async () => {
+    const h = await seedBlob("one");
+    const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+    const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
+    const c = await publish(makeManifest({ parent: b, files: { "a.md": { h } } }), b);
+
+    // b's commits were thinned away: c now reaches a directly, and only a client that
+    // understands splices may be handed that link.
+    await runInDurableObject(lockStub(), (lock: VaultLock) => {
+      (lock as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
+        "INSERT INTO manifest_splices (survivor_id, splice_parent, spliced) VALUES (?, ?, ?)",
+        c,
+        a,
+        1
+      );
+    });
+
+    const cut = await page(`limit=5&before=${c}`);
+    expect(cut).toEqual({ entries: [], complete: false });
+
+    const followed = await page(`limit=5&before=${c}&splices=1`);
+    expect(followed.entries.map((e) => e.id)).toEqual([a]);
+    expect(followed.complete).toBe(true);
+  });
+
+  it("refuses a cursor that is not a manifest id", async () => {
+    for (const bad of ["", "abc", "../etc", "01".repeat(40)]) {
+      const res = await SELF.fetch(
+        `${BASE}/api/history?before=${encodeURIComponent(bad)}`,
+        authed(token)
+      );
+      expect(res.status).toBe(422);
+    }
   });
 
   it("never exposes the encrypted path map", async () => {

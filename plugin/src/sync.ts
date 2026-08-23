@@ -47,6 +47,12 @@ import {
   parseFileEntries,
   isEncryptedManifest,
 } from "./types";
+import {
+  countGroups,
+  groupHistory,
+  type HistoryGranularity,
+  type SnapshotGroup,
+} from "./history-groups";
 
 export interface SyncApiLike {
   getHead(): Promise<string | null>;
@@ -56,7 +62,7 @@ export interface SyncApiLike {
    * Null is a real answer, not an error: the route is newer than the oldest Workers this
    * plugin talks to, and a client that cannot fall back would break those vaults outright.
    */
-  getHistory(limit: number): Promise<HistoryPage | null>;
+  getHistory(limit: number, opts?: { before?: string }): Promise<HistoryPage | null>;
   getManifest(id: string): Promise<Manifest>;
   getBlob(hash: string): Promise<Uint8Array>;
   checkBlobs(hashes: string[]): Promise<string[]>;
@@ -352,6 +358,93 @@ export interface SnapshotInfo {
    * `{ unknown }` when they were asked for but could not be computed.
    */
   changes?: SnapshotChanges | { unknown: ChangesUnknown };
+  /**
+   * Present when this row stands for a calendar bucket rather than one sync. `id`, `parent` and
+   * `changes` still describe real snapshots — the bucket's newest, and its diff against the
+   * older bucket's newest — so everything that browses or restores from a row works unchanged.
+   */
+  group?: SnapshotGroup;
+}
+
+/**
+ * One row a listing intends to build: which snapshot, and what its diff is measured against.
+ *
+ * Lifting these out of `HistoryEntry` is what lets a flat listing and a grouped one share every
+ * expensive step. A sync row compares against the chain's next link; a bucket row compares
+ * against the older bucket's pick. Downstream, neither case is special.
+ */
+interface HistoryRow {
+  /** The snapshot fetched, shown and browsed. */
+  id: string;
+  /** Its own parent as the index reports it, cross-checked against the manifest. */
+  parent: string | null;
+  /** When the server took delivery of it. What a date range is measured against on a sync row. */
+  at: number;
+  /** What the diff is taken against. Null means nothing older exists: an initial diff. */
+  compareTo: string | null;
+  /** Syncs the diff covers, collected commits included. One for an ordinary snapshot-vs-parent. */
+  spans: number;
+  /** Label material for a bucket row. Absent on a sync row. */
+  group?: SnapshotGroup;
+}
+
+/** What a history listing could not do, said out loud rather than served as a shorter list. */
+export type HistoryFallback =
+  /** The server could not answer the chain, so these are walked rows and cannot be grouped. */
+  | "no-index"
+  /** The server does not understand the paging cursor, so the listing stops at one page. */
+  | "no-cursor";
+
+/** How far back a listing reaches, and in what unit. */
+export interface HistoryOptions {
+  changes?: boolean;
+  /** Rows per sync, per day or per week. Defaults to per sync. */
+  granularity?: HistoryGranularity;
+  /** Hide anything uploaded before this instant. Paging continues until the range is covered. */
+  from?: number;
+  /** Hide anything uploaded at or after this instant. */
+  to?: number;
+}
+
+export interface HistoryListing {
+  rows: SnapshotInfo[];
+  /** What the rows actually are — not what was asked for, when a fallback intervened. */
+  granularity: HistoryGranularity;
+  /**
+   * Older snapshots exist past the last row shown. Without this, a list cut by a limit or a page
+   * cap reads as the end of the vault's history, which is the same lie as an empty listing.
+   */
+  more: boolean;
+  fallback?: HistoryFallback;
+}
+
+/** Index rows one chain request asks for when a listing may need to page. Mirrors the server cap. */
+const CHAIN_PAGE = 500;
+
+/**
+ * Chain requests one listing will make. Forty week-buckets on a vault committing a dozen times
+ * a day is well inside this; the bound exists so a chain that never satisfies the stop condition
+ * cannot spin, not because anyone should reach it.
+ */
+const MAX_HISTORY_PAGES = 8;
+
+/**
+ * The rows a date range leaves visible.
+ *
+ * Applied to the *plan*, never to the chain feeding it. Filtering entries before they are
+ * grouped would build buckets out of a discontiguous set and diff snapshots that nothing sits
+ * between; filtering afterwards leaves every row diffed against its true neighbour, which for
+ * the oldest row in range is deliberately a snapshot outside it — that is what makes "what
+ * changed on the first day you asked about" answerable at all.
+ */
+function inRange(plan: readonly HistoryRow[], opts: HistoryOptions): HistoryRow[] {
+  if (opts.from === undefined && opts.to === undefined) return [...plan];
+  return plan.filter((row) => {
+    // A bucket is placed by the calendar unit it names, a sync by its own upload time.
+    const at = row.group?.start ?? row.at;
+    if (opts.from !== undefined && at < opts.from) return false;
+    return opts.to === undefined || at < opts.to;
+  });
 }
 
 /**
@@ -360,10 +453,12 @@ export interface SnapshotInfo {
  * The second half is what makes the cache safe once retention can thin the chain. A row's
  * diff describes an interval, and collecting the snapshot at the far end of that interval
  * moves it — so a row keyed by id alone would keep answering for an interval that no longer
- * exists.
+ * exists. Grouping needs no third component: a bucket row's interval *is* that pair, so a day
+ * row and a sync row that share a key are describing the same two snapshots and may share the
+ * fetch. The bucket label is attached at assembly rather than cached, precisely so they can.
  */
-function rowKey(entry: HistoryEntry): string {
-  return `${entry.id}\u0000${previousOf(entry) ?? ""}`;
+function rowKey(entry: { id: string; compareTo: string | null }): string {
+  return `${entry.id}\u0000${entry.compareTo ?? ""}`;
 }
 
 /**
@@ -2080,15 +2175,151 @@ export class SyncEngine {
    * a snapshot this device's key cannot open, so one unreadable entry does not hide the
    * readable history behind it.
    */
-  async listHistory(limit: number, opts: { changes?: boolean } = {}): Promise<SnapshotInfo[]> {
-    const page = await this.#api.getHistory(limit);
+  async listHistory(limit: number, opts: HistoryOptions = {}): Promise<HistoryListing> {
+    const granularity = opts.granularity ?? "sync";
+    const wantChanges = opts.changes === true;
+
+    const chain = await this.#collectChain(limit, granularity, opts);
     // Only a chain the server can vouch for end to end. A partial index would list fewer
     // snapshots than the walk finds, and quietly showing less history than exists is worse
     // than being slow — so anything short falls back rather than truncating what the user sees.
-    if (page !== null && page.complete && page.entries.length > 0) {
-      return await this.#listHistoryIndexed(page.entries, opts.changes === true);
+    if (chain === null) {
+      const walked = await this.#listHistoryByWalk(limit, { changes: wantChanges });
+      const listing: HistoryListing = { rows: walked.rows, granularity: "sync", more: walked.more };
+      // Grouping the walk would save nothing: it fetches every manifest to learn each parent,
+      // which is the entire cost. So the answer is flat rows and a note saying why, never a
+      // shorter list that hides how it was built.
+      if (granularity !== "sync") listing.fallback = "no-index";
+      return listing;
     }
-    return await this.#listHistoryByWalk(limit, opts);
+
+    const planned =
+      granularity === "sync"
+        ? this.#flatPlan(chain.entries)
+        : this.#groupPlan(chain.entries, granularity, chain.chainEnds);
+    const visible = inRange(planned, opts);
+    const rows = await this.#listHistoryRows(visible.slice(0, limit), wantChanges);
+
+    const listing: HistoryListing = {
+      rows,
+      granularity,
+      // Either the limit cut the list, or the chain itself continues past what was collected.
+      more: visible.length > limit || !chain.chainEnds,
+    };
+    if (chain.fallback !== undefined) listing.fallback = chain.fallback;
+    return listing;
+  }
+
+  /** Every listed snapshot as its own row, diffed against the link the chain gives it. */
+  #flatPlan(entries: readonly HistoryEntry[]): HistoryRow[] {
+    return entries.map((entry) => ({
+      id: entry.id,
+      parent: entry.parent,
+      at: entry.uploadedAt,
+      compareTo: previousOf(entry),
+      spans: (entry.pruned ?? 0) + 1,
+    }));
+  }
+
+  /** One row per calendar bucket, each diffed against the older bucket's newest snapshot. */
+  #groupPlan(
+    entries: readonly HistoryEntry[],
+    granularity: "day" | "week",
+    chainEnds: boolean
+  ): HistoryRow[] {
+    return groupHistory(entries, granularity, { chainEnds }).map((g) => ({
+      // The pick's own parent, never the older bucket's pick: the manifest authenticates
+      // `parent`, the index is cross-checked against it, and the window browses this snapshot.
+      id: g.pick.id,
+      parent: g.pick.parent,
+      at: g.pick.uploadedAt,
+      compareTo: g.compareTo,
+      spans: g.spans,
+      group: g.group,
+    }));
+  }
+
+  /**
+   * The chain to build a listing from, paged until it reaches far enough back.
+   *
+   * Null when the server cannot vouch for a chain at all, which sends the caller to the walk.
+   *
+   * Paging exists because `historyLimit` counts *rows*, and a grouped row can hold a whole
+   * day's commits — forty days on a busy vault is well past the server's 500-row page. Only a
+   * grouped or ranged listing pages; a flat one asks for its limit and is done, exactly as it
+   * was before.
+   */
+  async #collectChain(
+    limit: number,
+    granularity: HistoryGranularity,
+    opts: HistoryOptions
+  ): Promise<{ entries: HistoryEntry[]; chainEnds: boolean; fallback?: HistoryFallback } | null> {
+    const pages = granularity === "sync" && opts.from === undefined ? 1 : MAX_HISTORY_PAGES;
+    const pageSize = pages === 1 ? limit : CHAIN_PAGE;
+
+    const first = await this.#api.getHistory(pageSize);
+    if (first === null || !first.complete || first.entries.length === 0) return null;
+
+    const entries = [...first.entries];
+    const seen = new Set(entries.map((e) => e.id));
+    let fallback: HistoryFallback | undefined;
+
+    for (let page = 1; page < pages; page++) {
+      const tail = entries[entries.length - 1];
+      const expected = previousOf(tail);
+      if (expected === null) break;
+      if (this.#chainReachesBack(entries, limit, granularity, opts)) break;
+
+      const next = await this.#api.getHistory(CHAIN_PAGE, { before: tail.id });
+      // A cursor row a sweep collected between two pages, or an index that stops here. Neither
+      // is an error; both mean this is as far back as the index can be trusted to reach.
+      if (next === null || next.entries.length === 0) break;
+      if (next.entries[0].id !== expected) {
+        // A Worker predating the cursor ignores the parameter and answers the head page again.
+        // That is a server capability, not a corrupt chain, and must not be reported as one.
+        if (next.entries[0].id === entries[0].id) {
+          fallback = "no-cursor";
+          break;
+        }
+        throw new Error(
+          `history page after ${tail.id} starts at ${next.entries[0].id}, not ${expected}`
+        );
+      }
+      for (const entry of next.entries) {
+        // A manifest id is used once, ever. `parseHistoryPage` enforces that within a page;
+        // across pages a repeat means the chain cycles, and a listing built over it would diff
+        // a snapshot against itself and report that nothing changed.
+        if (seen.has(entry.id)) throw new Error(`history repeats ${entry.id} across pages`);
+        seen.add(entry.id);
+        entries.push(entry);
+      }
+      if (!next.complete) break;
+    }
+
+    return { entries, chainEnds: previousOf(entries[entries.length - 1]) === null, fallback };
+  }
+
+  /** Whether the chain collected so far already reaches past what the listing will show. */
+  #chainReachesBack(
+    entries: readonly HistoryEntry[],
+    limit: number,
+    granularity: HistoryGranularity,
+    opts: HistoryOptions
+  ): boolean {
+    // A range is covered once the walk has passed its start; until then, more pages are the
+    // only way to know whether the earliest day asked for holds anything at all.
+    if (opts.from !== undefined && entries[entries.length - 1].uploadedAt >= opts.from) {
+      // Unless the range already holds more rows than the listing can show anyway.
+      const chainEnds = previousOf(entries[entries.length - 1]) === null;
+      const planned =
+        granularity === "sync"
+          ? this.#flatPlan(entries)
+          : this.#groupPlan(entries, granularity, chainEnds);
+      return inRange(planned, opts).length > limit;
+    }
+    if (granularity === "sync") return entries.length > limit;
+    const chainEnds = previousOf(entries[entries.length - 1]) === null;
+    return countGroups(entries, granularity, { chainEnds }) > limit;
   }
 
   /**
@@ -2099,28 +2330,24 @@ export class SyncEngine {
    * and rows already computed this session are not fetched at all. Reopening the window
    * normally costs one request plus the snapshots made since it was last open.
    */
-  async #listHistoryIndexed(
-    entries: readonly HistoryEntry[],
-    wantChanges: boolean
-  ): Promise<SnapshotInfo[]> {
+  async #listHistoryRows(plan: readonly HistoryRow[], wantChanges: boolean): Promise<SnapshotInfo[]> {
     // A row built for a caller that did not want diffs has no `changes`, and handing it to one
     // that does would report "no change recorded" for a snapshot nobody diffed. `rerootSummary`
     // asks without diffs, so the two callers really do share this cache.
-    const usable = (entry: HistoryEntry): SnapshotInfo | undefined => {
+    const usable = (entry: HistoryRow): SnapshotInfo | undefined => {
       const row = this.#historyRows.get(rowKey(entry));
       if (row === undefined) return undefined;
       return !wantChanges || row.changes !== undefined ? row : undefined;
     };
 
     const needed = new Set<string>();
-    for (const entry of entries) {
+    for (const entry of plan) {
       if (usable(entry) !== undefined) continue;
       needed.add(entry.id);
       // One manifest past the last uncached row, and only to give it something to diff
-      // against — the same single extra fetch the walk pays. Across collected history that
-      // is the nearest snapshot the server still holds rather than the literal parent.
-      const previous = previousOf(entry);
-      if (wantChanges && previous !== null) needed.add(previous);
+      // against — the same single extra fetch the walk pays. Across collected history, or
+      // across a bucket, that is the nearest snapshot still held rather than the literal parent.
+      if (wantChanges && entry.compareTo !== null) needed.add(entry.compareTo);
     }
 
     const ids = [...needed];
@@ -2149,11 +2376,16 @@ export class SyncEngine {
     });
     ids.forEach((id, i) => fetched.set(id, loaded[i]));
 
+    // The bucket label is view-specific and free to compute, so it is attached here rather than
+    // cached — which is what lets a day row and a sync row over the same pair share one fetch.
+    const label = (row: SnapshotInfo, entry: HistoryRow): SnapshotInfo =>
+      entry.group === undefined ? row : { ...row, group: entry.group };
+
     const out: SnapshotInfo[] = [];
-    for (const entry of entries) {
+    for (const entry of plan) {
       const cached = usable(entry);
       if (cached !== undefined) {
-        out.push(cached);
+        out.push(label(cached, entry));
         continue;
       }
       const got = fetched.get(entry.id);
@@ -2184,12 +2416,12 @@ export class SyncEngine {
         fileCount: got.files === null ? null : Object.keys(got.files).length,
         readable: got.files !== null,
       };
-      if (wantChanges) info.changes = this.#changesFor(entry, manifest, got.files, fetched);
-      out.push(info);
+      if (wantChanges) info.changes = this.#changesFor(entry, got.files, fetched);
       // Keyed by the snapshot this row was compared against, so it stays valid for exactly as
       // long as that comparison does — permanently for a true parent, and until the next tier
-      // transition for one reached across collected history.
+      // transition for one reached across collected history or across a bucket boundary.
       this.#historyRows.set(rowKey(entry), info);
+      out.push(label(info, entry));
     }
     return out;
   }
@@ -2203,10 +2435,13 @@ export class SyncEngine {
    * decrypted itself, over a wider interval, carrying `spans` so it is shown as one. That is
    * a different thing from an unknown diff: nothing here is being guessed, and rendering it
    * as `parent-missing` would hide a change the user can still see both ends of.
+   *
+   * A grouped row reaches the same shape by a different route: its interval is a calendar
+   * bucket rather than a collected stretch, and the snapshots inside it still exist. `spans`
+   * says how many syncs the diff covers either way, which is the only thing the reader needs.
    */
   #changesFor(
-    entry: HistoryEntry,
-    manifest: Manifest,
+    entry: HistoryRow,
     files: Record<string, FileEntry> | null,
     fetched: ReadonlyMap<
       string,
@@ -2214,16 +2449,22 @@ export class SyncEngine {
     >
   ): SnapshotChanges | { unknown: ChangesUnknown } {
     if (files === null) return { unknown: "unreadable" };
-    const previous = previousOf(entry);
-    if (previous === null) return diffSnapshots(null, files);
-    const parent = fetched.get(previous);
+    // The span is a fact about the interval, not about what it is being compared to, so the
+    // vault's first bucket carries it too: a day that held four syncs held four syncs whether
+    // or not there was a snapshot before it.
+    const span = (changes: SnapshotChanges): SnapshotChanges =>
+      entry.spans <= 1 ? changes : { ...changes, spans: entry.spans };
+    if (entry.compareTo === null) return span(diffSnapshots(null, files));
+    const parent = fetched.get(entry.compareTo);
     if (parent === undefined || "missing" in parent) return { unknown: "parent-missing" };
     if (parent.files === null) return { unknown: "parent-unreadable" };
-    const changes = diffSnapshots(parent.files, files);
-    return entry.pruned === null ? changes : { ...changes, spans: entry.pruned + 1 };
+    return span(diffSnapshots(parent.files, files));
   }
 
-  async #listHistoryByWalk(limit: number, opts: { changes?: boolean } = {}): Promise<SnapshotInfo[]> {
+  async #listHistoryByWalk(
+    limit: number,
+    opts: { changes?: boolean } = {}
+  ): Promise<{ rows: SnapshotInfo[]; more: boolean }> {
     const wantChanges = opts.changes === true;
     const out: SnapshotInfo[] = [];
     const seen = new Set<string>();
@@ -2245,11 +2486,19 @@ export class SyncEngine {
       else info.changes = diffSnapshots(parent.files, files);
     };
 
+    // Whether the chain carries on past the last row listed. Only a walk cut by the limit says
+    // yes: a walk that ran out of chain, hit a collected ancestor, or found the chain corrupt
+    // has nothing further to offer, and claiming otherwise would send the user back for it.
+    let more = false;
+
     for (;;) {
       // Past the limit the walk continues for exactly one more manifest, and only to give the
       // last listed snapshot something to diff against. Without diffs it stops at the limit.
       const parentOnly = out.length >= limit;
-      if (parentOnly && !wantChanges) break;
+      if (parentOnly && !wantChanges) {
+        more = id !== null;
+        break;
+      }
       if (id === null) {
         settle("initial");
         break;
@@ -2284,7 +2533,12 @@ export class SyncEngine {
         files = null;
       }
       settle(files === null ? { unknown: "parent-unreadable" } : { files });
-      if (parentOnly) break;
+      if (parentOnly) {
+        // This manifest was fetched only to diff the last listed row against; it is itself a
+        // snapshot the listing did not show, so there is demonstrably more history.
+        more = true;
+        break;
+      }
 
       const info: SnapshotInfo = {
         id: manifest.id,
@@ -2298,7 +2552,7 @@ export class SyncEngine {
       pending = { info, files };
       id = manifest.parent;
     }
-    return out;
+    return { rows: out, more };
   }
 
   /** The path → entry map a snapshot recorded, decrypting the path map when needed. */
@@ -2645,8 +2899,10 @@ export class SyncEngine {
     const chain = await this.listHistory(historyLimit);
     return {
       ...push,
-      discarded: chain.length,
-      discardedIsFloor: chain.length >= historyLimit,
+      discarded: chain.rows.length,
+      // A count cut by the limit is a floor, and so is one cut by a chain the listing could not
+      // follow to its end — both understate what a reroot abandons.
+      discardedIsFloor: chain.rows.length >= historyLimit || chain.more,
     };
   }
 

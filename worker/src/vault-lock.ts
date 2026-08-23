@@ -101,6 +101,17 @@ export interface HistoryPage {
   complete: boolean;
 }
 
+/** An indexed snapshot as the chain walk reads it: the row, plus the splice it may carry. */
+interface ChainRow {
+  id: string;
+  parent: string | null;
+  uploaded_at: number;
+  device: string | null;
+  created_at: string | null;
+  splice_parent: string | null;
+  spliced: number | null;
+}
+
 /** Manifests one `advanceHistoryDetail` call reads before handing control back. */
 const DEFAULT_HISTORY_DETAIL_CHUNK = 25;
 
@@ -603,35 +614,36 @@ export class VaultLock extends DurableObject<Env> {
    *
    * Reads no R2. A row the index does not reach ends the walk with `complete: false` rather
    * than pretending the vault's history stops there.
+   *
+   * `opts.before` continues an earlier page. It names a row the client already holds, and the
+   * server resolves that row's own link — never a start id from the client — so a continuation
+   * cannot be handed a chain whose links do not join up, which is the same reason a page is
+   * validated as a chain at all. A cursor row that is gone (a sweep can collect one between two
+   * pages) is an incomplete page, not an error: it is a listing the client must not read as the
+   * end of history.
    */
-  listHistory(limit: number, opts: { splices?: boolean } = {}): HistoryPage {
+  listHistory(limit: number, opts: { splices?: boolean; before?: string } = {}): HistoryPage {
     const max = Math.max(1, Math.min(limit, MAX_HISTORY_PAGE));
     const entries: HistoryEntry[] = [];
     const seen = new Set<string>();
     let id = this.#storedHead();
+
+    if (opts.before !== undefined) {
+      const from = this.#chainRow(opts.before);
+      if (from === undefined) return { entries, complete: false };
+      // Same rule the uncursored walk applies at a gap: a client that did not ask for splices
+      // reads `parent` as "the next row", so it must not be stepped over a collected stretch.
+      if (from.splice_parent !== null && opts.splices !== true) return { entries, complete: false };
+      seen.add(opts.before);
+      id = from.splice_parent ?? from.parent;
+    }
 
     while (id !== null && entries.length < max) {
       // The one-use rule makes a repeat impossible unless the index itself is corrupt, and a
       // walk that trusted it anyway would spin until the limit. Same guard as the client's.
       if (seen.has(id)) return { entries, complete: false };
       seen.add(id);
-      const row = this.ctx.storage.sql
-        .exec<{
-          id: string;
-          parent: string | null;
-          uploaded_at: number;
-          device: string | null;
-          created_at: string | null;
-          splice_parent: string | null;
-          spliced: number | null;
-        }>(
-          `SELECT i.id, i.parent, i.uploaded_at, i.device, i.created_at, s.splice_parent, s.spliced
-             FROM manifest_index i
-             LEFT JOIN manifest_splices s ON s.survivor_id = i.id
-            WHERE i.id = ?`,
-          id
-        )
-        .toArray()[0];
+      const row = this.#chainRow(id);
       if (row === undefined) return { entries, complete: false };
       entries.push({
         id: row.id,
@@ -650,6 +662,19 @@ export class VaultLock extends DurableObject<Env> {
       id = row.splice_parent ?? row.parent;
     }
     return { entries, complete: true };
+  }
+
+  /** One indexed snapshot with the link it is actually followed by. Undefined when unindexed. */
+  #chainRow(id: string): ChainRow | undefined {
+    return this.ctx.storage.sql
+      .exec<ChainRow>(
+        `SELECT i.id, i.parent, i.uploaded_at, i.device, i.created_at, s.splice_parent, s.spliced
+           FROM manifest_index i
+           LEFT JOIN manifest_splices s ON s.survivor_id = i.id
+          WHERE i.id = ?`,
+        id
+      )
+      .toArray()[0];
   }
 
   /**
