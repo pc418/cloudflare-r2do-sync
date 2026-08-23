@@ -1253,6 +1253,20 @@ describe("SyncEngine.listHistory grouped by calendar bucket", () => {
     expect(first.initial).toBe(true);
   });
 
+  it("walks rather than believing a page that a splice into nothing produced", async () => {
+    const heads = await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+    // A splice only ever names a survivor, so one pointing at a snapshot the index does not
+    // have is corruption — not the ordinary dangling `parent` at the end of retained history.
+    // Treating it as the end would let a grouped listing present a truncated chain as whole.
+    server.splices.set(heads[1], { spliceParent: "01GONEXXXXXXXXXXXXXXXXXXXX", pruned: 1 });
+
+    const listing = await makeEngine().listHistory(40, { changes: true, granularity: "day" });
+
+    expect(listing.fallback).toBe("no-index");
+    expect(listing.granularity).toBe("sync");
+    expect(heads[2]).not.toBe(heads[0]);
+  });
+
   it("calls an empty vault empty rather than an index that could not answer", async () => {
     server.serveHistoryIndex = true;
 

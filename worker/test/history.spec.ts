@@ -252,6 +252,28 @@ describe("GET /api/history", () => {
     expect(body.entries[0].parent).toBe(a);
   });
 
+  it("does not call a vault with an unindexed head empty", async () => {
+    const h = await seedBlob("one");
+    const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);
+    const b = await publish(makeManifest({ parent: a, files: { "a.md": { h } } }), a);
+
+    // Index/R2 divergence: the head pointer names a snapshot the index does not have. Nothing
+    // vouches for the head the way a cursor or a previous row vouches for what follows it, so
+    // this is corruption — not a vault that ran out of history. An empty *complete* page is
+    // exactly the shape a client reads as "this vault has no snapshots at all".
+    await runInDurableObject(lockStub(), (lock: VaultLock) => {
+      (lock as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
+        "DELETE FROM manifest_index WHERE id = ?",
+        b
+      );
+    });
+
+    const body = await page("limit=500&splices=1");
+    expect(body.entries).toEqual([]);
+    expect(body.complete).toBe(false);
+    expect(a).not.toBe(b);
+  });
+
   it("fails closed when a splice names a snapshot the index does not have", async () => {
     const h = await seedBlob("one");
     const a = await publish(makeManifest({ files: { "a.md": { h } } }), null);

@@ -159,19 +159,31 @@ export class FakeServer implements SyncApiLike {
     const entries: HistoryEntry[] = [];
 
     let id = this.head;
+    // Mirrors the Worker exactly, because the client's `chainEnds` is read off these answers:
+    // a splice into nothing is corruption (a sweep only splices onto a survivor), and the head
+    // is vouched for by nothing, so an unindexed head is divergence rather than an empty vault.
+    let viaSplice = false;
+    const anchored = opts.before !== undefined && !this.ignoreCursor;
     if (opts.before !== undefined && !this.ignoreCursor) {
       const from = this.manifests.get(opts.before);
       if (from === undefined || this.unindexed.has(opts.before)) return { entries, complete: false };
+      viaSplice = this.splices.has(from.id);
       id = this.splices.get(from.id)?.spliceParent ?? from.parent;
     }
 
     while (id !== null && entries.length < max) {
       const m = this.manifests.get(id);
       if (m === undefined || this.unindexed.has(id)) {
-        // A link into nothing is the end of *retained* history once the index is built: the
-        // oldest snapshot a thinned vault keeps names a parent a sweep collected. Only an
-        // index that has not finished backfilling turns that into a hole.
-        return { entries, complete: this.indexBackfilled && !this.unindexed.has(id) };
+        // A plain `parent` into nothing is the end of *retained* history once the index is
+        // built: the oldest snapshot a thinned vault keeps names a parent a sweep collected.
+        // An unfinished backfill, a splice into nothing, or a head nothing vouches for are all
+        // holes instead, and have to keep sending the client to the manifests.
+        const end =
+          (anchored || entries.length > 0) &&
+          !viaSplice &&
+          this.indexBackfilled &&
+          !this.unindexed.has(id);
+        return { entries, complete: end };
       }
       const splice = this.splices.get(m.id) ?? null;
       const stamped = this.uploadedAt.get(m.id) ?? Date.parse(m.createdAt);
@@ -184,6 +196,7 @@ export class FakeServer implements SyncApiLike {
         spliceParent: splice?.spliceParent ?? null,
         pruned: splice?.pruned ?? null,
       });
+      viaSplice = splice !== null;
       id = splice?.spliceParent ?? m.parent;
     }
     return { entries, complete: true };

@@ -638,6 +638,11 @@ export class VaultLock extends DurableObject<Env> {
     // names a survivor, so a splice leading nowhere is corruption. A plain `parent` leading
     // nowhere is the ordinary end of retained history — see `#reachedRetainedEnd`.
     let viaSplice = false;
+    // Whether anything vouches for the id being looked up. A cursor was itself found in the
+    // index before its link was followed, and every id past the first was read off a row. The
+    // *head* is vouched for by nothing: it comes from the head pointer, so a head that is not
+    // indexed is index/R2 divergence — never a vault that has run out of history.
+    const anchored = opts.before !== undefined;
 
     if (opts.before !== undefined) {
       const from = this.#chainRow(opts.before);
@@ -656,7 +661,9 @@ export class VaultLock extends DurableObject<Env> {
       if (seen.has(id)) return { entries, complete: false };
       seen.add(id);
       const row = this.#chainRow(id);
-      if (row === undefined) return { entries, complete: this.#reachedRetainedEnd(viaSplice) };
+      if (row === undefined) {
+        return { entries, complete: this.#reachedRetainedEnd(viaSplice, anchored || entries.length > 0) };
+      }
       entries.push({
         id: row.id,
         parent: row.parent,
@@ -692,9 +699,15 @@ export class VaultLock extends DurableObject<Env> {
    * stretch it collects *mid-chain*, so only an open run at the chain's end is left dangling
    * (`applyGcSplices` drops it rather than splicing it onto nothing). A `splice_parent` naming a
    * snapshot that is not indexed is therefore corruption, and must keep failing closed.
+   *
+   * `anchored` is the third: something has to vouch for the id that came up missing. A cursor
+   * was found in the index before its link was followed, and every id past the first was read
+   * off a row that exists. The *head* is vouched for by nothing — so an unindexed head is
+   * index/R2 divergence, and calling it "the end of retained history" would hand the client an
+   * empty, complete page, which `#collectChain` reads as a vault with no snapshots at all.
    */
-  #reachedRetainedEnd(viaSplice: boolean): boolean {
-    return !viaSplice && this.#gcIndexReady();
+  #reachedRetainedEnd(viaSplice: boolean, anchored: boolean): boolean {
+    return anchored && !viaSplice && this.#gcIndexReady();
   }
 
   /** One indexed snapshot with the link it is actually followed by. Undefined when unindexed. */
