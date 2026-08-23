@@ -1351,6 +1351,7 @@ export default class LogSyncPlugin extends Plugin {
       restoreFile: (id, path, opts) => engine.restoreFile(id, path, opts),
       restoreAll: (id) => this.#withVaultRewrite(RESTORE_ALL_BLOCK, () => engine.restoreAll(id)),
       syncsPath: (path) => engine.syncsPath(path),
+      restoreDestinationBlock: (path) => engine.restoreDestinationBlock(path),
       historyLimit: this.settings.historyLimit,
       granularity: this.settings.historyGranularity,
       // Remembered across openings, because the unit someone reads history in is a standing
@@ -2772,6 +2773,8 @@ export interface HistoryDeps {
   restoreAll(id: string): Promise<{ written: number; removed: number }>;
   /** Whether this device syncs a path, so a restore onto one it does not can say so. */
   syncsPath(path: string): boolean;
+  /** Why a destination is closed, so the window asks for another instead of writing into it. */
+  restoreDestinationBlock(path: string): string | null;
   /** How many rows to list; each one is a manifest fetch. */
   historyLimit: number;
   /** The unit the window opens in. */
@@ -3226,7 +3229,11 @@ export class SnapshotModal extends Modal {
       new Notice(`${path} is already identical to this snapshot — nothing to restore`);
       return;
     }
-    if (seen.current === "absent") {
+    // A snapshot can hold a file whose own path is a closed destination. Nothing is there to
+    // preserve, but writing in place is refused — so the window has to ask where to put it
+    // rather than hand back a throw the user cannot act on.
+    const blocked = this.deps.restoreDestinationBlock(path);
+    if (seen.current === "absent" && blocked === null) {
       // Bound to "nothing was there", so a file that appears in the meantime is not clobbered
       // by a decision taken before it existed.
       await this.#run(path, { expectedHash: seen.currentHash });
@@ -3235,6 +3242,7 @@ export class SnapshotModal extends Modal {
     new RestoreDestinationModal(this.app, {
       path,
       inspection: seen,
+      blocked,
       onRestore: (choice) => this.#run(path, choice),
     }).open();
   }
@@ -3346,6 +3354,8 @@ export class RestoreDestinationModal extends Modal {
     private readonly opts: {
       path: string;
       inspection: RestoreInspection;
+      /** Why the original path cannot be written to, when that is why this window is open. */
+      blocked?: string | null;
       onRestore: (choice: {
         destination?: string;
         overwrite?: boolean;
@@ -3361,10 +3371,18 @@ export class RestoreDestinationModal extends Modal {
     const { path, inspection } = this.opts;
     contentEl.empty();
     contentEl.createEl("h2", { text: `Restore ${path}` });
-    contentEl.createEl("p", {
-      text: `A different version of this file is at ${path} right now.`,
-    });
-    contentEl.createEl("p", { text: unsyncedWarning(inspection.unsyncedEdits) });
+    const blocked = this.opts.blocked ?? null;
+    if (blocked !== null) {
+      // Not "a different version is here" — nothing may be written here at all, whatever is or
+      // is not on disk. Saying which it is decides whether the overwrite button makes sense.
+      contentEl.createEl("p", { text: `${path} cannot be written to: ${blocked}.` });
+      contentEl.createEl("p", { text: "Choose somewhere else to put the restored copy." });
+    } else {
+      contentEl.createEl("p", {
+        text: `A different version of this file is at ${path} right now.`,
+      });
+      contentEl.createEl("p", { text: unsyncedWarning(inspection.unsyncedEdits) });
+    }
 
     let destination = inspection.suggestion;
     new Setting(contentEl)
@@ -3390,7 +3408,13 @@ export class RestoreDestinationModal extends Modal {
             await this.opts.onRestore({ destination });
           })
       )
-      .addButton((b) =>
+      .addButton((b) => {
+        // Replacing the file in place is precisely what a closed destination forbids, so the
+        // button is not offered at all rather than offered and then refused by the engine.
+        if (blocked !== null) {
+          b.setButtonText("Replace current file").setDisabled(true);
+          return;
+        }
         b
           .setButtonText("Replace current file")
           .setWarning()
@@ -3419,8 +3443,8 @@ export class RestoreDestinationModal extends Modal {
                 });
               },
             }).open();
-          })
-      )
+          });
+      })
       .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
   }
 

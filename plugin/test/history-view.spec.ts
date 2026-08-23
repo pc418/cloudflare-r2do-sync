@@ -86,6 +86,7 @@ function deps(
     },
     listHistory: async () => listing([]),
     syncsPath: () => true,
+    restoreDestinationBlock: () => null,
     snapshotFiles: async () => ({}),
     inspectRestore: async () => ({
       entry: entry(),
@@ -442,6 +443,38 @@ describe("the history window", () => {
     const texts = contentOf(modal).texts().join(" ");
     expect(texts).toContain("No snapshots in that range");
     expect(texts).not.toContain("no snapshots yet");
+  });
+
+  it("asks where to put a file whose own path may not be written to", async () => {
+    const calls: Calls = { restore: [], restoreAll: [], syncs: 0, granularity: [] };
+    const modal = new SnapshotModal(new App() as never, deps({
+      snapshotFiles: async () => ({ ".obsidian/plugins/obsidian-log-sync/data.json": entry() }),
+      inspectRestore: async () => ({
+        entry: entry(),
+        currentHash: null,
+        current: "absent",
+        unsyncedEdits: false,
+        suggestion: "data (restored 2026-08-05).json",
+      }),
+      restoreDestinationBlock: () => "that is this plugin's own folder",
+    }, calls), snapshot());
+    modal.open();
+    await settle();
+
+    rowsOf(modal).flatMap((r) => r.buttons).find((b) => b.text === "Restore")!.click();
+    await settle();
+
+    // Nothing is on disk, so the old path wrote straight in and surfaced a throw the user could
+    // do nothing about. The bytes are meant to stay recoverable, so it has to ask instead.
+    const opened = Modal.shown.at(-1)!;
+    expect(opened).toBeInstanceOf(RestoreDestinationModal);
+    const texts = contentOf(opened).texts().join(" ");
+    expect(texts).toContain("cannot be written to");
+    expect(calls.restore).toEqual([]);
+
+    // And the one button that would write in place is not on offer.
+    const replace = contentOf(opened).log.rows.flatMap((r) => r.buttons).find((b) => b.text === "Replace current file");
+    expect(replace?.disabled).toBe(true);
   });
 
   it("warns that a restored file on an unsynced path is never published", async () => {

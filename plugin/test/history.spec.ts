@@ -489,6 +489,62 @@ describe("SyncEngine.restoreFile", () => {
     expect(vault.text("recovered-main.js.txt")).toBe("console.log(1)");
   });
 
+  it("numbers a copy beside an occupied destination this device does not sync", async () => {
+    const engine = makeEngine({ excludes: [] });
+    vault.set("a.md", "one");
+    await engine.sync();
+    await server.seedRemoteCommit({ "a.md": "one", ".obsidian/app.json": "{\"from\":\"remote\"}" });
+    await engine.sync();
+    vault.set(".obsidian/app.json", "{\"from\":\"local\"}");
+
+    // Numbering used to be filtered by the sync policy, so every candidate beside an unsynced
+    // destination was skipped and the restore claimed all copies were taken with (2) free.
+    const out = await engine.restoreFile(server.head!, ".obsidian/app.json");
+
+    expect(out.kind).toBe("copied");
+    expect(out.path).toBe(".obsidian/app (2).json");
+    expect(vault.text(".obsidian/app (2).json")).toBe("{\"from\":\"remote\"}");
+    // And the file that was already there is untouched.
+    expect(vault.text(".obsidian/app.json")).toBe("{\"from\":\"local\"}");
+  });
+
+  it("closes the plugin folder under any spelling a case-insensitive vault accepts", async () => {
+    const engine = makeEngine();
+
+    // macOS and Windows vaults are case-insensitive by default, so this names the live
+    // credential file. A case-sensitive guard would wave it straight through to an overwrite.
+    for (const spelling of [
+      ".obsidian/plugins/cloudflare-rdo-sync/data.json",
+      ".obsidian/plugins/CLOUDFLARE-RDO-SYNC/data.json",
+      ".obsidian/plugins/Cloudflare-Rdo-Sync/data.json",
+      ".obsidian/plugins/obsidian-log-sync/data.json",
+    ]) {
+      expect(engine.restoreDestinationBlock(spelling), spelling).not.toBeNull();
+    }
+    expect(engine.restoreDestinationBlock(".obsidian/plugins/other/data.json")).toBeNull();
+    expect(engine.restoreDestinationBlock("notes/a.md")).toBeNull();
+  });
+
+  it("suggests a destination outside the folder it may not write to", async () => {
+    const engine = makeEngine({ excludes: [] });
+    vault.set("a.md", "one");
+    await engine.sync();
+    await server.seedRemoteCommit({
+      "a.md": "one",
+      ".obsidian/plugins/obsidian-log-sync/data.json": "secret",
+    });
+    await engine.sync();
+
+    const seen = await engine.inspectRestore(
+      server.head!,
+      ".obsidian/plugins/obsidian-log-sync/data.json"
+    );
+
+    // The copy path of a file inside that folder is still inside it, so the offer has to leave.
+    expect(engine.restoreDestinationBlock(seen.suggestion)).toBeNull();
+    expect(seen.suggestion).not.toContain("plugins/");
+  });
+
   it("leaves a restored unsynced file alone on the next pass rather than deleting it", async () => {
     const engine = makeEngine({ excludes: [] });
     vault.set("a.md", "one");

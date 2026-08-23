@@ -2653,7 +2653,7 @@ export class SyncEngine {
       currentHash: local,
       current: local === null ? "absent" : local === entry.h ? "identical" : "differs",
       unsyncedEdits: local !== null && local !== state?.files[path]?.h,
-      suggestion: restoreCopyPath(path, manifest.createdAt),
+      suggestion: this.#restoreSuggestion(path, manifest.createdAt),
     };
   }
 
@@ -2736,7 +2736,10 @@ export class SyncEngine {
   ): Promise<{ path: string; identical: boolean }> {
     for (let n = 2; n <= MAX_RESTORE_COPIES; n++) {
       const candidate = numberedPath(requested, n);
-      if (this.#notScanned(candidate)) continue;
+      // The destination rule, deliberately not the sync policy. Filtering these by what the
+      // device *syncs* skipped every candidate beside an unsynced destination — so a restore
+      // onto an occupied config path reported all copies taken while `(2)` sat free.
+      if (this.restoreDestinationBlock(candidate) !== null) continue;
       const existing = await this.#localHash(candidate);
       if (existing === null) return { path: candidate, identical: false };
       if (existing === hash) return { path: candidate, identical: true };
@@ -2745,6 +2748,20 @@ export class SyncEngine {
       `refusing to restore "${requested}": ${MAX_RESTORE_COPIES} numbered copies beside it are ` +
         `already taken by different content`
     );
+  }
+
+  /**
+   * Where to offer to put a restored copy.
+   *
+   * Beside the original, except when that would land somewhere nothing may be written — the
+   * copy path of a file inside this plugin's folder is still inside this plugin's folder, so
+   * the offer has to leave it. The vault root is the one place known to be open.
+   */
+  #restoreSuggestion(path: string, createdAt: string): string {
+    const beside = restoreCopyPath(path, createdAt);
+    if (this.restoreDestinationBlock(beside) === null) return beside;
+    const name = beside.slice(beside.lastIndexOf("/") + 1);
+    return this.restoreDestinationBlock(name) === null ? name : `restored-${name}`;
   }
 
   /**
@@ -2794,14 +2811,34 @@ export class SyncEngine {
   #assertRestorableDestination(path: string): void {
     const bad = pathError(path);
     if (bad !== null) throw new Error(`"${path}" is not a valid vault path: ${bad}`);
+    const blocked = this.restoreDestinationBlock(path);
+    if (blocked !== null) throw new Error(`refusing to restore into "${path}": ${blocked}`);
+  }
+
+  /**
+   * Why a destination is closed to a restore, or null when it is open.
+   *
+   * Public because the window has to know *before* it offers an in-place restore: a snapshot
+   * can hold a file whose own path is closed, and with no local copy the browser would otherwise
+   * write straight to it and surface a throw with no way to redirect. The source stays
+   * recoverable — that is the whole point — so the UI asks for another destination instead.
+   *
+   * Case-folded, like destination collision detection: the default macOS and Windows vaults are
+   * case-insensitive, so `.obsidian/plugins/CLOUDFLARE-RDO-SYNC/data.json` is the live
+   * credential file under another spelling, and a case-sensitive guard would wave it through.
+   */
+  restoreDestinationBlock(path: string): string | null {
+    const folded = foldPath(path);
     for (const dir of selfDirs(this.#configDir)) {
-      if (path === dir || path.startsWith(`${dir}/`)) {
-        throw new Error(
-          `refusing to restore into "${path}": that is this plugin's own folder, which holds ` +
-            `this device's credentials and is rewritten from memory while the plugin runs`
+      const self = foldPath(dir);
+      if (folded === self || folded.startsWith(`${self}/`)) {
+        return (
+          "that is this plugin's own folder, which holds this device's credentials and is " +
+          "rewritten from memory while the plugin runs"
         );
       }
     }
+    return null;
   }
 
   /**
