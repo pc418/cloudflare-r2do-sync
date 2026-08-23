@@ -165,11 +165,15 @@ describe.skipIf(config === null)("Global chrome and commands", () => {
     expect(modal.contentEl.log.headings[0]).toBe("Snapshot history");
     // `onOpen` is async (it fetches the list), so the rows populate after the modal is already
     // on top — checking too early would be a false negative here, not a pass.
+    // Snapshot rows only. The Group by and Between controls render synchronously, so waiting
+    // on `settings.length` would be satisfied before the list had loaded anything at all.
     await harness.waitFor(
-      () => modal.contentEl.log.settings.length > 0 || modal.contentEl.log.paragraphs.some((p) => /no snapshots/i.test(p)),
+      () =>
+        LiveHarness.historyRows(modal.contentEl.log).length > 0 ||
+        modal.contentEl.log.paragraphs.some((p) => /no snapshots/i.test(p)),
       { label: "history list to finish loading" }
     );
-    expect(modal.contentEl.log.settings.length).toBeGreaterThan(0);
+    expect(LiveHarness.historyRows(modal.contentEl.log).length).toBeGreaterThan(0);
   });
 
   it('"sync-export-log" writes a report note to disk, same as the Export button', async () => {

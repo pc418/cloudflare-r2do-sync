@@ -437,8 +437,12 @@ const MAX_HISTORY_PAGES = 8;
  * the oldest row in range is deliberately a snapshot outside it — that is what makes "what
  * changed on the first day you asked about" answerable at all.
  */
+function isRanged(opts: HistoryOptions): boolean {
+  return opts.from !== undefined || opts.to !== undefined;
+}
+
 function inRange(plan: readonly HistoryRow[], opts: HistoryOptions): HistoryRow[] {
-  if (opts.from === undefined && opts.to === undefined) return [...plan];
+  if (!isRanged(opts)) return [...plan];
   return plan.filter((row) => {
     // A bucket is placed by the calendar unit it names, a sync by its own upload time.
     const at = row.group?.start ?? row.at;
@@ -2200,11 +2204,16 @@ export class SyncEngine {
     const visible = inRange(planned, opts);
     const rows = await this.#listHistoryRows(visible.slice(0, limit), wantChanges);
 
+    // A range that the walk got past is a finished question: snapshots older than its start
+    // exist, but none of them belong in this list, and offering to fetch them would be noise.
+    const oldest = chain.entries[chain.entries.length - 1];
+    const settled =
+      chain.chainEnds || (opts.from !== undefined && oldest.uploadedAt < opts.from);
     const listing: HistoryListing = {
       rows,
       granularity,
-      // Either the limit cut the list, or the chain itself continues past what was collected.
-      more: visible.length > limit || !chain.chainEnds,
+      // Either the limit cut the list, or the chain continues past what was collected.
+      more: visible.length > limit || !settled,
     };
     if (chain.fallback !== undefined) listing.fallback = chain.fallback;
     return listing;
@@ -2254,7 +2263,7 @@ export class SyncEngine {
     granularity: HistoryGranularity,
     opts: HistoryOptions
   ): Promise<{ entries: HistoryEntry[]; chainEnds: boolean; fallback?: HistoryFallback } | null> {
-    const pages = granularity === "sync" && opts.from === undefined ? 1 : MAX_HISTORY_PAGES;
+    const pages = granularity === "sync" && !isRanged(opts) ? 1 : MAX_HISTORY_PAGES;
     const pageSize = pages === 1 ? limit : CHAIN_PAGE;
 
     const first = await this.#api.getHistory(pageSize);
@@ -2306,20 +2315,24 @@ export class SyncEngine {
     granularity: HistoryGranularity,
     opts: HistoryOptions
   ): boolean {
-    // A range is covered once the walk has passed its start; until then, more pages are the
-    // only way to know whether the earliest day asked for holds anything at all.
-    if (opts.from !== undefined && entries[entries.length - 1].uploadedAt >= opts.from) {
-      // Unless the range already holds more rows than the listing can show anyway.
-      const chainEnds = previousOf(entries[entries.length - 1]) === null;
-      const planned =
-        granularity === "sync"
-          ? this.#flatPlan(entries)
-          : this.#groupPlan(entries, granularity, chainEnds);
-      return inRange(planned, opts).length > limit;
+    const oldest = entries[entries.length - 1];
+    const chainEnds = previousOf(oldest) === null;
+    if (!isRanged(opts)) {
+      return granularity === "sync"
+        ? entries.length > limit
+        : countGroups(entries, granularity, { chainEnds }) > limit;
     }
-    if (granularity === "sync") return entries.length > limit;
-    const chainEnds = previousOf(entries[entries.length - 1]) === null;
-    return countGroups(entries, granularity, { chainEnds }) > limit;
+
+    // With a range, only rows *inside* it count. A `to` in the past filters out everything
+    // fetched so far, so stopping on the raw row count would page once and then report the
+    // range as empty while the snapshots it asked for sat one page further back.
+    const planned =
+      granularity === "sync"
+        ? this.#flatPlan(entries)
+        : this.#groupPlan(entries, granularity, chainEnds);
+    if (inRange(planned, opts).length > limit) return true;
+    // Nothing older than the range's start can matter, so the walk is finished once past it.
+    return opts.from !== undefined && oldest.uploadedAt < opts.from;
   }
 
   /**

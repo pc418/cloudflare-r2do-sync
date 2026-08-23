@@ -1378,6 +1378,36 @@ describe("SyncEngine.listHistory over a date range", () => {
     expect(listing.rows.map((r) => r.id)).toEqual([heads[2]]);
   });
 
+  it("pages past newer snapshots to reach a range that ends in the past", async () => {
+    const heads = await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+    // Pages that hold one row, so the range's snapshots are two pages behind the head.
+    server.maxHistoryPage = 1;
+
+    const listing = await makeEngine().listHistory(10, {
+      changes: true,
+      to: at(2026, 8, 19, 0),
+    });
+
+    // Stopping on the raw row count would page once, filter its single newer row away, and
+    // report the range as empty while the snapshot it asked for sat one page further back.
+    expect(listing.rows.map((r) => r.id)).toEqual([heads[0]]);
+  });
+
+  it("does not offer older snapshots once the walk is past the range's start", async () => {
+    await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
+    server.maxHistoryPage = 1;
+
+    const listing = await makeEngine().listHistory(10, {
+      changes: true,
+      from: at(2026, 8, 20, 0),
+    });
+
+    // The chain does continue, but nothing older belongs in this list, so saying "older
+    // snapshots exist past this list" would send the user after rows the range excludes.
+    expect(listing.rows).toHaveLength(1);
+    expect(listing.more).toBe(false);
+  });
+
   it("says nothing is in an empty range rather than showing the newest history", async () => {
     await commitsOn([at(2026, 8, 20), at(2026, 8, 19), at(2026, 8, 18)]);
 
