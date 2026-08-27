@@ -1867,11 +1867,16 @@ export class SyncEngine {
     const todo = plan.filter((a) => a.plan !== "keep-ours");
     let done = 0;
 
-    const each = await mapPool(todo, this.#lanes, async (action) => {
+    // Filled by the lanes as deletions land, because a failed pass must still prune what it
+    // deleted: the path is then absent on both sides, so no later pass will ever plan it again.
+    const deleted: string[] = [];
+    let each: MergeOutcome[];
+    const run = mapPool(todo, this.#lanes, async (action) => {
       const out: MergeOutcome = { pulled: 0, merged: 0, pulledChanges: [], conflicts: [], conflictDetails: [] };
       switch (action.plan) {
         case "delete-local":
           await this.#vault.remove(action.path);
+          deleted.push(action.path);
           out.pulled++;
           out.pulledChanges.push(this.#localChange(action.path, "delete", null));
           break;
@@ -1898,15 +1903,18 @@ export class SyncEngine {
       this.#onProgress?.({ phase: "pull", done: ++done, total: todo.length });
       return out;
     });
-
-    // A folder is only ever the parent of a file, so a pulled tree move deletes the files and
-    // leaves the old skeleton standing. Sequential and after the pool: lanes racing on shared
-    // ancestors is a TOCTOU generator, and deepest-first only converges when a parent is
-    // checked after its child has gone. A throw above skips this; the next pass catches up.
-    const deleted = todo.filter((a) => a.plan === "delete-local").map((a) => a.path);
-    for (const dir of pruneCandidates(deleted, this.#configDir)) {
-      await this.#vault.removeFolderIfEmpty(dir);
+    try {
+      each = await run;
+    } catch (error) {
+      // The pool failure is the pass's error; a prune failure on the way out must not displace it.
+      try {
+        await this.#pruneEmptied(deleted);
+      } catch {
+        /* reported error stays the pool's */
+      }
+      throw error;
     }
+    await this.#pruneEmptied(deleted);
 
     const total: MergeOutcome = { pulled: 0, merged: 0, pulledChanges: [], conflicts: [], conflictDetails: [] };
     for (const one of each) {
@@ -2922,13 +2930,37 @@ export class SyncEngine {
         !collisionResolution.protectedLocalPaths.includes(file.path) &&
         !Object.hasOwn(files, file.path)
     );
-    await mapPool(stale, this.#lanes, (file) => this.#vault.remove(file.path));
-    // Same reason and same shape as `#executePlan`: sequential, deepest-first, after the pool.
-    for (const dir of pruneCandidates(stale.map((file) => file.path), this.#configDir)) {
-      await this.#vault.removeFolderIfEmpty(dir);
+    // Same reason and same shape as `#executePlan`: a removal that landed before another lane
+    // failed will never be planned again, so its folders are pruned even on the way out.
+    const removed: string[] = [];
+    try {
+      await mapPool(stale, this.#lanes, async (file) => {
+        await this.#vault.remove(file.path);
+        removed.push(file.path);
+      });
+    } catch (error) {
+      try {
+        await this.#pruneEmptied(removed);
+      } catch {
+        /* reported error stays the pool's */
+      }
+      throw error;
     }
+    await this.#pruneEmptied(removed);
 
     return { written: fetched.length, removed: stale.length };
+  }
+
+  /**
+   * A folder is only ever the parent of a file, so deletions strand the old skeleton on the
+   * device that receives them. Sequential and after the lanes settle: lanes racing on shared
+   * ancestors is a TOCTOU generator, and deepest-first only converges when a parent is
+   * checked after its child has gone.
+   */
+  async #pruneEmptied(deleted: string[]): Promise<void> {
+    for (const dir of pruneCandidates(deleted, this.#configDir)) {
+      await this.#vault.removeFolderIfEmpty(dir);
+    }
   }
 
   /**

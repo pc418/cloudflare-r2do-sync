@@ -825,6 +825,31 @@ describe("SyncEngine.sync — pull", () => {
     expect(vault.folderChecks).toEqual([]);
   });
 
+  // A deletion that landed before another lane failed will never be planned again — the path
+  // is gone on both sides — so the failing pass is the only chance to prune its folders.
+  it("still prunes the folders its completed deletions emptied when another lane fails", async () => {
+    vault.set("a/b/x.md", "one");
+    vault.set("boom.md", "old");
+    for (const name of ["keep1.md", "keep2.md", "keep3.md"]) vault.set(name, name);
+    await engine.sync();
+
+    await server.seedRemoteCommit({
+      "boom.md": "new",
+      "keep1.md": "keep1.md",
+      "keep2.md": "keep2.md",
+      "keep3.md": "keep3.md",
+    });
+    const write = vault.write.bind(vault);
+    vault.write = async (path, bytes) => {
+      if (path === "boom.md") throw new Error("disk full");
+      await write(path, bytes);
+    };
+
+    await expect(engine.sync()).rejects.toThrow(/disk full/);
+    expect(vault.files.has("a/b/x.md")).toBe(false);
+    expect(vault.folderRemoves).toEqual(["a/b", "a"]);
+  });
+
   it("restores a file we deleted that the remote had edited", async () => {
     vault.set("a.md", "one");
     await engine.sync();

@@ -112,10 +112,15 @@ export class ObsidianVault implements VaultAdapter {
       await this.app.vault.adapter.rmdir(path, false);
     } catch (error) {
       // Tolerate only the two races, as `#ensureFolder` does: another actor removed the
-      // folder first, or something appeared inside it between the listing and the rmdir.
+      // folder first, or something appeared inside it between the listing and the rmdir. A
+      // folder still standing *empty* is neither — the rmdir itself failed, and swallowing
+      // that (EPERM, EIO) strands the folder with no later deletion to try again.
       const raced = await this.app.vault.adapter.stat(path);
       if (raced === null) return true;
-      if (raced.type === "folder") return false;
+      if (raced.type === "folder") {
+        const relisted = await this.app.vault.adapter.list(path);
+        if (relisted.files.length > 0 || relisted.folders.length > 0) return false;
+      }
       throw error;
     }
     return true;

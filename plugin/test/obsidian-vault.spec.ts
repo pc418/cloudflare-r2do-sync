@@ -263,4 +263,15 @@ describe("ObsidianVault.removeFolderIfEmpty", () => {
     };
     await expect(vault(adapter).removeFolderIfEmpty("a/b")).rejects.toThrow(/EPERM/);
   });
+
+  // A folder still standing *empty* after a failed rmdir is neither race: the rmdir itself
+  // failed, and reading it as "something appeared" strands the folder with no retry to come.
+  it("propagates an rmdir failure that left the folder standing empty", async () => {
+    const adapter = emptyFolder("a/b");
+    adapter.rmdir = async () => {
+      throw new Error("EPERM");
+    };
+    await expect(vault(adapter).removeFolderIfEmpty("a/b")).rejects.toThrow(/EPERM/);
+    expect(adapter.entries.has("a/b")).toBe(true);
+  });
 });
