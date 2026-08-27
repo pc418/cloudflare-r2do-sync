@@ -109,6 +109,41 @@ describe("SyncEngine.forcePull", () => {
     expect(vault.text("a.md")).toBe("remote-a");
   });
 
+  // The stale removal is the other place a whole subtree can disappear at once, and it
+  // strands the same directory skeleton the pull merge used to.
+  it("prunes the folders its stale removals emptied, deepest first", async () => {
+    const engine = makeEngine();
+    vault.set("a/b/x.md", "one");
+    vault.set("keep.md", "keep");
+    await engine.sync();
+    await server.seedRemoteCommit({ "keep.md": "keep" });
+
+    await engine.forcePull();
+
+    expect(vault.removes).toEqual(["a/b/x.md"]);
+    expect(vault.folderRemoves).toEqual(["a/b", "a"]);
+  });
+
+  it("still prunes what its stale removal managed before a failing lane", async () => {
+    const engine = makeEngine();
+    vault.set("a/b/x.md", "one");
+    vault.set("c/y.md", "two");
+    vault.set("keep.md", "keep");
+    await engine.sync();
+    await server.seedRemoteCommit({ "keep.md": "keep" });
+
+    const remove = vault.remove.bind(vault);
+    vault.remove = async (path) => {
+      if (path === "c/y.md") throw new Error("volume locked");
+      await remove(path);
+    };
+
+    await expect(engine.forcePull()).rejects.toThrow(/volume locked/);
+    expect(vault.files.has("a/b/x.md")).toBe(false);
+    expect(vault.folderRemoves).toEqual(["a/b", "a"]);
+    expect(vault.files.has("c/y.md")).toBe(true);
+  });
+
   it("leaves paths this device does not sync alone on both sides", async () => {
     const engine = makeEngine({ excludes: ["private/**"] });
     await divergedRemote(engine);

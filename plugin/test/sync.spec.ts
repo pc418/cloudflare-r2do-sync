@@ -774,6 +774,82 @@ describe("SyncEngine.sync — pull", () => {
     ]);
   });
 
+  // A whole-tree move reaches this device as deletions plus writes elsewhere. Sync is
+  // file-only, so without this the old directory skeleton stands in the file explorer forever.
+  it("prunes the folders a pulled deletion emptied, deepest first", async () => {
+    vault.set("a/b/c/x.md", "one");
+    vault.set("a/b/y.md", "two");
+    // Enough untouched files that the two deletions stay under the mass-change guard: this
+    // is about the folders, not about the watched decision.
+    for (const name of ["keep1.md", "keep2.md", "keep3.md"]) vault.set(name, name);
+    await engine.sync();
+
+    await server.seedRemoteCommit({
+      "keep1.md": "keep1.md",
+      "keep2.md": "keep2.md",
+      "keep3.md": "keep3.md",
+    });
+    const res = await engine.sync();
+
+    expect(res.status).toBe("pulled");
+    expect(vault.removes.sort()).toEqual(["a/b/c/x.md", "a/b/y.md"]);
+    expect(vault.folderRemoves).toEqual(["a/b/c", "a/b", "a"]);
+  });
+
+  it("keeps a folder still holding a file this device does not sync", async () => {
+    engine = makeEngine({ excludes: ["**/*.png"] });
+    vault.set("a/note.md", "one");
+    vault.set("a/image.png", "not ours to touch");
+    vault.set("keep.md", "keep");
+    await engine.sync();
+
+    await server.seedRemoteCommit({ "keep.md": "keep" });
+    const res = await engine.sync();
+
+    expect(res.status).toBe("pulled");
+    expect(vault.removes).toEqual(["a/note.md"]);
+    expect(vault.folderChecks).toEqual(["a"]); // asked, and told no
+    expect(vault.folderRemoves).toEqual([]);
+    expect(vault.files.has("a/image.png")).toBe(true);
+  });
+
+  it("attempts no folder removal for a deletion at the vault root", async () => {
+    vault.set("a.md", "one");
+    vault.set("b.md", "two");
+    await engine.sync();
+
+    await server.seedRemoteCommit({ "a.md": "one" });
+    await engine.sync();
+
+    expect(vault.removes).toEqual(["b.md"]);
+    expect(vault.folderChecks).toEqual([]);
+  });
+
+  // A deletion that landed before another lane failed will never be planned again — the path
+  // is gone on both sides — so the failing pass is the only chance to prune its folders.
+  it("still prunes the folders its completed deletions emptied when another lane fails", async () => {
+    vault.set("a/b/x.md", "one");
+    vault.set("boom.md", "old");
+    for (const name of ["keep1.md", "keep2.md", "keep3.md"]) vault.set(name, name);
+    await engine.sync();
+
+    await server.seedRemoteCommit({
+      "boom.md": "new",
+      "keep1.md": "keep1.md",
+      "keep2.md": "keep2.md",
+      "keep3.md": "keep3.md",
+    });
+    const write = vault.write.bind(vault);
+    vault.write = async (path, bytes) => {
+      if (path === "boom.md") throw new Error("disk full");
+      await write(path, bytes);
+    };
+
+    await expect(engine.sync()).rejects.toThrow(/disk full/);
+    expect(vault.files.has("a/b/x.md")).toBe(false);
+    expect(vault.folderRemoves).toEqual(["a/b", "a"]);
+  });
+
   it("restores a file we deleted that the remote had edited", async () => {
     vault.set("a.md", "one");
     await engine.sync();

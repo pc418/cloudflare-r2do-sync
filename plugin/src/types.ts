@@ -153,6 +153,11 @@ export interface VaultAdapter {
   write(path: string, bytes: Uint8Array): Promise<void>;
   /** Removes a file. Implementations should trash rather than destroy where they can. */
   remove(path: string): Promise<void>;
+  /**
+   * Removes a folder only when a fresh listing shows it truly empty (no files, no subfolders).
+   * Returns whether it removed. Destroys nothing: an empty folder has no content to lose.
+   */
+  removeFolderIfEmpty(path: string): Promise<boolean>;
 }
 
 /** What this device believes it last pushed. The basis for divergence detection. */

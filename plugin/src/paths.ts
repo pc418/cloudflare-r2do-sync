@@ -34,6 +34,40 @@ export function selfDirs(configDir: string = DEFAULT_CONFIG_DIR): string[] {
 }
 
 /**
+ * Directories a set of deleted files may have left empty: every strict ancestor, deepest first.
+ *
+ * Sync is file-only — a folder exists only as the parent of a file it holds — so a whole-tree
+ * move arriving as a pull deletes the files and leaves the directory skeleton standing at the
+ * old path. These are candidates only. Whether a directory is *actually* empty is a filesystem
+ * question, answered against a fresh listing by `VaultAdapter.removeFolderIfEmpty`, which is
+ * what keeps excluded, skipped and unscanned content safe.
+ *
+ * The vault root is never a candidate, and neither is this plugin's own folder or anything
+ * inside it: `selfDirs` holds this device's credentials, compared here exactly as `alwaysSkip`
+ * compares them. Deepest-first is what lets a sequential caller collapse a whole chain in one
+ * pass — `a/b` only becomes empty once `a/b/c` is gone.
+ */
+export function pruneCandidates(deleted: readonly string[], configDir: string): string[] {
+  const selves = selfDirs(configDir);
+  const dirs = new Set<string>();
+  for (const path of deleted) {
+    const segments = path.split("/");
+    for (let i = 1; i < segments.length; i++) {
+      const dir = segments.slice(0, i).join("/");
+      if (selves.some((self) => dir === self || dir.startsWith(`${self}/`))) continue;
+      dirs.add(dir);
+    }
+  }
+  return [...dirs].sort((a, b) => {
+    const depth = b.split("/").length - a.split("/").length;
+    if (depth !== 0) return depth;
+    // Code-unit order, not `localeCompare`: equal-depth siblings are independent, so the only
+    // thing this decides is that two runs over the same deletions produce the same list.
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+}
+
+/**
  * Configuration sub-directories whose contents Obsidian loads as code, or that decide which
  * code it loads: `plugins/` holds every community plugin's `main.js`, `themes/` and
  * `snippets/` hold CSS the app injects. `plugins/<id>/data.json` lives here too, and that is

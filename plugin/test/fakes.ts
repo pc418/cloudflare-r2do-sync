@@ -7,17 +7,31 @@ import type { SyncApiLike } from "../src/sync";
 /** In-memory vault. Paths map to string or binary content. */
 export class FakeVault implements VaultAdapter {
   files = new Map<string, { data: Uint8Array; mtime: number }>();
+  /**
+   * Directories, explicit because the fix depends on them outliving their files: a real vault
+   * keeps the folder after the last file in it is deleted, which is the bug being fixed.
+   */
+  folders = new Set<string>();
   reads: string[] = [];
   listCalls = 0;
   stats: string[] = [];
   writes: string[] = [];
   removes: string[] = [];
+  /** Every folder the engine asked about, so a test can assert it did not even try. */
+  folderChecks: string[] = [];
+  folderRemoves: string[] = [];
   /** Every engine-driven write gets a fresh mtime, as a real filesystem would. */
   nextMtime = 1_754_000_500_000;
 
   set(path: string, content: string | Uint8Array, mtime = 1_754_000_000_000): void {
     const data = typeof content === "string" ? new TextEncoder().encode(content) : content;
     this.files.set(path, { data, mtime });
+    this.#addFolders(path);
+  }
+
+  #addFolders(path: string): void {
+    const segments = path.split("/");
+    for (let i = 1; i < segments.length; i++) this.folders.add(segments.slice(0, i).join("/"));
   }
 
   /** Convenience for assertions: a file's content as text. */
@@ -30,12 +44,25 @@ export class FakeVault implements VaultAdapter {
   async write(path: string, bytes: Uint8Array): Promise<void> {
     this.writes.push(path);
     this.files.set(path, { data: bytes.slice(), mtime: this.nextMtime++ });
+    this.#addFolders(path);
   }
 
   async remove(path: string): Promise<void> {
     if (!this.files.has(path)) throw new Error(`no such file: ${path}`);
     this.removes.push(path);
     this.files.delete(path);
+  }
+
+  /** Empty means: known folder, no file under it, no folder strictly inside it. */
+  async removeFolderIfEmpty(path: string): Promise<boolean> {
+    this.folderChecks.push(path);
+    if (!this.folders.has(path)) return false;
+    const prefix = `${path}/`;
+    for (const file of this.files.keys()) if (file.startsWith(prefix)) return false;
+    for (const folder of this.folders) if (folder.startsWith(prefix)) return false;
+    this.folders.delete(path);
+    this.folderRemoves.push(path);
+    return true;
   }
 
   delete(path: string): void {

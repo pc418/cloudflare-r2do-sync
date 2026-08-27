@@ -12,6 +12,7 @@ class FakeDataAdapter {
   systemTrashAvailable = true;
   readonly statCalls: string[] = [];
   readonly listCalls: string[] = [];
+  readonly rmdirCalls: Array<{ path: string; recursive: boolean }> = [];
 
   addFile(path: string, text: string, mtime = 1): void {
     this.entries.set(path, { type: "file", bytes: new TextEncoder().encode(text), mtime });
@@ -63,6 +64,17 @@ class FakeDataAdapter {
   async mkdir(path: string): Promise<void> {
     if (this.entries.has(path)) throw new Error(`already exists: ${path}`);
     this.entries.set(path, { type: "folder" });
+  }
+
+  async rmdir(path: string, recursive: boolean): Promise<void> {
+    this.rmdirCalls.push({ path, recursive });
+    const entry = this.entries.get(path);
+    if (entry?.type !== "folder") throw new Error(`not a folder: ${path}`);
+    const prefix = `${path}/`;
+    const inside = [...this.entries.keys()].filter((p) => p.startsWith(prefix));
+    if (!recursive && inside.length > 0) throw new Error(`directory not empty: ${path}`);
+    for (const p of inside) this.entries.delete(p);
+    this.entries.delete(path);
   }
 
   async trashSystem(path: string): Promise<boolean> {
@@ -180,5 +192,86 @@ describe("ObsidianVault DataAdapter bridge", () => {
     adapter.addFile(".obsidian", "not a folder");
     await expect(vault(adapter).write(".obsidian/app.json", new Uint8Array([1])))
       .rejects.toThrow(/not a folder/);
+  });
+});
+
+// A folder is removed on the evidence of a fresh listing and nothing else. That listing is
+// what keeps excluded, skipped and unscanned files safe without this knowing the sync policy.
+describe("ObsidianVault.removeFolderIfEmpty", () => {
+  /** A folder chain holding no file at all — what a moved-away subtree leaves behind. */
+  const emptyFolder = (path: string): FakeDataAdapter => {
+    const adapter = new FakeDataAdapter();
+    const parts = path.split("/");
+    for (let i = 1; i <= parts.length; i++) {
+      adapter.entries.set(parts.slice(0, i).join("/"), { type: "folder" });
+    }
+    return adapter;
+  };
+
+  it("removes a folder a fresh listing shows empty, without recursing", async () => {
+    const adapter = emptyFolder("a/b");
+    await expect(vault(adapter).removeFolderIfEmpty("a/b")).resolves.toBe(true);
+    expect(adapter.rmdirCalls).toEqual([{ path: "a/b", recursive: false }]);
+    expect(adapter.entries.has("a/b")).toBe(false);
+  });
+
+  it("keeps a folder that still holds a file", async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.addFile("a/b/excluded.png", "binary");
+    await expect(vault(adapter).removeFolderIfEmpty("a/b")).resolves.toBe(false);
+    expect(adapter.rmdirCalls).toEqual([]);
+  });
+
+  it("keeps a folder that still holds a subfolder", async () => {
+    const adapter = emptyFolder("a/b/c");
+    await expect(vault(adapter).removeFolderIfEmpty("a/b")).resolves.toBe(false);
+    expect(adapter.rmdirCalls).toEqual([]);
+  });
+
+  it("reports no removal for a path that is already gone, or is a file", async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.addFile("a/note.md", "note");
+    await expect(vault(adapter).removeFolderIfEmpty("a/gone")).resolves.toBe(false);
+    await expect(vault(adapter).removeFolderIfEmpty("a/note.md")).resolves.toBe(false);
+    expect(adapter.rmdirCalls).toEqual([]);
+  });
+
+  it("counts a folder another actor removed first as removed", async () => {
+    const adapter = emptyFolder("a/b");
+    adapter.rmdir = async (path) => {
+      adapter.entries.delete(path);
+      throw new Error("ENOENT");
+    };
+    await expect(vault(adapter).removeFolderIfEmpty("a/b")).resolves.toBe(true);
+  });
+
+  it("keeps a folder something appeared inside between the listing and the rmdir", async () => {
+    const adapter = emptyFolder("a/b");
+    adapter.rmdir = async (path) => {
+      adapter.addFile(`${path}/raced.md`, "raced");
+      throw new Error("ENOTEMPTY");
+    };
+    await expect(vault(adapter).removeFolderIfEmpty("a/b")).resolves.toBe(false);
+    expect(adapter.entries.has("a/b/raced.md")).toBe(true);
+  });
+
+  it("propagates an rmdir failure that is neither race", async () => {
+    const adapter = emptyFolder("a/b");
+    adapter.rmdir = async (path) => {
+      adapter.entries.set(path, { type: "file", bytes: new Uint8Array(), mtime: 1 });
+      throw new Error("EPERM");
+    };
+    await expect(vault(adapter).removeFolderIfEmpty("a/b")).rejects.toThrow(/EPERM/);
+  });
+
+  // A folder still standing *empty* after a failed rmdir is neither race: the rmdir itself
+  // failed, and reading it as "something appeared" strands the folder with no retry to come.
+  it("propagates an rmdir failure that left the folder standing empty", async () => {
+    const adapter = emptyFolder("a/b");
+    adapter.rmdir = async () => {
+      throw new Error("EPERM");
+    };
+    await expect(vault(adapter).removeFolderIfEmpty("a/b")).rejects.toThrow(/EPERM/);
+    expect(adapter.entries.has("a/b")).toBe(true);
   });
 });
