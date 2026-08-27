@@ -134,21 +134,25 @@ export class ObsidianVault implements VaultAdapter {
     const listed = await this.app.vault.adapter.list(path);
     if (listed.files.length > 0 || listed.folders.length > 0) return false;
     try {
-      // Non-recursive: anything that appeared since the listing has to fail this call rather
-      // than be deleted by it.
+      // Preferred: anything that appeared since the listing has to fail this call rather than
+      // be deleted by it. Not supported everywhere — see the fallback below.
       await this.app.vault.adapter.rmdir(path, false);
     } catch (error) {
       // Tolerate only the two races, as `#ensureFolder` does: another actor removed the
-      // folder first, or something appeared inside it between the listing and the rmdir. A
-      // folder still standing *empty* is neither — the rmdir itself failed, and swallowing
-      // that (EPERM, EIO) strands the folder with no later deletion to try again.
+      // folder first, or something appeared inside it between the listing and the rmdir.
       const raced = await this.app.vault.adapter.stat(path);
       if (raced === null) return true;
-      if (raced.type === "folder") {
-        const relisted = await this.app.vault.adapter.list(path);
-        if (relisted.files.length > 0 || relisted.folders.length > 0) return false;
-      }
-      throw error;
+      if (raced.type !== "folder") throw error;
+      const relisted = await this.app.vault.adapter.list(path);
+      if (relisted.files.length > 0 || relisted.folders.length > 0) return false;
+      // Still standing, still empty: this is the platform refusing the call, not refusing the
+      // folder. Desktop maps `rmdir` onto `fs.rm`, which rejects EVERY directory unless
+      // `recursive` is true — "rm returned EISDIR" — so the documented "if false the folder
+      // needs to be empty" contract is unreachable there and the non-recursive call can never
+      // succeed. Emptiness has just been re-verified against a *fresh* listing one microtask
+      // ago, so `true` has nothing to recurse into; and if this fails too it throws, which is
+      // what keeps a genuine EPERM/EIO loud rather than stranding the folder silently.
+      await this.app.vault.adapter.rmdir(path, true);
     }
     return true;
   }

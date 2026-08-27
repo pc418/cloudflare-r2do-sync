@@ -66,10 +66,22 @@ class FakeDataAdapter {
     this.entries.set(path, { type: "folder" });
   }
 
+  /**
+   * Whether `rmdir(path, false)` works at all. **False by default, because that is desktop
+   * Obsidian**: it maps `rmdir` onto `fs.rm`, which refuses every directory unless `recursive`
+   * is true, whatever the API docs say about "the folder needs to be empty". Modelling the
+   * documented contract instead is what let a completely broken removal ship in 0.9.1 with
+   * green tests.
+   */
+  nonRecursiveRmdirWorks = false;
+
   async rmdir(path: string, recursive: boolean): Promise<void> {
     this.rmdirCalls.push({ path, recursive });
     const entry = this.entries.get(path);
     if (entry?.type !== "folder") throw new Error(`not a folder: ${path}`);
+    if (!recursive && !this.nonRecursiveRmdirWorks) {
+      throw new Error(`Path is a directory: rm returned EISDIR (is a directory) ${path}`);
+    }
     const prefix = `${path}/`;
     const inside = [...this.entries.keys()].filter((p) => p.startsWith(prefix));
     if (!recursive && inside.length > 0) throw new Error(`directory not empty: ${path}`);
@@ -208,11 +220,43 @@ describe("ObsidianVault.removeFolderIfEmpty", () => {
     return adapter;
   };
 
-  it("removes a folder a fresh listing shows empty, without recursing", async () => {
+  it("removes a folder without recursing, where the platform allows that", async () => {
     const adapter = emptyFolder("a/b");
+    adapter.nonRecursiveRmdirWorks = true;
     await expect(vault(adapter).removeFolderIfEmpty("a/b")).resolves.toBe(true);
+    // The safe call is tried first and, where it works, is the only one made.
     expect(adapter.rmdirCalls).toEqual([{ path: "a/b", recursive: false }]);
     expect(adapter.entries.has("a/b")).toBe(false);
+  });
+
+  it("falls back to a recursive rmdir when the platform refuses the non-recursive one", async () => {
+    // Desktop Obsidian maps `rmdir` onto `fs.rm`, which rejects EVERY directory unless
+    // `recursive` is true. The reported failure: "for all dir, rm returned EISDIR and couldn't
+    // remove" — so 0.9.1's pruning removed nothing and threw, and this button removed nothing.
+    const adapter = emptyFolder("a/b");
+    await expect(vault(adapter).removeFolderIfEmpty("a/b")).resolves.toBe(true);
+    expect(adapter.rmdirCalls).toEqual([
+      { path: "a/b", recursive: false },
+      { path: "a/b", recursive: true },
+    ]);
+    expect(adapter.entries.has("a/b")).toBe(false);
+  });
+
+  it("re-verifies emptiness against a fresh listing before it recurses", async () => {
+    // The fallback is only safe because nothing is under the folder when it runs. If a file
+    // appeared after the first listing, the recursive call must never be reached.
+    const adapter = emptyFolder("a/b");
+    const originalList = adapter.list.bind(adapter);
+    let listCount = 0;
+    adapter.list = async (path) => {
+      const result = await originalList(path);
+      if (++listCount === 1) adapter.addFile("a/b/appeared.md", "written mid-removal");
+      return result;
+    };
+
+    await expect(vault(adapter).removeFolderIfEmpty("a/b")).resolves.toBe(false);
+    expect(adapter.rmdirCalls).toEqual([{ path: "a/b", recursive: false }]);
+    expect(adapter.entries.has("a/b/appeared.md")).toBe(true);
   });
 
   it("keeps a folder that still holds a file", async () => {

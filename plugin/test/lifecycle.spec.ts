@@ -1648,15 +1648,18 @@ function vaultTree(
         : folders.has(path)
           ? { type: "folder", size: 0, mtime: 1 }
           : null,
+    // Emulates desktop Obsidian, which maps `rmdir` onto `fs.rm`: it refuses EVERY directory
+    // unless `recursive` is true, whatever the API docs say about "the folder needs to be
+    // empty". Modelling the documented contract instead is what let 0.9.1 ship a removal that
+    // could not remove anything.
     rmdir: async (path: string, recursive: boolean) => {
       if (handle.beforeRmdir !== null) await handle.beforeRmdir(path);
-      // The command must never hand `true` here: a recursive remove would delete whatever
-      // appeared since the listing instead of failing on it.
-      if (recursive) throw new Error(`recursive rmdir on ${path}`);
-      const prefix = `${path}/`;
-      if ([...files, ...folders].some((p) => p.startsWith(prefix))) {
-        throw new Error(`directory not empty: ${path}`);
+      if (!recursive) {
+        throw new Error(`Path is a directory: rm returned EISDIR (is a directory) ${path}`);
       }
+      const prefix = `${path}/`;
+      for (const p of [...files].filter((f) => f.startsWith(prefix))) files.delete(p);
+      for (const p of [...folders].filter((f) => f.startsWith(prefix))) folders.delete(p);
       folders.delete(path);
       removed.push(path);
     },
