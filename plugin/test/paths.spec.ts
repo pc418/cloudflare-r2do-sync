@@ -10,6 +10,7 @@ import {
   numberedPath,
   parseGlobs,
   pathError,
+  pruneCandidates,
   restoreCopyPath,
   selfDirs,
   DEFAULT_CONFIG_DIR,
@@ -346,5 +347,51 @@ describe("restore destination names", () => {
   it("produces paths the server would accept", () => {
     expect(pathError(restoreCopyPath("Note.md", "2026-08-05T00:00:00Z"))).toBeNull();
     expect(pathError(numberedPath("Note.md", 2))).toBeNull();
+  });
+});
+
+// Sync is file-only, so a whole-tree move arriving as a pull deletes the files and strands the
+// old directories. This names the folders worth *asking* about; the emptiness check that
+// decides is a filesystem one and lives in the vault adapter.
+describe("pruneCandidates", () => {
+  it("offers every ancestor of a deleted path, deepest first", () => {
+    expect(pruneCandidates(["a/b/c/x.md"], DEFAULT_CONFIG_DIR)).toEqual(["a/b/c", "a/b", "a"]);
+  });
+
+  it("dedupes ancestors shared by siblings, in an order the input cannot change", () => {
+    const expected = ["a/b", "a/z", "a"];
+    expect(pruneCandidates(["a/b/x.md", "a/b/y.md", "a/z/w.md"], DEFAULT_CONFIG_DIR)).toEqual(
+      expected
+    );
+    expect(pruneCandidates(["a/z/w.md", "a/b/y.md", "a/b/x.md"], DEFAULT_CONFIG_DIR)).toEqual(
+      expected
+    );
+  });
+
+  it("offers nothing for a deletion at the vault root", () => {
+    expect(pruneCandidates(["root.md"], DEFAULT_CONFIG_DIR)).toEqual([]);
+    expect(pruneCandidates([], DEFAULT_CONFIG_DIR)).toEqual([]);
+  });
+
+  it("never offers this plugin's own folder or anything inside it", () => {
+    // The folder holds this device's access token and master key, and the running plugin
+    // rewrites `data.json` from memory — removing it, even verified-empty, is not ours to do.
+    for (const self of selfDirs()) {
+      const offered = pruneCandidates([`${self}/cache/blob`], DEFAULT_CONFIG_DIR);
+      expect(offered).toEqual([".obsidian/plugins", ".obsidian"]);
+    }
+  });
+
+  it("keys the self-exclusion on the directory the vault actually uses", () => {
+    const CUSTOM = ".config-obsidian";
+    expect(pruneCandidates([`${CUSTOM}/plugins/cloudflare-rdo-sync/data.json`], CUSTOM)).toEqual([
+      `${CUSTOM}/plugins`,
+      CUSTOM,
+    ]);
+    // The default directory stays protected too: a renamed vault keeps the old copy on disk.
+    expect(pruneCandidates([`${PLUGIN_DIR}/data.json`], CUSTOM)).toEqual([
+      ".obsidian/plugins",
+      ".obsidian",
+    ]);
   });
 });

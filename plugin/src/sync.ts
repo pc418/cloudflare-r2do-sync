@@ -26,6 +26,7 @@ import {
   makeExcluder,
   numberedPath,
   pathError,
+  pruneCandidates,
   restoreCopyPath,
   selfDirs,
 } from "./paths";
@@ -1898,6 +1899,15 @@ export class SyncEngine {
       return out;
     });
 
+    // A folder is only ever the parent of a file, so a pulled tree move deletes the files and
+    // leaves the old skeleton standing. Sequential and after the pool: lanes racing on shared
+    // ancestors is a TOCTOU generator, and deepest-first only converges when a parent is
+    // checked after its child has gone. A throw above skips this; the next pass catches up.
+    const deleted = todo.filter((a) => a.plan === "delete-local").map((a) => a.path);
+    for (const dir of pruneCandidates(deleted, this.#configDir)) {
+      await this.#vault.removeFolderIfEmpty(dir);
+    }
+
     const total: MergeOutcome = { pulled: 0, merged: 0, pulledChanges: [], conflicts: [], conflictDetails: [] };
     for (const one of each) {
       total.pulled += one.pulled;
@@ -2913,6 +2923,10 @@ export class SyncEngine {
         !Object.hasOwn(files, file.path)
     );
     await mapPool(stale, this.#lanes, (file) => this.#vault.remove(file.path));
+    // Same reason and same shape as `#executePlan`: sequential, deepest-first, after the pool.
+    for (const dir of pruneCandidates(stale.map((file) => file.path), this.#configDir)) {
+      await this.#vault.removeFolderIfEmpty(dir);
+    }
 
     return { written: fetched.length, removed: stale.length };
   }

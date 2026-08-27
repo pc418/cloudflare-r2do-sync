@@ -94,4 +94,30 @@ export class ObsidianVault implements VaultAdapter {
       await this.app.vault.adapter.trashLocal(path);
     }
   }
+
+  /**
+   * Removes a folder only when a fresh listing shows it truly empty, so nothing is trashed:
+   * an empty folder has no content to lose. The listing is the whole safety property — a
+   * folder still holding an excluded, skipped or unscanned file is not empty to `list()` and
+   * therefore survives, without this needing to know the sync policy.
+   */
+  async removeFolderIfEmpty(path: string): Promise<boolean> {
+    const stat = await this.app.vault.adapter.stat(path);
+    if (stat?.type !== "folder") return false;
+    const listed = await this.app.vault.adapter.list(path);
+    if (listed.files.length > 0 || listed.folders.length > 0) return false;
+    try {
+      // Non-recursive: anything that appeared since the listing has to fail this call rather
+      // than be deleted by it.
+      await this.app.vault.adapter.rmdir(path, false);
+    } catch (error) {
+      // Tolerate only the two races, as `#ensureFolder` does: another actor removed the
+      // folder first, or something appeared inside it between the listing and the rmdir.
+      const raced = await this.app.vault.adapter.stat(path);
+      if (raced === null) return true;
+      if (raced.type === "folder") return false;
+      throw error;
+    }
+    return true;
+  }
 }

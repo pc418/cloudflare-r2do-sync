@@ -109,6 +109,21 @@ describe("SyncEngine.forcePull", () => {
     expect(vault.text("a.md")).toBe("remote-a");
   });
 
+  // The stale removal is the other place a whole subtree can disappear at once, and it
+  // strands the same directory skeleton the pull merge used to.
+  it("prunes the folders its stale removals emptied, deepest first", async () => {
+    const engine = makeEngine();
+    vault.set("a/b/x.md", "one");
+    vault.set("keep.md", "keep");
+    await engine.sync();
+    await server.seedRemoteCommit({ "keep.md": "keep" });
+
+    await engine.forcePull();
+
+    expect(vault.removes).toEqual(["a/b/x.md"]);
+    expect(vault.folderRemoves).toEqual(["a/b", "a"]);
+  });
+
   it("leaves paths this device does not sync alone on both sides", async () => {
     const engine = makeEngine({ excludes: ["private/**"] });
     await divergedRemote(engine);
