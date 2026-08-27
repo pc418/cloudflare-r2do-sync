@@ -113,7 +113,7 @@ import {
 import {
   ancestorDirs,
   countInScope,
-  makeScopeFilter,
+  makeFolderScopeFilter,
   parseGlobs,
   DEFAULT_CONFIG_DIR,
 } from "./paths";
@@ -1354,9 +1354,10 @@ export default class LogSyncPlugin extends Plugin {
    * just been deleted.
    *
    * Two boundaries, and they do different jobs. **Scope** decides what is offered:
-   * `makeScopeFilter` — the same rules a pass scans by — so this cleans the part of the vault
-   * this device syncs and nothing else. A folder under an exclude glob, inside `.git`, or
-   * inside the plugin's own directory was never created by us and is not ours to tidy.
+   * `makeFolderScopeFilter` — this device's own glob settings, read as directories rather than
+   * as files — so this cleans the part of the vault this device syncs and nothing else. A
+   * folder under an exclude glob, inside `.git`, or inside the plugin's own directory was
+   * never created by us and is not ours to tidy.
    * **Safety** is `removeFolderIfEmpty`'s fresh listing, unchanged: it is what keeps a folder
    * holding excluded or unscanned content standing, and it is re-checked per folder at removal
    * time. That is why the confirmed list is allowed to go stale while the dialog is open — a
@@ -1378,7 +1379,7 @@ export default class LogSyncPlugin extends Plugin {
       return;
     }
     const vault = new ObsidianVault(this.app, this.settings.lanes);
-    const inScope = makeScopeFilter({
+    const inScope = makeFolderScopeFilter({
       excludes: parseGlobs(this.settings.excludes),
       onlyPaths: parseGlobs(this.settings.onlyPaths),
       syncConfigDir: this.settings.syncConfigDir,
@@ -1425,14 +1426,20 @@ export default class LogSyncPlugin extends Plugin {
     const removed: string[] = [];
     const kept: string[] = [];
     const failed: string[] = [];
-    const REMOVING = "R2DO Sync: removing empty folders…";
-    const notice = new Notice(REMOVING, 0);
+    const removing = "R2DO Sync: removing empty folders…";
+    const notice = new Notice(removing, 0);
     try {
       // The wait can be a whole sync pass plus its retry backoff. A status line that says
       // "removing" throughout is the same lie as a button that looks identical before and
       // after the press.
       await this.#exclusive(
         async () => {
+          // Re-checked here, where the lane finally grants the work, and not only at entry.
+          // A force pull, restore-all or encryption rewrite sets `#vaultRewrite` but runs
+          // outside this lane, so it can begin while this waits — and the wait is the long
+          // window, a whole sync pass plus its retry backoff. The flag is the only thing that
+          // sees those; without this the removals would run straight into one.
+          if (this.#vaultRewrite !== null) throw new Error(this.#vaultRewrite);
           for (const folder of folders) {
             try {
               if (await vault.removeFolderIfEmpty(folder)) removed.push(folder);
@@ -1449,12 +1456,19 @@ export default class LogSyncPlugin extends Plugin {
             notice.setMessage("R2DO Sync: waiting for the current sync to finish…");
           },
           onStart: () => {
-            notice.setMessage(REMOVING);
+            notice.setMessage(removing);
           },
         }
       );
     } catch (e) {
-      new Notice(`R2DO Sync could not remove empty folders: ${message(e)}`, 0);
+      // A rewrite is said in this action's own words: the stored block sentences all end by
+      // telling the reader to resolve a conflict, and nobody who pressed this button is in one.
+      new Notice(
+        this.#vaultRewrite !== null
+          ? "R2DO Sync: this vault is being rewritten, so nothing was removed"
+          : `R2DO Sync could not remove empty folders: ${message(e)}`,
+        10_000
+      );
       return;
     } finally {
       notice.hide();

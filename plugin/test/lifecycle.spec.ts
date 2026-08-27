@@ -1619,7 +1619,7 @@ describe("notice name", () => {
 function vaultTree(
   app: LifecycleApp,
   tree: { files?: string[]; folders?: string[] }
-): { files: Set<string>; removed: string[] } {
+): { files: Set<string>; removed: string[]; beforeRmdir: null | ((path: string) => Promise<void>) } {
   const files = new Set(tree.files ?? []);
   const folders = new Set(tree.folders ?? []);
   for (const path of [...files, ...folders]) {
@@ -1628,6 +1628,9 @@ function vaultTree(
     for (let i = 1; i <= last; i++) folders.add(segments.slice(0, i).join("/"));
   }
   const removed: string[] = [];
+  /** Lets a test hold one removal open, so another operation genuinely queues behind it. */
+  const handle: { files: Set<string>; removed: string[]; beforeRmdir: null | ((path: string) => Promise<void>) } =
+    { files, removed, beforeRmdir: null };
   const childrenOf = (path: string, of: Set<string>): string[] => {
     const prefix = path === "" ? "" : `${path}/`;
     return [...of].filter(
@@ -1646,6 +1649,7 @@ function vaultTree(
           ? { type: "folder", size: 0, mtime: 1 }
           : null,
     rmdir: async (path: string, recursive: boolean) => {
+      if (handle.beforeRmdir !== null) await handle.beforeRmdir(path);
       // The command must never hand `true` here: a recursive remove would delete whatever
       // appeared since the listing instead of failing on it.
       if (recursive) throw new Error(`recursive rmdir on ${path}`);
@@ -1657,7 +1661,7 @@ function vaultTree(
       removed.push(path);
     },
   } as never;
-  return { files, removed };
+  return handle;
 }
 
 describe("removing empty folders", () => {
@@ -1769,6 +1773,20 @@ describe("removing empty folders", () => {
     expect(offered()).toEqual(["Notes/Gone", "Notes"]);
   });
 
+  it("does not offer the very folder an exclude glob was written for", async () => {
+    // `.trash/**` is the DEFAULT exclude and never matches `.trash` itself, so reading the
+    // folder with the file predicate offered to remove the folder the user had excluded.
+    const { plugin, app } = idle({ excludes: ".trash/**" });
+    vaultTree(app, { files: ["note.md"], folders: [".trash", "ghost"] });
+    await plugin.onload();
+    Modal.shown.length = 0;
+
+    await plugin.removeEmptyFolders();
+    await untilModal();
+
+    expect(offered()).toEqual(["ghost"]);
+  });
+
   it("never offers this plugin's own folder, which holds the key", async () => {
     const { plugin, app } = idle({ syncConfigDir: true });
     vaultTree(app, {
@@ -1813,6 +1831,75 @@ describe("removing empty folders", () => {
     await first;
     await second;
     expect(tree.removed).toEqual(["ghost", "other"]);
+  });
+
+  /**
+   * Holds `#vaultRewrite` open by starting a restore-all whose first request never answers.
+   * Whole-vault rewrites set that flag but run outside the scheduler lane, so it is the only
+   * thing a cleanup can see them through.
+   */
+  async function startHangingRewrite(plugin: LogSyncPlugin): Promise<void> {
+    requestUrlMock.impl = async () => await new Promise(() => {});
+    await plugin.openHistory();
+    const history = lastModal() as unknown as {
+      deps: { restoreAll: (id: string) => Promise<unknown> };
+    };
+    void history.deps.restoreAll("01J000000000000000000000").catch(() => {});
+    await flush();
+  }
+
+  it("refuses to even look while a whole-vault rewrite is running", async () => {
+    const { plugin, app } = idle();
+    const tree = vaultTree(app, { files: ["note.md"], folders: ["ghost"] });
+    await plugin.onload();
+    await startHangingRewrite(plugin);
+    Modal.shown.length = 0;
+    Notice.shown.length = 0;
+
+    await plugin.removeEmptyFolders();
+
+    // Not "no empty folders": that answer would be about a vault already being rewritten.
+    expect(Modal.shown).toHaveLength(0);
+    expect(Notice.shown.join(" ")).toContain("being rewritten");
+    expect(tree.removed).toEqual([]);
+  });
+
+  it("stops rather than removing when a rewrite starts while it waits for the lane", async () => {
+    // The long window, and the one an entry check cannot cover: the removal can sit in the
+    // lane behind a whole sync pass plus its retry backoff, and a rewrite that begins during
+    // that wait runs outside the lane entirely.
+    const { plugin, app } = idle();
+    const tree = vaultTree(app, { files: ["note.md"], folders: ["first", "second"] });
+    await plugin.onload();
+
+    // Two cleanups, so the second is genuinely queued rather than granted straight away.
+    await plugin.removeEmptyFolders();
+    await untilModal();
+    const confirmFirst = (lastModal() as unknown as { opts: { onConfirm: () => Promise<void> } })
+      .opts.onConfirm;
+    await plugin.removeEmptyFolders();
+    await untilModal();
+    const confirmSecond = (lastModal() as unknown as { opts: { onConfirm: () => Promise<void> } })
+      .opts.onConfirm;
+
+    let release = (): void => {};
+    tree.beforeRmdir = () => new Promise<void>((resolve) => (release = resolve));
+
+    const first = confirmFirst();
+    const second = confirmSecond();
+    await flush();
+    Notice.shown.length = 0;
+
+    // Starts after both entry checks have already passed, while the second still waits.
+    await startHangingRewrite(plugin);
+    tree.beforeRmdir = null;
+    release();
+    await first;
+    await second;
+
+    // The first was already under way and finishes; the second never touches the disk.
+    expect(tree.removed).toEqual(["first", "second"]);
+    expect(Notice.shown.join(" ")).toContain("being rewritten, so nothing was removed");
   });
 
   it("reports a folder it could not remove instead of counting it as done", async () => {

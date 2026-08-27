@@ -8,6 +8,7 @@ import {
   isConfigCodePath,
   isConfigPath,
   makeExcluder,
+  makeFolderScopeFilter,
   makeScopeFilter,
   numberedPath,
   parseGlobs,
@@ -424,5 +425,48 @@ describe("deepestFirst", () => {
     expect(pruneCandidates(["a/b/x.md", "a/z/w.md"], DEFAULT_CONFIG_DIR)).toEqual(
       deepestFirst(["a", "a/b", "a/z"])
     );
+  });
+});
+
+describe("makeFolderScopeFilter", () => {
+  const rules = (over: Partial<Parameters<typeof makeFolderScopeFilter>[0]> = {}) =>
+    makeFolderScopeFilter({ excludes: [], onlyPaths: [], syncConfigDir: false, ...over });
+
+  it("excludes the folder a content glob was written for", () => {
+    // The review case, and the default setting: `.trash/**` never matches `.trash` itself, so
+    // asking the file predicate would have offered to remove a folder the user excluded.
+    const inScope = rules({ excludes: [".trash/**"] });
+    expect(inScope(".trash")).toBe(false);
+    expect(inScope(".trash/old")).toBe(false);
+    expect(inScope("notes")).toBe(true);
+  });
+
+  it("keeps an allow-list's own root, which the file globs do not match either", () => {
+    const inScope = rules({ onlyPaths: ["notes/**"] });
+    expect(inScope("notes")).toBe(true);
+    expect(inScope("notes/deep")).toBe(true);
+    expect(inScope("elsewhere")).toBe(false);
+  });
+
+  it("offers nothing under an allow-list that selects by extension", () => {
+    // Documented and deliberate: no folder is inside `**/*.md`, and finding nothing is the
+    // safe direction to be wrong in.
+    expect(rules({ onlyPaths: ["**/*.md"] })("notes")).toBe(false);
+  });
+
+  it("never offers junk directories or this plugin's own folder", () => {
+    const inScope = rules({ syncConfigDir: true });
+    expect(inScope(".git")).toBe(false);
+    expect(inScope("a/node_modules/pkg")).toBe(false);
+    for (const self of selfDirs()) expect(inScope(self)).toBe(false);
+  });
+
+  it("follows the configuration-directory toggle", () => {
+    expect(rules()(".obsidian/anything")).toBe(false);
+    expect(rules({ syncConfigDir: true })(".obsidian/anything")).toBe(true);
+  });
+
+  it("refuses a folder the server would reject as a path", () => {
+    expect(rules()("bad\\folder")).toBe(false);
   });
 });

@@ -300,6 +300,37 @@ export function makeScopeFilter(rules: ScopeRules): (path: string) => boolean {
     (only.length === 0 || included(path));
 }
 
+/**
+ * Whether a **folder** is this device's territory, for the empty-folder cleanup.
+ *
+ * Not `makeScopeFilter`. Those globs describe files, and asking them about a directory gives
+ * the wrong answer in the ordinary case: the default exclude `.trash/**` does not match
+ * `.trash` itself, so the file predicate would offer to remove a folder the user excluded,
+ * and an allow-list of `notes/**` does not match `notes`, so it would refuse one this device
+ * owns. Both are answered by asking about the folder **as a prefix** — `folder/` — as well as
+ * about the bare path: `**` compiles to `.*`, which matches the empty remainder, so a glob
+ * written for a folder's contents also answers for the folder.
+ *
+ * Known conservative case: an allow-list that selects by extension rather than by folder
+ * (`**\/*.md`) matches no folder and no folder prefix, so nothing is offered. A cleanup that
+ * finds nothing is the safe direction to be wrong in, and the alternative — deciding whether
+ * any path under a folder *could* match a glob — is a different and much larger question.
+ */
+export function makeFolderScopeFilter(rules: ScopeRules): (folder: string) => boolean {
+  const excluded = makeExcluder(rules.excludes);
+  const only = rules.onlyPaths.filter((glob) => glob.trim().length > 0);
+  const included = makeExcluder(only);
+  const configDir = rules.configDir ?? DEFAULT_CONFIG_DIR;
+  const orAsPrefix = (test: (path: string) => boolean, folder: string): boolean =>
+    test(folder) || test(`${folder}/`);
+  return (folder: string) =>
+    !alwaysSkip(folder, configDir) &&
+    pathError(folder) === null &&
+    (rules.syncConfigDir || !isConfigPath(folder, configDir)) &&
+    !orAsPrefix(excluded, folder) &&
+    (only.length === 0 || orAsPrefix(included, folder));
+}
+
 export function countInScope(paths: readonly string[], rules: ScopeRules): number {
   const inScope = makeScopeFilter(rules);
   let kept = 0;
