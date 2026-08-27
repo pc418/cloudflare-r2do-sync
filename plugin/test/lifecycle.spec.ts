@@ -1785,6 +1785,36 @@ describe("removing empty folders", () => {
     expect(Notice.shown.join(" ")).toContain("no empty folders");
   });
 
+  it("says it is waiting, not removing, while something else holds the lane", async () => {
+    // The wait can be a whole sync pass plus its retry backoff. Two cleanups are the cheapest
+    // way to occupy the lane deterministically; what is being pinned is the wording, which
+    // must follow what is actually happening rather than what the notice started as.
+    const { plugin, app } = idle();
+    const tree = vaultTree(app, { files: ["note.md"], folders: ["ghost", "other"] });
+    await plugin.onload();
+
+    await plugin.removeEmptyFolders();
+    await untilModal();
+    const firstWindow = lastModal();
+    await plugin.removeEmptyFolders();
+    await untilModal();
+    const secondWindow = lastModal();
+    expect(secondWindow).not.toBe(firstWindow);
+    Notice.shown.length = 0;
+
+    const confirmOf = (m: Modal): (() => unknown) =>
+      (m as unknown as { opts: { onConfirm: () => unknown } }).opts.onConfirm;
+    // Both in the same tick, so the second genuinely queues behind the first.
+    const first = confirmOf(firstWindow)() as Promise<void>;
+    const second = confirmOf(secondWindow)() as Promise<void>;
+
+    expect(Notice.shown.join(" ")).toContain("waiting for the current sync to finish");
+
+    await first;
+    await second;
+    expect(tree.removed).toEqual(["ghost", "other"]);
+  });
+
   it("reports a folder it could not remove instead of counting it as done", async () => {
     const { plugin, app } = idle();
     const tree = vaultTree(app, { files: ["note.md"], folders: ["ghost"] });

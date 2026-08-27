@@ -553,7 +553,17 @@ export class Modal {
 
 export class Notice {
   static readonly shown: string[] = [];
-  constructor(readonly message: string) {
+  message: string;
+  constructor(message: string) {
+    this.message = message;
+    Notice.shown.push(message);
+  }
+  /**
+   * A held-open notice can be reworded in place. Recorded like any other, so a test can assert
+   * that a status line said what was actually happening rather than what it started as.
+   */
+  setMessage(message: string): void {
+    this.message = message;
     Notice.shown.push(message);
   }
   hide(): void {}

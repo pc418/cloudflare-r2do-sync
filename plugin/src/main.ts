@@ -1366,9 +1366,9 @@ export default class LogSyncPlugin extends Plugin {
   async removeEmptyFolders(): Promise<void> {
     // Checked before the scan, not just before the removal: a force pull or an encryption
     // rewrite is moving files right now, so any answer here would be about a vault that has
-    // already changed — including "nothing to remove".
-    // The stored block sentences all end by telling the reader to resolve a conflict, which is
-    // not what this button was doing.
+    // already changed — "nothing to remove" included. Its own wording rather than the stored
+    // block sentence, because every one of those ends by telling the reader to resolve a
+    // conflict, which is not what this button was doing.
     if (this.#vaultRewrite !== null) {
       new Notice(
         "R2DO Sync: this vault is being rewritten. Wait for that to finish, then look for " +
@@ -1425,20 +1425,34 @@ export default class LogSyncPlugin extends Plugin {
     const removed: string[] = [];
     const kept: string[] = [];
     const failed: string[] = [];
-    const notice = new Notice("R2DO Sync: removing empty folders…", 0);
+    const REMOVING = "R2DO Sync: removing empty folders…";
+    const notice = new Notice(REMOVING, 0);
     try {
-      await this.#exclusive(async () => {
-        for (const folder of folders) {
-          try {
-            if (await vault.removeFolderIfEmpty(folder)) removed.push(folder);
-            else kept.push(folder);
-          } catch (e) {
-            // One folder refusing to go is not a reason to abandon the rest, and a parent it
-            // still occupies simply reports as kept. Every failure is named below.
-            failed.push(`${folder} (${message(e)})`);
+      // The wait can be a whole sync pass plus its retry backoff. A status line that says
+      // "removing" throughout is the same lie as a button that looks identical before and
+      // after the press.
+      await this.#exclusive(
+        async () => {
+          for (const folder of folders) {
+            try {
+              if (await vault.removeFolderIfEmpty(folder)) removed.push(folder);
+              else kept.push(folder);
+            } catch (e) {
+              // One folder refusing to go is not a reason to abandon the rest, and a parent it
+              // still occupies simply reports as kept. Every failure is named below.
+              failed.push(`${folder} (${message(e)})`);
+            }
           }
+        },
+        {
+          onQueued: () => {
+            notice.setMessage("R2DO Sync: waiting for the current sync to finish…");
+          },
+          onStart: () => {
+            notice.setMessage(REMOVING);
+          },
         }
-      });
+      );
     } catch (e) {
       new Notice(`R2DO Sync could not remove empty folders: ${message(e)}`, 0);
       return;

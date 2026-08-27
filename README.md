@@ -275,6 +275,10 @@ curl -X POST "$WORKER_URL/api/tokens" -H "authorization: Bearer $ADMIN_TOKEN" \
 - **Preview, history, log.** **Preview sync** shows what a pass would change without changing
   anything; **Snapshot history** browses and restores past snapshots; **Sync log** exports
   recent passes to a note. **Sync hotkey** binds "Sync now" (`⇧⌘S` offered when free).
+- **Remove empty folders.** Only files sync, so a folder moved on one device leaves its empty
+  shape behind on the others. A pass clears the folders its own deletions emptied; this button
+  finds any left over, lists them, and removes them only once you agree. A folder holding any
+  file — including one this device does not sync — is never touched.
 - **History by day, week, or every sync**, with an optional date range. A grouped row is one
   calendar day (or week): its newest snapshot, compared against the newest of the day before,
   and labelled with how many syncs that covers. Grouping is what makes the window reach months
