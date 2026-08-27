@@ -51,18 +51,33 @@ export function pruneCandidates(deleted: readonly string[], configDir: string): 
   const selves = selfDirs(configDir);
   const dirs = new Set<string>();
   for (const path of deleted) {
-    const segments = path.split("/");
-    for (let i = 1; i < segments.length; i++) {
-      const dir = segments.slice(0, i).join("/");
+    for (const dir of ancestorDirs(path)) {
       if (selves.some((self) => dir === self || dir.startsWith(`${self}/`))) continue;
       dirs.add(dir);
     }
   }
-  return [...dirs].sort((a, b) => {
+  return deepestFirst(dirs);
+}
+
+/** Every strict ancestor directory of a path, shallowest first. The vault root is not one. */
+export function ancestorDirs(path: string): string[] {
+  const segments = path.split("/");
+  const dirs: string[] = [];
+  for (let i = 1; i < segments.length; i++) dirs.push(segments.slice(0, i).join("/"));
+  return dirs;
+}
+
+/**
+ * Directories ordered so that a sequential remover collapses a whole chain in one pass: `a/b`
+ * only becomes empty once `a/b/c` is gone. Shared by the pruning a sync pass does and the
+ * standalone cleanup command, so both orders are the same order.
+ */
+export function deepestFirst(dirs: Iterable<string>): string[] {
+  return [...new Set(dirs)].sort((a, b) => {
     const depth = b.split("/").length - a.split("/").length;
     if (depth !== 0) return depth;
     // Code-unit order, not `localeCompare`: equal-depth siblings are independent, so the only
-    // thing this decides is that two runs over the same deletions produce the same list.
+    // thing this decides is that two runs over the same input produce the same list.
     return a < b ? -1 : a > b ? 1 : 0;
   });
 }

@@ -1610,3 +1610,200 @@ describe("notice name", () => {
     expect(await summaryAfterOkSync({ noticePrefix: "" })).toBe("up to date");
   });
 });
+
+/**
+ * A vault whose folder tree the test controls, including folders holding no file anywhere
+ * beneath them. That state is invisible to `list()` — a folder exists only as the parent of a
+ * file it holds — which is the whole reason the cleanup command has to walk directories.
+ */
+function vaultTree(
+  app: LifecycleApp,
+  tree: { files?: string[]; folders?: string[] }
+): { files: Set<string>; removed: string[] } {
+  const files = new Set(tree.files ?? []);
+  const folders = new Set(tree.folders ?? []);
+  for (const path of [...files, ...folders]) {
+    const segments = path.split("/");
+    const last = folders.has(path) ? segments.length : segments.length - 1;
+    for (let i = 1; i <= last; i++) folders.add(segments.slice(0, i).join("/"));
+  }
+  const removed: string[] = [];
+  const childrenOf = (path: string, of: Set<string>): string[] => {
+    const prefix = path === "" ? "" : `${path}/`;
+    return [...of].filter(
+      (p) => p !== path && p.startsWith(prefix) && !p.slice(prefix.length).includes("/")
+    );
+  };
+  app.vault.adapter = {
+    list: async (path: string) => ({
+      files: childrenOf(path, files).sort(),
+      folders: childrenOf(path, folders).sort(),
+    }),
+    stat: async (path: string) =>
+      files.has(path)
+        ? { type: "file", size: 1, mtime: 1 }
+        : folders.has(path)
+          ? { type: "folder", size: 0, mtime: 1 }
+          : null,
+    rmdir: async (path: string, recursive: boolean) => {
+      // The command must never hand `true` here: a recursive remove would delete whatever
+      // appeared since the listing instead of failing on it.
+      if (recursive) throw new Error(`recursive rmdir on ${path}`);
+      const prefix = `${path}/`;
+      if ([...files, ...folders].some((p) => p.startsWith(prefix))) {
+        throw new Error(`directory not empty: ${path}`);
+      }
+      folders.delete(path);
+      removed.push(path);
+    },
+  } as never;
+  return { files, removed };
+}
+
+describe("removing empty folders", () => {
+  const idle = (over: Partial<Settings> = {}) =>
+    makePlugin(
+      persisted({
+        settings: { ...CONFIGURED, firstSyncAcknowledged: true, syncOnStartup: false, ...over },
+      })
+    );
+
+  /** Answers the window and waits for the removal it starts, rather than for a flush count. */
+  async function confirmAndWait(): Promise<void> {
+    const opts = lastModal().opts as { onConfirm?: () => unknown } | undefined;
+    await opts?.onConfirm?.();
+  }
+
+  function offered(): unknown {
+    return (lastModal().opts as { list?: readonly string[] } | undefined)?.list;
+  }
+
+  it("says so, and opens no window, when there is nothing to remove", async () => {
+    const { plugin, app } = idle();
+    const tree = vaultTree(app, { files: ["note.md", "a/b/deep.md"] });
+    await plugin.onload();
+    Modal.shown.length = 0;
+    Notice.shown.length = 0;
+
+    await plugin.removeEmptyFolders();
+
+    expect(Modal.shown).toHaveLength(0);
+    expect(Notice.shown.join(" ")).toContain("no empty folders");
+    expect(tree.removed).toEqual([]);
+  });
+
+  it("names the whole skeleton and removes it deepest-first once confirmed", async () => {
+    // `removeFolderIfEmpty` is leaf-only, so offering just `a` would remove nothing at all.
+    const { plugin, app } = idle();
+    const tree = vaultTree(app, { files: ["note.md"], folders: ["a/b/c"] });
+    await plugin.onload();
+    Modal.shown.length = 0;
+    Notice.shown.length = 0;
+
+    await plugin.removeEmptyFolders();
+    await untilModal();
+
+    expect(offered()).toEqual(["a/b/c", "a/b", "a"]);
+    // The list is rendered, not just carried: a count alone is not something anyone can check.
+    const body = (lastModal().contentEl as unknown as { texts(): string[] }).texts().join(" ");
+    expect(body).toContain("a/b/c");
+
+    await confirmAndWait();
+
+    expect(tree.removed).toEqual(["a/b/c", "a/b", "a"]);
+    expect(Notice.shown.join(" ")).toContain("removed 3 empty folders");
+  });
+
+  it("removes nothing when the window is dismissed", async () => {
+    const { plugin, app } = idle();
+    const tree = vaultTree(app, { files: ["note.md"], folders: ["ghost"] });
+    await plugin.onload();
+    Modal.shown.length = 0;
+
+    await plugin.removeEmptyFolders();
+    await untilModal();
+    answerConfirm(false);
+    await flush();
+
+    expect(tree.removed).toEqual([]);
+  });
+
+  it("re-checks each folder, so one that filled while the window was open is kept", async () => {
+    // The confirmed list is a snapshot of a moving filesystem. Being allowed to go stale is
+    // the point: the fresh listing inside removeFolderIfEmpty is what decides, every time.
+    const { plugin, app } = idle();
+    const tree = vaultTree(app, { files: ["note.md"], folders: ["ghost", "refilled"] });
+    await plugin.onload();
+    Modal.shown.length = 0;
+    Notice.shown.length = 0;
+
+    await plugin.removeEmptyFolders();
+    await untilModal();
+    expect(offered()).toEqual(["ghost", "refilled"]);
+
+    tree.files.add("refilled/new.md");
+    await confirmAndWait();
+
+    expect(tree.removed).toEqual(["ghost"]);
+    // Said out loud: the number differing from the list they confirmed is exactly when
+    // someone needs to know the check ran again.
+    expect(Notice.shown.join(" ")).toContain("kept 1 no longer empty");
+  });
+
+  it("offers only folders this device syncs, and never a parent of one it skipped", async () => {
+    const { plugin, app } = idle({ excludes: "Archive/**" });
+    vaultTree(app, {
+      files: ["note.md"],
+      // `.git` is junk this plugin never scans; `Archive/Old` is excluded by the glob. Both
+      // were made by someone else and are not this button's to tidy. `Archive` itself is in
+      // scope but cannot go while `Archive/Old` stands, so offering it would be a promise
+      // that has to break.
+      folders: ["Notes/Gone", "Archive/Old", ".git/refs/tags"],
+    });
+    await plugin.onload();
+    Modal.shown.length = 0;
+
+    await plugin.removeEmptyFolders();
+    await untilModal();
+
+    expect(offered()).toEqual(["Notes/Gone", "Notes"]);
+  });
+
+  it("never offers this plugin's own folder, which holds the key", async () => {
+    const { plugin, app } = idle({ syncConfigDir: true });
+    vaultTree(app, {
+      files: ["note.md"],
+      folders: [".obsidian/plugins/cloudflare-rdo-sync/cache"],
+    });
+    await plugin.onload();
+    Modal.shown.length = 0;
+    Notice.shown.length = 0;
+
+    await plugin.removeEmptyFolders();
+
+    expect(Modal.shown).toHaveLength(0);
+    expect(Notice.shown.join(" ")).toContain("no empty folders");
+  });
+
+  it("reports a folder it could not remove instead of counting it as done", async () => {
+    const { plugin, app } = idle();
+    const tree = vaultTree(app, { files: ["note.md"], folders: ["ghost"] });
+    await plugin.onload();
+    const adapter = app.vault.adapter as unknown as { rmdir: unknown };
+    adapter.rmdir = async () => {
+      throw new Error("EPERM");
+    };
+    Modal.shown.length = 0;
+    Notice.shown.length = 0;
+
+    await plugin.removeEmptyFolders();
+    await untilModal();
+    await confirmAndWait();
+
+    expect(tree.removed).toEqual([]);
+    const said = Notice.shown.join(" ");
+    expect(said).toContain("removed 0 empty folders");
+    expect(said).toContain("ghost");
+    expect(said).toContain("EPERM");
+  });
+});

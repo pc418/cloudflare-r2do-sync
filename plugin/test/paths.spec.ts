@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   alwaysSkip,
+  ancestorDirs,
   countInScope,
+  deepestFirst,
   globToRegExp,
   isConfigCodePath,
   isConfigPath,
@@ -393,5 +395,34 @@ describe("pruneCandidates", () => {
       ".obsidian/plugins",
       ".obsidian",
     ]);
+  });
+});
+
+describe("ancestorDirs", () => {
+  it("names every strict ancestor, shallowest first, never the path itself", () => {
+    expect(ancestorDirs("a/b/c/x.md")).toEqual(["a", "a/b", "a/b/c"]);
+  });
+
+  it("names nothing for a path at the vault root", () => {
+    expect(ancestorDirs("x.md")).toEqual([]);
+  });
+});
+
+describe("deepestFirst", () => {
+  it("orders deepest first so a chain collapses in one sequential pass", () => {
+    expect(deepestFirst(["a", "a/b/c", "a/b"])).toEqual(["a/b/c", "a/b", "a"]);
+  });
+
+  it("dedupes, and orders equal-depth siblings the same way whatever the input order", () => {
+    expect(deepestFirst(["a/z", "a/b", "a/z"])).toEqual(["a/b", "a/z"]);
+    expect(deepestFirst(["a/b", "a/z"])).toEqual(["a/b", "a/z"]);
+  });
+
+  it("is the order pruneCandidates already produced", () => {
+    // The sort moved out of `pruneCandidates` so the cleanup command shares it. If these two
+    // ever disagree, one of the two removers stops collapsing chains.
+    expect(pruneCandidates(["a/b/x.md", "a/z/w.md"], DEFAULT_CONFIG_DIR)).toEqual(
+      deepestFirst(["a", "a/b", "a/z"])
+    );
   });
 });

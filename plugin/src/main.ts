@@ -110,7 +110,13 @@ import {
   describeFailure,
   domMobileChrome,
 } from "./mobile-status-bar";
-import { countInScope, parseGlobs, DEFAULT_CONFIG_DIR } from "./paths";
+import {
+  ancestorDirs,
+  countInScope,
+  makeScopeFilter,
+  parseGlobs,
+  DEFAULT_CONFIG_DIR,
+} from "./paths";
 import { DEFAULT_LANES, MAX_LANES, clampLanes, mapPool } from "./pool";
 import { SyncScheduler, type ExclusiveHooks } from "./queue";
 import {
@@ -1338,6 +1344,116 @@ export default class LogSyncPlugin extends Plugin {
     }
   }
 
+  /**
+   * Removes the directory skeletons a pulled tree move leaves behind.
+   *
+   * Sync is file-only, so a folder exists only as the parent of a file it holds. A pass now
+   * prunes the folders its own deletions emptied, but anything stranded before that shipped —
+   * or by a device that never ran the fix — has no deletion left to trigger it. This is the
+   * standalone sweep for those, and the one place a folder is removed without a file having
+   * just been deleted.
+   *
+   * Two boundaries, and they do different jobs. **Scope** decides what is offered:
+   * `makeScopeFilter` — the same rules a pass scans by — so this cleans the part of the vault
+   * this device syncs and nothing else. A folder under an exclude glob, inside `.git`, or
+   * inside the plugin's own directory was never created by us and is not ours to tidy.
+   * **Safety** is `removeFolderIfEmpty`'s fresh listing, unchanged: it is what keeps a folder
+   * holding excluded or unscanned content standing, and it is re-checked per folder at removal
+   * time. That is why the confirmed list is allowed to go stale while the dialog is open — a
+   * folder that gained a file survives and is reported as kept, rather than being removed on
+   * the strength of a listing taken minutes ago.
+   */
+  async removeEmptyFolders(): Promise<void> {
+    // Checked before the scan, not just before the removal: a force pull or an encryption
+    // rewrite is moving files right now, so any answer here would be about a vault that has
+    // already changed — including "nothing to remove".
+    // The stored block sentences all end by telling the reader to resolve a conflict, which is
+    // not what this button was doing.
+    if (this.#vaultRewrite !== null) {
+      new Notice(
+        "R2DO Sync: this vault is being rewritten. Wait for that to finish, then look for " +
+          "empty folders again.",
+        10_000
+      );
+      return;
+    }
+    const vault = new ObsidianVault(this.app, this.settings.lanes);
+    const inScope = makeScopeFilter({
+      excludes: parseGlobs(this.settings.excludes),
+      onlyPaths: parseGlobs(this.settings.onlyPaths),
+      syncConfigDir: this.settings.syncConfigDir,
+      configDir: configDirOf(this.app),
+    });
+
+    // The scan is read-only, so it runs outside the exclusive lane: holding the lane across a
+    // confirmation dialog would stall sync for as long as the window stays open, which is the
+    // dead-button complaint again.
+    const notice = new Notice("R2DO Sync: looking for empty folders…", 0);
+    let found: string[];
+    try {
+      found = offerable(await vault.emptyFolders(), inScope);
+    } catch (e) {
+      new Notice(`R2DO Sync could not scan for empty folders: ${message(e)}`, 10_000);
+      return;
+    } finally {
+      notice.hide();
+    }
+
+    if (found.length === 0) {
+      new Notice("R2DO Sync: no empty folders to remove", 5_000);
+      return;
+    }
+
+    new ConfirmModal(this.app, {
+      title: `Remove ${found.length} empty folder${found.length === 1 ? "" : "s"}?`,
+      body: [
+        "These folders hold no file, in them or anywhere beneath them. Removing them changes " +
+          "nothing that syncs — an empty folder is not part of a snapshot.",
+        "Each one is checked again as it is removed, so anything that gains a file in the " +
+          "meantime is left alone.",
+      ],
+      list: found,
+      confirmText: "Remove them",
+      cancelText: "Keep them",
+      onConfirm: () => this.#removeFoldersOnDisk(found),
+    }).open();
+  }
+
+  /** Deepest first, sequentially: `a/b` only becomes removable once `a/b/c` is gone. */
+  async #removeFoldersOnDisk(folders: readonly string[]): Promise<void> {
+    const vault = new ObsidianVault(this.app, this.settings.lanes);
+    const removed: string[] = [];
+    const kept: string[] = [];
+    const failed: string[] = [];
+    const notice = new Notice("R2DO Sync: removing empty folders…", 0);
+    try {
+      await this.#exclusive(async () => {
+        for (const folder of folders) {
+          try {
+            if (await vault.removeFolderIfEmpty(folder)) removed.push(folder);
+            else kept.push(folder);
+          } catch (e) {
+            // One folder refusing to go is not a reason to abandon the rest, and a parent it
+            // still occupies simply reports as kept. Every failure is named below.
+            failed.push(`${folder} (${message(e)})`);
+          }
+        }
+      });
+    } catch (e) {
+      new Notice(`R2DO Sync could not remove empty folders: ${message(e)}`, 0);
+      return;
+    } finally {
+      notice.hide();
+    }
+
+    const parts = [`removed ${removed.length} empty folder${removed.length === 1 ? "" : "s"}`];
+    // Said rather than swallowed: the number differing from the list the user confirmed is
+    // exactly the moment they need to know the check happened again.
+    if (kept.length > 0) parts.push(`kept ${kept.length} no longer empty`);
+    if (failed.length > 0) parts.push(`could not remove ${failed.join(", ")}`);
+    new Notice(`R2DO Sync: ${parts.join("; ")}`, failed.length > 0 ? 0 : 5_000);
+  }
+
   async openHistory(): Promise<void> {
     if (!this.#engine) {
       new Notice("R2DO Sync: set the server URL and access token in settings first");
@@ -2047,18 +2163,25 @@ export default class LogSyncPlugin extends Plugin {
     choice: ConflictChoice,
     hooks?: ExclusiveHooks
   ): Promise<void> {
+    await this.#exclusive(() => this.#resolveConflictOnDisk(info, choice), hooks);
+  }
+
+  /**
+   * Runs a local vault mutation in the scheduler's exclusive lane, so it cannot overlap a pass.
+   *
+   * Shared by conflict resolution and the empty-folder cleanup: both write to the vault outside
+   * a sync, and both must therefore queue behind one rather than race it.
+   */
+  async #exclusive<T>(run: () => Promise<T>, hooks?: ExclusiveHooks): Promise<T> {
     // Checked before anything is queued: these rewrites run for as long as they run, and a
     // button that waits minutes is the dead-button complaint again rather than a fix for it.
     if (this.#vaultRewrite !== null) throw new Error(this.#vaultRewrite);
     const scheduler = this.#scheduler;
-    if (scheduler !== null) {
-      await scheduler.runExclusive(() => this.#resolveConflictOnDisk(info, choice), hooks);
-      return;
-    }
+    if (scheduler !== null) return await scheduler.runExclusive(run, hooks);
     // A rebuild hides its scheduler immediately, then drains the old one before installing
     // the replacement. Waiting here avoids racing the old pass; re-checking afterwards lets
-    // the choice join the replacement's lane if configuration is still usable. With no
-    // scheduler after the drain, no pass can overlap a direct local resolution.
+    // the operation join the replacement's lane if configuration is still usable. With no
+    // scheduler after the drain, no pass can overlap a direct local mutation.
     //
     // Deliberately no `onQueued`: on a device that cannot sync at all — no server URL, no
     // key — this is the ordinary path and the drain is already resolved, so announcing a wait
@@ -2066,12 +2189,9 @@ export default class LogSyncPlugin extends Plugin {
     await this.#schedulerDrain;
     if (this.#vaultRewrite !== null) throw new Error(this.#vaultRewrite);
     const replacement = this.#scheduler;
-    if (replacement !== null) {
-      await replacement.runExclusive(() => this.#resolveConflictOnDisk(info, choice), hooks);
-      return;
-    }
+    if (replacement !== null) return await replacement.runExclusive(run, hooks);
     hooks?.onStart?.();
-    await this.#resolveConflictOnDisk(info, choice);
+    return await run();
   }
 
   /**
@@ -3679,6 +3799,32 @@ export class ConflictReportModal extends Modal {
   }
 }
 
+/**
+ * The empty folders this device may actually offer to remove, from the walk's deepest-first list.
+ *
+ * A folder is offered only when everything beneath it is offered too. Scope is decided per
+ * path, so an exclude glob like `Archive/**` can put a child out of scope while its parent
+ * stays in — and that parent cannot be removed while the excluded child still stands. Listing
+ * it would promise a removal that has to fail, and then report it as "no longer empty", which
+ * it never was. Deepest-first is what lets one pass decide this: a child is always seen before
+ * its parent.
+ */
+function offerable(found: readonly string[], inScope: (path: string) => boolean): string[] {
+  const blocked = new Set<string>();
+  const offered: string[] = [];
+  for (const folder of found) {
+    if (inScope(folder) && !blocked.has(folder)) {
+      offered.push(folder);
+      continue;
+    }
+    for (const dir of ancestorDirs(folder)) blocked.add(dir);
+  }
+  return offered;
+}
+
+/** Same cap as the sync preview: past this a dialog is a wall of text nobody reads. */
+const CONFIRM_LIST_MAX = 50;
+
 class ConfirmModal extends Modal {
   /** So `onCancel` fires exactly once, whether the user cancels or dismisses the window. */
   #settled = false;
@@ -3689,6 +3835,11 @@ class ConfirmModal extends Modal {
       title: string;
       /** One paragraph, or several — a wall of text is a dialog nobody reads. */
       body: string | readonly string[];
+      /**
+       * Paths the confirmation is *about*, listed under the body. A count alone is not
+       * something anyone can check, and this dialog is where a wrong entry has to be caught.
+       */
+      list?: readonly string[];
       /** When set, the phrase must be typed. Absent: a plain second-confirm button. */
       phrase?: string;
       confirmText?: string;
@@ -3706,6 +3857,13 @@ class ConfirmModal extends Modal {
     contentEl.createEl("h2", { text: opts.title });
     for (const paragraph of typeof opts.body === "string" ? [opts.body] : opts.body) {
       contentEl.createEl("p", { text: paragraph });
+    }
+    if (opts.list !== undefined && opts.list.length > 0) {
+      const ul = contentEl.createEl("ul");
+      for (const item of opts.list.slice(0, CONFIRM_LIST_MAX)) ul.createEl("li", { text: item });
+      if (opts.list.length > CONFIRM_LIST_MAX) {
+        ul.createEl("li", { text: `…and ${opts.list.length - CONFIRM_LIST_MAX} more` });
+      }
     }
 
     const phrase = opts.phrase;
@@ -5425,6 +5583,20 @@ export class LogSyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         });
       });
+
+    // A vault-hygiene chore rather than a policy choice, which is why it sits here and not
+    // among Recovery's progressively destructive rows: it can only remove a folder that a
+    // fresh listing proves holds nothing.
+    new Setting(containerEl)
+      .setName("Remove empty folders")
+      .setDesc(
+        "Finds folders left holding nothing — usually the old skeleton after a folder was " +
+          "moved on another device — and lists them before removing any. Only folders this " +
+          "device syncs are offered, and one holding any file, even an excluded one, is kept."
+      )
+      .addButton((b) =>
+        b.setButtonText("Find empty folders").onClick(() => void this.plugin.removeEmptyFolders())
+      );
   }
 
   display(): void {

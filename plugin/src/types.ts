@@ -158,6 +158,16 @@ export interface VaultAdapter {
    * Returns whether it removed. Destroys nothing: an empty folder has no content to lose.
    */
   removeFolderIfEmpty(path: string): Promise<boolean>;
+  /**
+   * Every folder whose **entire subtree** holds no file, deepest first.
+   *
+   * Sync is file-only, so these are invisible to `list()` — the standalone cleanup command is
+   * the only caller, and it needs the whole chain rather than the leaves: `removeFolderIfEmpty`
+   * is leaf-only, so a sixteen-deep skeleton is removed by naming every level of it and
+   * working upward. A snapshot of a moving filesystem, deliberately: emptiness is re-checked
+   * per folder at removal time, which is what makes a stale list safe rather than merely likely.
+   */
+  emptyFolders(): Promise<string[]>;
 }
 
 /** What this device believes it last pushed. The basis for divergence detection. */

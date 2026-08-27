@@ -275,3 +275,76 @@ describe("ObsidianVault.removeFolderIfEmpty", () => {
     expect(adapter.entries.has("a/b")).toBe(true);
   });
 });
+
+describe("ObsidianVault.emptyFolders", () => {
+  const addFolder = (adapter: FakeDataAdapter, path: string): void => {
+    const parts = path.split("/");
+    for (let i = 1; i <= parts.length; i++) {
+      adapter.entries.set(parts.slice(0, i).join("/"), { type: "folder" });
+    }
+  };
+
+  it("names every level of a file-free chain, deepest first", async () => {
+    // The skeleton a pulled tree move leaves behind. `removeFolderIfEmpty` is leaf-only, so
+    // naming only `a` would remove nothing at all.
+    const adapter = new FakeDataAdapter();
+    addFolder(adapter, "a/b/c");
+
+    await expect(vault(adapter).emptyFolders()).resolves.toEqual(["a/b/c", "a/b", "a"]);
+  });
+
+  it("never names the vault root, and finds nothing in a vault of files", async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.addFile("note.md", "note");
+
+    await expect(vault(adapter).emptyFolders()).resolves.toEqual([]);
+  });
+
+  it("keeps a folder holding a file, however deep the file is", async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.addFile("a/b/c/note.md", "note");
+
+    await expect(vault(adapter).emptyFolders()).resolves.toEqual([]);
+  });
+
+  it("keeps ancestors of a file but names the empty branch beside it", async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.addFile("a/keep/note.md", "note");
+    addFolder(adapter, "a/gone/deeper");
+
+    await expect(vault(adapter).emptyFolders()).resolves.toEqual(["a/gone/deeper", "a/gone"]);
+  });
+
+  it("counts an excluded file as content, so its folder is never named", async () => {
+    // The command must not offer a folder holding an image nobody syncs. This is the same
+    // property `removeFolderIfEmpty` enforces at removal time; here it keeps it off the list
+    // the user is asked to confirm in the first place.
+    const adapter = new FakeDataAdapter();
+    addFolder(adapter, "a/attachments");
+    adapter.addFile("a/attachments/photo.png", "binary");
+
+    await expect(vault(adapter).emptyFolders()).resolves.toEqual([]);
+  });
+
+  it("names hidden and config folders too, leaving scope to the caller", async () => {
+    const adapter = new FakeDataAdapter();
+    addFolder(adapter, ".obsidian/plugins/other/cache");
+
+    // The walk reports what is empty. Which of these the command may touch is a policy
+    // question answered above it, not here.
+    await expect(vault(adapter).emptyFolders()).resolves.toContain(
+      ".obsidian/plugins/other/cache"
+    );
+  });
+
+  it("costs directory listings only — never a stat", async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.addFile("a/note.md", "note");
+    addFolder(adapter, "b/c");
+
+    await vault(adapter).emptyFolders();
+
+    expect(adapter.statCalls).toEqual([]);
+    expect(adapter.listCalls.sort()).toEqual(["", "a", "b", "b/c"]);
+  });
+});

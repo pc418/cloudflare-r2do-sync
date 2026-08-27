@@ -75,6 +75,7 @@ function fakePlugin(over: Partial<Settings> = {}, keyMismatch: string | null = n
     async forcePull() {},
     async forcePush() {},
     async rebuildHistory() {},
+    async removeEmptyFolders() {},
     openConflictReview() {
       this.reviewed += 1;
     },
@@ -130,6 +131,7 @@ describe("settings tab rendering", () => {
     ["Rows listed in history", "Safety and recovery"],
     ["Sync log length", "Troubleshooting"],
     ["Report folder", "Troubleshooting"],
+    ["Remove empty folders", "Troubleshooting"],
     ["Sync settings between devices", "This device"],
   ])("files %s under %s", (row, heading) => {
     const found = render().log.settings.find((s) => s.name === row);
@@ -182,6 +184,7 @@ describe("settings tab rendering", () => {
     "Parallel lanes",
     "Sync log length",
     "Report folder",
+    "Remove empty folders",
     "Rows listed in history",
     "Automatic retries",
     "What sync announces",
@@ -243,12 +246,16 @@ describe("settings tab rendering", () => {
     ["Push local over remote", "Push local", "push"],
     // The only control on this page that destroys history rather than moving files.
     ["Rebuild remote history", "Rebuild", "rebuild"],
+    // Not destructive, but it does remove things from disk, and a dead button here would
+    // leave the skeletons standing with nothing to say so.
+    ["Remove empty folders", "Find empty folders", "folders"],
   ])("wires %s to the plugin action", (row, button, action) => {
     const called: string[] = [];
     const plugin = fakePlugin();
     plugin.forcePull = async () => void called.push("pull");
     plugin.forcePush = async () => void called.push("push");
     plugin.rebuildHistory = async () => void called.push("rebuild");
+    plugin.removeEmptyFolders = async () => void called.push("folders");
     const tab = newTab(plugin);
     tab.display();
     const log = logOf(tab);

@@ -1,4 +1,5 @@
 import { sha256Hex } from "../src/hash";
+import { ancestorDirs, deepestFirst } from "../src/paths";
 import { blobKey, type Manifest, type ManifestV1, type ManifestV2, type ManifestV3 } from "../src/types";
 import type { HistoryEntry, HistoryPage, StateStore, SyncState, VaultAdapter, VaultFile } from "../src/types";
 import { ApiError, MissingBlobError, StaleHeadError } from "../src/api";
@@ -63,6 +64,13 @@ export class FakeVault implements VaultAdapter {
     this.folders.delete(path);
     this.folderRemoves.push(path);
     return true;
+  }
+
+  /** Known folders with no file anywhere beneath them, deepest first. */
+  async emptyFolders(): Promise<string[]> {
+    const holdsFile = new Set<string>();
+    for (const file of this.files.keys()) for (const dir of ancestorDirs(file)) holdsFile.add(dir);
+    return deepestFirst([...this.folders].filter((dir) => !holdsFile.has(dir)));
   }
 
   delete(path: string): void {

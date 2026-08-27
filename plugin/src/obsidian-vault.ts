@@ -1,6 +1,7 @@
 import type { App } from "obsidian";
 import type { VaultAdapter, VaultFile } from "./types";
 import { DEFAULT_LANES, clampLanes, mapPool } from "./pool";
+import { ancestorDirs, deepestFirst } from "./paths";
 
 /**
  * Vault bridge backed by Obsidian's DataAdapter rather than the loaded TFile tree.
@@ -36,6 +37,32 @@ export class ObsidianVault implements VaultAdapter {
       folders = listings.flatMap((listed) => listed.folders);
     }
     return files.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /**
+   * Folders holding no file anywhere beneath them, deepest first.
+   *
+   * One walk, and **no stats**: this needs paths, never `size`/`mtime`, so it costs a directory
+   * listing per folder rather than `list()`'s stat per file. A folder is file-free when its own
+   * listing has no files and neither does any folder under it, which is computed here by
+   * marking every ancestor of every file seen — the complement is the answer.
+   */
+  async emptyFolders(): Promise<string[]> {
+    const seen: string[] = [];
+    const holdsFile = new Set<string>();
+    let layer = [""];
+    while (layer.length > 0) {
+      const listings = await mapPool(layer, this.#lanes, async (folder) =>
+        this.app.vault.adapter.list(folder)
+      );
+      for (const listed of listings) {
+        for (const file of listed.files) for (const dir of ancestorDirs(file)) holdsFile.add(dir);
+      }
+      layer = listings.flatMap((listed) => listed.folders);
+      // The root is never a candidate, and it is the one folder never pushed here.
+      seen.push(...layer);
+    }
+    return deepestFirst(seen.filter((dir) => !holdsFile.has(dir)));
   }
 
   /**
