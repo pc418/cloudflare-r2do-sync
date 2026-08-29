@@ -38,12 +38,23 @@ export class AgentState extends DurableObject<AgentEnv> {
       const client = (token: string) =>
         new SyncApi({ baseUrl: this.env.SYNC_URL, token, http: fetchHttp });
       const write = this.env.SYNC_WRITE_TOKEN;
+      // One value, threaded to both: the reader hides the config directory's contents and the
+      // writer refuses to write into it, and they must be deciding about the same directory.
+      const configDir =
+        this.env.VAULT_CONFIG_DIR !== undefined && this.env.VAULT_CONFIG_DIR !== ""
+          ? this.env.VAULT_CONFIG_DIR
+          : ".obsidian";
       this.#view = new VaultView({
         api: client(this.env.SYNC_TOKEN),
         writeApi: write === undefined || write === "" ? null : client(write),
         crypto,
+        configDir,
       });
-      this.#writer = new VaultWriter({ view: this.#view, device: this.env.AGENT_DEVICE ?? "agent" });
+      this.#writer = new VaultWriter({
+        view: this.#view,
+        device: this.env.AGENT_DEVICE ?? "agent",
+        configDir,
+      });
     }
     return { view: this.#view, writer: this.#writer };
   }

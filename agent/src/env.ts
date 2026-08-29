@@ -23,5 +23,13 @@ export interface AgentEnv {
   MCP_BEARER: string;
   /** Device name stamped on the agent's snapshots, so history shows who wrote them. */
   AGENT_DEVICE?: string;
+  /**
+   * This vault's Obsidian configuration directory, when it is not `.obsidian`.
+   *
+   * It decides what `alwaysSkip` and `selfDirs` cover. On a vault with a renamed config
+   * folder, defaulting would leave that folder's historical credentials neither hidden from
+   * reads nor protected from writes — the hard-skip set is computed from this name.
+   */
+  VAULT_CONFIG_DIR?: string;
   AGENT: DurableObjectNamespace<AgentState>;
 }

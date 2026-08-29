@@ -3,6 +3,8 @@ import { SyncApi } from "../../plugin/src/api";
 import { callTool, TOOLS, type ToolContext } from "../src/tools";
 import { fetchHttp, VaultView } from "../src/vault";
 import { PLUGIN_DIR } from "../../plugin/src/paths";
+import { INDEX_CHUNK } from "../src/index-store";
+import { MAX_SCAN_FILES } from "../src/search";
 import { VaultWriter, refuseWrite, type WriteOp } from "../src/write";
 import { fakeVault, seed, testCrypto } from "./helpers";
 
@@ -84,7 +86,9 @@ describe("read tools", () => {
     const { ctx } = await context();
     const out = await callTool("read", { path: "Projects/Tea.md" }, ctx);
     expect(out).toContain("Gyokuro wants 60C water.");
-    expect(out).toMatch(/^Projects\/Tea\.md \(\d+ lines, hash [0-9a-f]{12}\)/);
+    // The FULL hash: `write` compares `expected_hash` against all 64 characters, so a
+    // truncated one made the advertised read-then-write workflow impossible.
+    expect(out).toMatch(/^Projects\/Tea\.md \(\d+ lines, hash [0-9a-f]{64}\)/);
     expect(out).toContain("1  # Tea");
   });
 
@@ -261,6 +265,144 @@ describe("write tools", () => {
     vault.readOnly = true;
     await expect(callTool("append", { path: "a.md", text: "x" }, ctx)).rejects.toThrow();
     expect(vault.manifests.size).toBe(1);
+  });
+});
+
+describe("the shared sync policy governs the agent too", () => {
+  const policy = (plain: Record<string, unknown>) => ({
+    v: 1 as const,
+    updatedAt: 1_754_000_000_000,
+    device: "laptop",
+    rev: 1,
+    plain,
+  });
+
+  async function withPolicy(plain: Record<string, unknown>, notes: Record<string, string>) {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, notes);
+    vault.settings = policy(plain);
+    const client = () => new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const view = new VaultView({ api: client(), writeApi: client(), crypto });
+    const writer = new VaultWriter({ view, device: "agent" });
+    const ctx: ToolContext = {
+      view,
+      writable: true,
+      enqueue: async (op: WriteOp) => {
+        const outcome = await writer.apply([op]);
+        return { head: outcome.head, summary: outcome.applied[0] };
+      },
+    };
+    return { vault, view, writer, ctx };
+  }
+
+  // The vault's excludes are what keep a credentials folder — real credentials — off synced devices.
+  // Excluded paths are CARRIED in snapshots, so without this the agent reads them straight out
+  // of the path map and hands them to whatever the model was asked to summarise.
+  it("hides user-excluded paths from list, read and search", async () => {
+    const { ctx } = await withPolicy(
+      { excludes: "Credentials/**" },
+      { "Welcome.md": "hello\n", "Credentials/keys.md": "AWS_SECRET=hunter2\n" }
+    );
+    const listed = await callTool("list", {}, ctx);
+    expect(listed).not.toContain("Credentials/keys.md");
+    expect(listed).toContain("path(s) this vault never syncs are not listed");
+    expect(await callTool("search", { query: "hunter2" }, ctx)).toContain("No matches");
+    await expect(callTool("read", { path: "Credentials/keys.md" }, ctx)).rejects.toThrow(/no note at/);
+  });
+
+  it("refuses to write to an excluded path", async () => {
+    const { ctx } = await withPolicy({ excludes: "Private/**" }, { "Welcome.md": "hello\n" });
+    await expect(
+      callTool("append", { path: "Private/secret.md", text: "x" }, ctx)
+    ).rejects.toThrow(/outside what this vault syncs/);
+  });
+
+  it("honours an only-paths allow-list in both directions", async () => {
+    const { ctx } = await withPolicy(
+      { onlyPaths: "Notes/**" },
+      { "Notes/a.md": "in scope\n", "Other/b.md": "out of scope\n" }
+    );
+    const listed = await callTool("list", {}, ctx);
+    expect(listed).toContain("Notes/a.md");
+    expect(listed).not.toContain("Other/b.md");
+    await expect(callTool("append", { path: "Elsewhere/c.md", text: "x" }, ctx)).rejects.toThrow(
+      /outside what this vault syncs/
+    );
+  });
+
+  // A 404 is a real state — no policy published yet. Any other failure is not evidence of an
+  // absent policy, and treating it as one would open the vault wide exactly when something
+  // is wrong.
+  it("treats an absent settings document as no policy, but never a failed read", async () => {
+    const { ctx } = await context();
+    expect(await callTool("list", {}, ctx)).toContain("Welcome.md");
+
+    const broken = fakeVault();
+    const crypto = await testCrypto();
+    await seed(broken, crypto, { "a.md": "x\n" });
+    broken.settingsStatus = 500;
+    const client = () => new SyncApi({ baseUrl: "https://vault.test", token: "t", http: broken.http });
+    const view = new VaultView({ api: client(), crypto });
+    const ctx2: ToolContext = { view, writable: false, enqueue: async () => ({ head: "", summary: "" }) };
+    await expect(callTool("list", {}, ctx2)).rejects.toThrow();
+  });
+
+  // Excluded and hard-skipped entries are carried through snapshots on purpose. A commit built
+  // from the visible subset deletes every one of them.
+  it("carries hidden entries through a commit instead of deleting them", async () => {
+    const { ctx, view } = await withPolicy(
+      { excludes: "Credentials/**" },
+      { "Welcome.md": "hello\n", "Credentials/keys.md": "AWS_SECRET=hunter2\n" }
+    );
+    await callTool("append", { path: "Welcome.md", text: "more\n" }, ctx);
+    const after = await view.snapshot({ fresh: true });
+    expect(Object.keys(after.all)).toContain("Credentials/keys.md");
+    expect(Object.keys(after.files)).not.toContain("Credentials/keys.md");
+  });
+});
+
+describe("budgets and configuration", () => {
+  // The Free plan allows 50 EXTERNAL subrequests per invocation. Every blob is a fetch to the
+  // sync Worker, and head + manifest + settings have already spent three. Exceeding it does
+  // not degrade gracefully — it throws mid-scan.
+  it("keeps the scan and the index build under the external subrequest limit", () => {
+    const EXTERNAL_SUBREQUEST_LIMIT = 50;
+    const OVERHEAD = 3; // head, manifest, settings
+    expect(MAX_SCAN_FILES + OVERHEAD).toBeLessThan(EXTERNAL_SUBREQUEST_LIMIT);
+    expect(INDEX_CHUNK + MAX_SCAN_FILES + OVERHEAD).toBeLessThanOrEqual(EXTERNAL_SUBREQUEST_LIMIT * 2);
+    expect(INDEX_CHUNK + OVERHEAD).toBeLessThan(EXTERNAL_SUBREQUEST_LIMIT);
+  });
+
+  // A vault whose Obsidian folder was renamed still has credentials under the ACTIVE directory.
+  // The reader and the writer must be deciding about the same one.
+  it("applies a renamed config directory to both hiding and write protection", async () => {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, {
+      "Welcome.md": "hello\n",
+      ".config/plugins/cloudflare-rdo-sync/data.json": '{"accessToken":"SECRET"}\n',
+    });
+    const client = () => new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const view = new VaultView({ api: client(), writeApi: client(), crypto, configDir: ".config" });
+    const writer = new VaultWriter({ view, device: "agent" });
+    const ctx: ToolContext = {
+      view,
+      writable: true,
+      enqueue: async (op: WriteOp) => {
+        const outcome = await writer.apply([op]);
+        return { head: outcome.head, summary: outcome.applied[0] };
+      },
+    };
+
+    const listed = await callTool("list", {}, ctx);
+    expect(listed).not.toContain("data.json");
+    expect(await callTool("search", { query: "SECRET" }, ctx)).toContain("No matches");
+    await expect(
+      callTool("append", { path: ".config/plugins/cloudflare-rdo-sync/data.json", text: "x" }, ctx)
+    ).rejects.toThrow(/credential|never syncs|not a path|outside what/);
+    // The writer inherits the view's directory rather than defaulting to `.obsidian`.
+    expect(writer instanceof VaultWriter).toBe(true);
   });
 });
 

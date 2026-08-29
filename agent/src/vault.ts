@@ -6,10 +6,11 @@
  * never reimplemented, because a second implementation of the HKDF domains or the AAD layout
  * is how compatibility bugs are born.
  */
-import { SyncApi, type HttpClient } from "../../plugin/src/api";
-import { VaultCrypto, manifestAad } from "../../plugin/src/crypto";
+import { SyncApi, ApiError, type HttpClient } from "../../plugin/src/api";
+import { VaultCrypto, manifestAad, settingsAad } from "../../plugin/src/crypto";
 import { sha256Hex } from "../../plugin/src/hash";
-import { alwaysSkip } from "../../plugin/src/paths";
+import { makeScopeFilter, parseGlobs, type ScopeRules } from "../../plugin/src/paths";
+import { isSettingsDoc } from "../../plugin/src/settings-doc";
 import { blobKey, parseFileEntries, type FileEntry, type Manifest } from "../../plugin/src/types";
 
 /**
@@ -42,9 +43,18 @@ export class VaultError extends Error {}
 
 export interface Snapshot {
   head: string;
-  /** Visible paths only — see `hidden`. */
+  /** In-scope paths: what the tools may see. */
   files: Record<string, FileEntry>;
-  /** How many paths the snapshot carried that this reader refuses to expose. */
+  /**
+   * The COMPLETE path map, filtered by nothing.
+   *
+   * A child manifest must be built from this, never from `files`. Excluded and hard-skipped
+   * paths are deliberately *carried* through snapshots, so a commit assembled from the visible
+   * subset would silently delete every one of them — the agent would quietly destroy exactly
+   * the content the vault takes most care to preserve.
+   */
+  all: Record<string, FileEntry>;
+  /** How many carried paths are withheld from the tools. */
   hidden: number;
 }
 
@@ -73,6 +83,9 @@ export class VaultView {
   readonly #configDir: string;
   #cached: Snapshot | null = null;
 
+  /** Cached shared policy. `null` until first load; the inner value is null when none exists. */
+  #scope: ((path: string) => boolean) | null = null;
+
   constructor(opts: {
     api: SyncApi;
     writeApi?: SyncApi | null;
@@ -83,6 +96,68 @@ export class VaultView {
     this.#writeApi = opts.writeApi ?? null;
     this.#crypto = opts.crypto;
     this.#configDir = opts.configDir ?? ".obsidian";
+  }
+
+  get configDir(): string {
+    return this.#configDir;
+  }
+
+  /**
+   * The vault's own scope rules, from the shared settings document.
+   *
+   * This is not decoration. `alwaysSkip` covers plugin state and config; it says nothing about
+   * the *user's* excludes, and this vault's excludes are what keep a credentials folder — real API keys
+   * and credentials — out of what devices sync. Excluded paths are carried in snapshots
+   * forever, so without this the agent would read them out of the path map and hand them to
+   * whatever the model was asked to summarise.
+   *
+   * A 404 means no policy has been published, which is a real state (a fresh vault), and the
+   * hard skips still apply. Any *other* failure is not evidence of an absent policy — treating
+   * a 401 or a 5xx as "no excludes" would open the vault wide exactly when something is wrong —
+   * so it propagates.
+   */
+  async scope(): Promise<(path: string) => boolean> {
+    if (this.#scope !== null) return this.#scope;
+
+    let rules: ScopeRules = { excludes: [], onlyPaths: [], syncConfigDir: false, configDir: this.#configDir };
+    let raw: unknown;
+    try {
+      raw = await this.#api.getSettingsDoc();
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) raw = null;
+      else throw error;
+    }
+
+    if (raw !== null && raw !== undefined) {
+      if (!isSettingsDoc(raw)) throw new VaultError("the shared settings document is malformed");
+      let plain: Record<string, unknown>;
+      if (raw.v === 2 || raw.v === 3) {
+        if (this.#crypto.keyId !== raw.keyId) {
+          throw new VaultError(
+            "the shared settings were written with a different master key than this agent holds"
+          );
+        }
+        plain = await this.#crypto.decryptSettingsJson<Record<string, unknown>>(
+          raw.enc,
+          raw.v === 3
+            ? settingsAad({ v: 3, rev: raw.rev ?? 0, device: raw.device, keyId: raw.keyId, vaultSalt: raw.vaultSalt })
+            : undefined
+        );
+      } else {
+        plain = raw.plain;
+      }
+      rules = {
+        excludes: parseGlobs(typeof plain.excludes === "string" ? plain.excludes : ""),
+        onlyPaths: parseGlobs(typeof plain.onlyPaths === "string" ? plain.onlyPaths : ""),
+        syncConfigDir: false,
+        configDir: this.#configDir,
+      };
+    }
+
+    // The engine's own predicate, not a second implementation: it already composes
+    // `alwaysSkip`, `pathError`, the config-directory rule, the excludes and the allow-list.
+    this.#scope = makeScopeFilter(rules);
+    return this.#scope;
   }
 
   get writable(): boolean {
@@ -114,22 +189,18 @@ export class VaultView {
 
     const manifest = await this.#api.getManifest(head);
     const all = await this.#decryptPathMap(manifest);
+    const inScope = await this.scope();
 
-    // Defence in depth, and the reason it is not merely tidy: `paths.ts` hard-skips
-    // credential-bearing plugin state, so those paths are not synced — but excluded remote
-    // paths are *carried* through snapshots, so anything a past device published stays in the
-    // path map forever. This agent holds the master key; letting it read back a `data.json`
-    // holding another device's access token and master key would hand the whole vault to
-    // whatever the model is asked to summarise. The sync policy governs writing; this is the
-    // reading side of the same concern, and it is applied before anything is offered.
+    // The reading side of the sync policy. `all` keeps everything, because a commit must carry
+    // it; `files` is what the tools may look at.
     const files: Record<string, FileEntry> = Object.create(null) as Record<string, FileEntry>;
     let hidden = 0;
     for (const [path, entry] of Object.entries(all)) {
-      if (alwaysSkip(path, this.#configDir)) hidden++;
-      else files[path] = entry;
+      if (inScope(path)) files[path] = entry;
+      else hidden++;
     }
 
-    this.#cached = { head, files, hidden };
+    this.#cached = { head, files, all, hidden };
     return this.#cached;
   }
 

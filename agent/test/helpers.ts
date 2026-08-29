@@ -21,6 +21,10 @@ export interface FakeVault {
   http: HttpClient;
   /** Runs before each request is served — the seam for "another device commits mid-write". */
   before?: (path: string, method: string) => Promise<void>;
+  /** The shared settings document this vault serves, or null for "none published". */
+  settings?: unknown;
+  /** Overrides the settings response status, to test a failed read vs an absent document. */
+  settingsStatus?: number;
   /** Set to a scope the token lacks to make every write 403, like a read-only token. */
   readOnly: boolean;
   head: string | null;
@@ -54,6 +58,12 @@ export function fakeVault(): FakeVault {
     const writing = req.method !== "GET";
     if (writing && vault.readOnly) {
       return json(403, { error: { code: "forbidden", message: "this access token may read the vault but not write to it" } });
+    }
+
+    if (path === "/api/settings") {
+      if (vault.settingsStatus !== undefined) return json(vault.settingsStatus, { error: { code: "boom", message: "no" } });
+      if (vault.settings === undefined) return json(404, { error: { code: "not_found", message: "no shared settings document" } });
+      return json(200, vault.settings);
     }
 
     if (path === "/api/head") return json(200, { head: vault.head });

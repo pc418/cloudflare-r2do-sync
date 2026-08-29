@@ -56,7 +56,9 @@ export class VaultWriter {
   constructor(opts: { view: VaultView; device: string; configDir?: string }) {
     this.#view = opts.view;
     this.#device = opts.device;
-    this.#configDir = opts.configDir ?? ".obsidian";
+    // Falls back to the view's, never to a literal: two objects disagreeing about which
+    // directory holds the credentials is how one of them stops protecting it.
+    this.#configDir = opts.configDir ?? opts.view.configDir;
   }
 
   /**
@@ -73,10 +75,25 @@ export class VaultWriter {
       if (refusal !== null) throw new VaultError(refusal);
     }
 
+    // The shared policy, not just the hard skips: a path this vault excludes is one ordinary
+    // devices deliberately do not scan, so committing it would report success for a note that
+    // never reaches anyone's disk.
+    const inScope = await this.#view.scope();
+    for (const op of ops) {
+      if (!inScope(op.path)) {
+        throw new VaultError(
+          `"${op.path}" is outside what this vault syncs (its exclude or only-paths policy), so writing it would publish a note no device would download`
+        );
+      }
+    }
+
     let lastError: unknown = null;
     for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt++) {
       const snapshot = await this.#view.snapshot({ fresh: true });
-      const files: Record<string, FileEntry> = { ...snapshot.files };
+      // The complete map, not `snapshot.files`. Excluded and hard-skipped entries are carried
+      // through snapshots deliberately; building from the visible subset would delete every
+      // one of them — silently destroying exactly what the vault takes most care to keep.
+      const files: Record<string, FileEntry> = { ...snapshot.all };
       const applied: string[] = [];
 
       for (const op of ops) {

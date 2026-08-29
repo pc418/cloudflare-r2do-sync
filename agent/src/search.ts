@@ -11,8 +11,15 @@ import { globToRegExp } from "../../plugin/src/paths";
 import type { FileEntry } from "../../plugin/src/types";
 import type { VaultView } from "./vault";
 
-/** Blobs one search may fetch. Each costs a request plus a decrypt. */
-export const MAX_SCAN_FILES = 60;
+/**
+ * Blobs one search may fetch.
+ *
+ * The binding constraint is not time, it is the Free plan's **50 external subrequests per
+ * invocation**: every blob is a `fetch` to the sync Worker, and the head, the manifest and the
+ * settings document have already spent three. Exceeding it does not degrade, it throws
+ * mid-scan. 40 leaves room for those three plus the write path's own requests.
+ */
+export const MAX_SCAN_FILES = 40;
 /** Plaintext bytes one search may scan, whichever limit binds first. */
 export const MAX_SCAN_BYTES = 2 * 1024 * 1024;
 /** Files large enough that they are almost certainly not prose worth grepping. */

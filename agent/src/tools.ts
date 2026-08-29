@@ -292,7 +292,7 @@ export async function callTool(
       const body = slice.map((l, i) => `${String(offset + i).padStart(width)}  ${l}`).join("\n");
       const truncated = offset - 1 + slice.length < lines.length;
       return [
-        `${path} (${lines.length} lines, hash ${entry.h.slice(0, 12)})`,
+        `${path} (${lines.length} lines, hash ${entry.h})`,
         body,
         truncated ? `... ${lines.length - (offset - 1 + slice.length)} more line(s); read again with offset ${offset + slice.length}` : "",
         `head at ${shortSnapshot(head)}`,

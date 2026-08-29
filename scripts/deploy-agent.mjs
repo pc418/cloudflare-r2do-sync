@@ -189,6 +189,11 @@ async function main() {
       { type: "secret_text", name: "SYNC_TOKEN", text: readToken.accessToken ?? readToken.token },
       { type: "secret_text", name: "MCP_BEARER", text: bearer },
       { type: "plain_text", name: "AGENT_DEVICE", text: `agent (${scriptName})` },
+      // What the hard-skip set is computed from. A vault with a renamed Obsidian config folder
+      // must say so, or its historical credentials are neither hidden nor write-protected.
+      ...(process.env.VAULT_CONFIG_DIR
+        ? [{ type: "plain_text", name: "VAULT_CONFIG_DIR", text: process.env.VAULT_CONFIG_DIR }]
+        : []),
       ...(writeToken === null
         ? []
         : [

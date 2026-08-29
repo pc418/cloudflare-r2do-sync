@@ -25,8 +25,14 @@ import { isProbablyText, MAX_FILE_BYTES, type SearchHit, type SearchResult } fro
 /** All the index needs from the vault. Narrow on purpose: it reads bytes, nothing more. */
 export type BlobReader = { read(entry: FileEntry): Promise<Uint8Array> };
 
-/** Notes read into the index per catch-up. Bounds the work, not the eventual coverage. */
-export const INDEX_CHUNK = 80;
+/**
+ * Notes read into the index per catch-up. Bounds the work, not the eventual coverage.
+ *
+ * Same wall as the scan: the Free plan allows **50 external subrequests per invocation**, and
+ * a catch-up runs after a search has already spent some. 30 converges a large vault over a
+ * handful of questions without ever risking the limit mid-build.
+ */
+export const INDEX_CHUNK = 30;
 
 export interface IndexStatus {
   /** The head the index fully describes, or null while it is still catching up. */
