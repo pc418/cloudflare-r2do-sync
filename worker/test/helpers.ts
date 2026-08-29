@@ -48,6 +48,23 @@ export async function mintToken(name = "test-token"): Promise<{ id: string; toke
   return res.json();
 }
 
+/** Mint a token with an explicit authority, through the real admin API. */
+export async function mintScoped(
+  name: string,
+  scopes: readonly string[]
+): Promise<{ id: string; token: string }> {
+  const res = await SELF.fetch(
+    `${BASE}/api/tokens`,
+    authed(ADMIN, {
+      method: "POST",
+      body: JSON.stringify({ name, scopes }),
+      headers: { "content-type": "application/json" },
+    })
+  );
+  if (res.status !== 201) throw new Error(`mintScoped failed: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+
 /** Upload a blob for `content`, returning its hash. */
 export async function putBlob(token: string, content: string): Promise<string> {
   const h = await sha256hex(content);

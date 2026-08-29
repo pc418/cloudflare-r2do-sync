@@ -1,6 +1,17 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import { ADMIN, BASE, authed, commit, makeManifest, mintToken, putBlob, ulid } from "./helpers";
+import {
+  ADMIN,
+  BASE,
+  authed,
+  commit,
+  makeManifest,
+  mintScoped,
+  mintToken,
+  putBlob,
+  sha256hex,
+  ulid,
+} from "./helpers";
 import type { VaultLock } from "../src/vault-lock";
 
 describe("auth", () => {
@@ -190,6 +201,11 @@ describe("token authority", () => {
     expect(await mint([])).toBe(422);
     expect(await mint(["reroot"])).toBe(422);
     expect(await mint(["sync"])).toBe(201);
+    // `read` is the other way to be useful, so it is the other way to be mintable.
+    expect(await mint(["read"])).toBe(201);
+    // Reroot destroys history through a route a read-only token cannot reach, so this
+    // combination grants nothing. Minting it would advertise an authority that does not exist.
+    expect(await mint(["read", "reroot"])).toBe(422);
   });
 
   it("rejects malformed scope and expiry requests instead of ignoring them", async () => {
@@ -207,5 +223,128 @@ describe("token authority", () => {
     expect(await bad({ name: "x", scopes: ["admin"] })).toBe(422);
     expect(await bad({ name: "x", scopes: "sync" })).toBe(422);
     expect(await bad({ name: "x", expiresAt: "not-a-date" })).toBe(422);
+  });
+});
+
+/**
+ * A token that reads the vault and cannot change it. It exists so a process holding the
+ * master key — the mobile agent Worker — can answer questions about the vault without
+ * carrying the authority to write to it: read and write stay separately revocable.
+ */
+describe("read-only scope", () => {
+  const settingsDoc = (device: string) =>
+    JSON.stringify({ v: 1, updatedAt: 1_754_000_000_000, device, plain: { protectPercent: 25 } });
+
+  /** A vault with one snapshot, one blob and a settings document, plus a read-only token. */
+  async function seeded(): Promise<{ read: string; manifestId: string; hash: string }> {
+    const { token: writer } = await mintToken("writer");
+    const hash = await putBlob(writer, "note body");
+    const manifest = makeManifest({ files: { "a.md": { h: hash } } });
+    expect((await commit(writer, manifest, null)).status).toBe(200);
+    const wrote = await SELF.fetch(
+      `${BASE}/api/settings`,
+      authed(writer, {
+        method: "PUT",
+        body: settingsDoc("writer"),
+        headers: { "content-type": "application/json" },
+      })
+    );
+    expect(wrote.status).toBe(200);
+    const { token: read } = await mintScoped("agent", ["read"]);
+    return { read, manifestId: manifest.id, hash };
+  }
+
+  it("reads head, history, manifests, blobs and settings", async () => {
+    const { read, manifestId, hash } = await seeded();
+    for (const path of [
+      "/api/head",
+      "/api/history",
+      `/api/manifests/${manifestId}`,
+      `/api/blobs/${hash}`,
+      "/api/settings",
+    ]) {
+      const res = await SELF.fetch(`${BASE}${path}`, authed(read));
+      expect(`${path} → ${res.status}`).toBe(`${path} → 200`);
+    }
+  });
+
+  it("refuses every route that writes, and says which kind of refusal it is", async () => {
+    const { read } = await seeded();
+    const attempts: [string, RequestInit][] = [
+      [`/api/blobs/${await sha256hex("smuggled")}`, { method: "PUT", body: "smuggled" }],
+      [
+        "/api/blobs/check",
+        {
+          method: "POST",
+          body: JSON.stringify({ hashes: [] }),
+          headers: { "content-type": "application/json" },
+        },
+      ],
+      [
+        "/api/settings",
+        {
+          method: "PUT",
+          body: settingsDoc("agent"),
+          headers: { "content-type": "application/json" },
+        },
+      ],
+    ];
+    for (const [path, init] of attempts) {
+      const res = await SELF.fetch(`${BASE}${path}`, authed(read, init));
+      expect(`${path} → ${res.status}`).toBe(`${path} → 403`);
+      expect(await res.json()).toMatchObject({
+        error: { code: "forbidden", message: "this access token may read the vault but not write to it" },
+      });
+    }
+
+    const committed = await commit(read, makeManifest({ files: {} }), null);
+    expect(committed.status).toBe(403);
+    // The destructive form is refused as a write, before the reroot scope is ever consulted.
+    const destructive = await commit(read, makeManifest({ files: {} }), null, { reroot: true });
+    expect(destructive.status).toBe(403);
+  });
+
+  it("leaves the vault exactly as it found it when it refuses", async () => {
+    const { read, manifestId, hash } = await seeded();
+    const headBefore = await (await SELF.fetch(`${BASE}/api/head`, authed(read))).json<{ head: string }>();
+
+    const smuggled = await sha256hex("smuggled");
+    await SELF.fetch(`${BASE}/api/blobs/${smuggled}`, authed(read, { method: "PUT", body: "smuggled" }));
+    await commit(read, makeManifest({ files: { "b.md": { h: hash } } }), manifestId);
+    await SELF.fetch(
+      `${BASE}/api/settings`,
+      authed(read, {
+        method: "PUT",
+        body: settingsDoc("agent"),
+        headers: { "content-type": "application/json" },
+      })
+    );
+
+    const headAfter = await (await SELF.fetch(`${BASE}/api/head`, authed(read))).json<{ head: string }>();
+    expect(headAfter.head).toBe(headBefore.head);
+    expect(await env.VAULT.head(`blobs/${smuggled}`)).toBeNull();
+    const settings = await (await SELF.fetch(`${BASE}/api/settings`, authed(read))).json<{
+      device: string;
+      rev: number;
+    }>();
+    expect(settings.device).toBe("writer");
+    expect(settings.rev).toBe(1);
+  });
+
+  it("does not narrow what an ordinary sync token could already do", async () => {
+    const { token } = await mintToken("device");
+    const hash = await putBlob(token, "still writable");
+    expect((await commit(token, makeManifest({ files: { "a.md": { h: hash } } }), null)).status).toBe(200);
+    expect((await SELF.fetch(`${BASE}/api/head`, authed(token))).status).toBe(200);
+  });
+
+  it("a legacy token stored before `read` existed still reads, because sync implies read", async () => {
+    const minted = await runInDurableObject(env.VAULT_LOCK.getByName("default"), (instance: VaultLock) =>
+      instance.mintToken("pre-read-scope", { scopes: ["sync", "reroot"] })
+    );
+    expect(minted.scopes).not.toContain("read");
+    expect((await SELF.fetch(`${BASE}/api/head`, authed(minted.token))).status).toBe(200);
+    const hash = await putBlob(minted.token, "legacy write");
+    expect((await commit(minted.token, makeManifest({ files: { "a.md": { h: hash } } }), null)).status).toBe(200);
   });
 });

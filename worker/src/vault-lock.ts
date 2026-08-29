@@ -131,8 +131,14 @@ const MAX_HISTORY_PAGE = 500;
  * What an access token is allowed to do. `sync` is everything an ordinary device needs;
  * `reroot` is separate because it is the only operation that makes remote content stop
  * existing, and a stolen token should not carry the power to destroy history with it.
+ *
+ * `read` is strictly weaker than `sync`: it reads head, history, manifests, blobs and
+ * settings, and reaches no route that changes anything. **`sync` implies it** rather than
+ * `read` being an ingredient of it — every token already issued carries `sync` and not
+ * `read`, so a route that demanded the literal scope would lock out every existing device.
+ * Appended, not inserted: these lists are stored and returned in `ALL_SCOPES` order.
  */
-export const ALL_SCOPES = ["sync", "reroot"] as const;
+export const ALL_SCOPES = ["sync", "reroot", "read"] as const;
 export type TokenScope = (typeof ALL_SCOPES)[number];
 
 export function isTokenScope(value: unknown): value is TokenScope {

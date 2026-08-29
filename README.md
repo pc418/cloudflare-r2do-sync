@@ -246,6 +246,12 @@ curl -X POST "$WORKER_URL/api/tokens" -H "authorization: Bearer $ADMIN_TOKEN" \
   -d '{"name":"phone","scopes":["sync"],"expiresAt":"2027-01-01T00:00:00Z"}'
 ```
 
+`scopes: ["read"]` is weaker still: it reads the head, the snapshot chain, manifests, blobs
+and shared settings, and is refused — 403, without touching the vault — on every route that
+changes anything, uploads included. It is meant for something that answers questions about
+the vault without being trusted to write to it. Ordinary devices need `sync`, which covers
+reading too, so existing tokens are unaffected.
+
 ## How syncing behaves
 
 - **Merges are line by line** (diff3). Two devices appending to the same note at the same

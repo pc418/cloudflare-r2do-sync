@@ -147,10 +147,15 @@ app.post("/api/tokens", adminAuth, async (c) => {
       );
     }
     // An empty array reads as "no authority" and used to be silently upgraded to full. A
-    // token that cannot sync cannot do anything, so refuse rather than mint a useless or
-    // surprisingly powerful credential.
-    if (!scopes.includes("sync")) {
-      return c.json(errJson("invalid_scopes", 'scopes must include "sync"'), 422);
+    // token that can neither sync nor read cannot do anything, so refuse rather than mint a
+    // useless or surprisingly powerful credential.
+    if (!scopes.includes("sync") && !scopes.includes("read")) {
+      return c.json(errJson("invalid_scopes", 'scopes must include "sync" or "read"'), 422);
+    }
+    // Reroot acts on the commit route, which a read-only token cannot reach. Minting the pair
+    // would hand back a credential advertising an authority it does not actually have.
+    if (scopes.includes("reroot") && !scopes.includes("sync")) {
+      return c.json(errJson("invalid_scopes", '"reroot" requires "sync"'), 422);
     }
   }
   if (expiresAt !== undefined && expiresAt !== null) {
@@ -222,7 +227,17 @@ function indexChunkOf(c: Context<AppEnv>): number | null | undefined {
 
 // --- vault routes (access token) ----------------------------------------------------------
 
-const accessAuth = async (c: Context<AppEnv>, next: () => Promise<void>) => {
+/**
+ * Authenticates the token and checks it against what the route actually does.
+ *
+ * There is deliberately no argument-free form. Every vault route has to say whether it reads
+ * or writes, so a route added later cannot inherit write authority by forgetting to mention
+ * it — the compiler asks the question at the point where the answer is known.
+ *
+ * `write` is the historical bar: `sync`, which is what every existing device holds. `read`
+ * is satisfied by `sync` too, so widening this narrows nothing.
+ */
+const vaultAuth = (need: "read" | "write") => async (c: Context<AppEnv>, next: () => Promise<void>) => {
   const startedAt = performance.now();
   const token = bearer(c);
   if (token === null) return c.json(errJson("unauthorized", "missing bearer token"), 401);
@@ -231,18 +246,38 @@ const accessAuth = async (c: Context<AppEnv>, next: () => Promise<void>) => {
   if (verified === null) {
     return c.json(errJson("unauthorized", "invalid, revoked, or expired token"), 401);
   }
-  // Every vault route needs `sync`. Without this the scope split was decorative: a token
-  // issued for something else still read and wrote the whole vault, because only the reroot
-  // branch ever looked at scopes.
-  if (!verified.scopes.includes("sync")) {
+  // A token with neither scope reaches nothing. Without this the scope split was decorative:
+  // a token issued for something else still read and wrote the whole vault, because only the
+  // reroot branch ever looked at scopes.
+  const canWrite = verified.scopes.includes("sync");
+  const canRead = canWrite || verified.scopes.includes("read");
+  if (!canRead) {
     return c.json(errJson("forbidden", "this access token may not read or write the vault"), 403);
+  }
+  // Separated from the message above on purpose: "you hold nothing here" and "you hold a
+  // read-only credential" are different facts, and an agent that cannot tell them apart
+  // retries a request that will never succeed.
+  if (need === "write" && !canWrite) {
+    return c.json(
+      errJson("forbidden", "this access token may read the vault but not write to it"),
+      403
+    );
   }
   c.set("tokenId", verified.id);
   c.set("scopes", verified.scopes);
   await next();
 };
 
-app.get("/api/head", accessAuth, async (c) => {
+/** Reads vault content and changes nothing. */
+const readAuth = vaultAuth("read");
+/**
+ * Changes something, or is a step of the commit flow. `blobs/check` mutates nothing but is
+ * the probe a writer makes before uploading; a token that may not upload has no use for it,
+ * and `read` is meant to mean "may read your notes", not "may probe your storage".
+ */
+const writeAuth = vaultAuth("write");
+
+app.get("/api/head", readAuth, async (c) => {
   return c.json({ head: await vault(c.env).getHead() });
 });
 
@@ -254,7 +289,7 @@ app.get("/api/head", accessAuth, async (c) => {
  * path map is neither read nor readable here. What it removes is the round trips: the client's
  * own walk cannot know a parent without first downloading and decrypting its child.
  */
-app.get("/api/history", accessAuth, async (c) => {
+app.get("/api/history", readAuth, async (c) => {
   const raw = c.req.query("limit");
   const limit = raw === undefined ? 50 : Number(raw);
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
@@ -285,7 +320,7 @@ app.post("/api/history/index", adminAuth, async (c) => {
   return c.json(progress);
 });
 
-app.get("/api/manifests/:id", accessAuth, async (c) => {
+app.get("/api/manifests/:id", readAuth, async (c) => {
   const id = c.req.param("id") ?? "";
   if (!ULID_RE.test(id)) return c.json(errJson("bad_id", "manifest id must be a ULID"), 422);
   const obj = await c.env.VAULT.get(`manifests/${id}.json`);
@@ -293,13 +328,13 @@ app.get("/api/manifests/:id", accessAuth, async (c) => {
   return new Response(obj.body, { headers: { "content-type": "application/json" } });
 });
 
-app.get("/api/settings", accessAuth, async (c) => {
+app.get("/api/settings", readAuth, async (c) => {
   const obj = await c.env.VAULT.get(SETTINGS_KEY);
   if (obj === null) return c.json(errJson("not_found", "no shared settings document"), 404);
   return new Response(obj.body, { headers: { "content-type": "application/json" } });
 });
 
-app.put("/api/settings", accessAuth, async (c) => {
+app.put("/api/settings", writeAuth, async (c) => {
   const raw = await c.req.text();
   if (new TextEncoder().encode(raw).byteLength > MAX_SETTINGS_BYTES) {
     return c.json(errJson("too_large", `settings document exceeds ${MAX_SETTINGS_BYTES} bytes`), 413);
@@ -334,7 +369,7 @@ app.put("/api/settings", accessAuth, async (c) => {
   return c.json({ ok: true, rev: result.rev });
 });
 
-app.post("/api/blobs/check", accessAuth, async (c) => {
+app.post("/api/blobs/check", writeAuth, async (c) => {
   const declaredLength = Number(c.req.header("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > MAX_CHECK_BODY_BYTES) {
     return c.json(errJson("too_large", `request exceeds ${MAX_CHECK_BODY_BYTES} bytes`), 413);
@@ -354,7 +389,7 @@ app.post("/api/blobs/check", accessAuth, async (c) => {
   return c.json({ missing: result.missing });
 });
 
-app.put("/api/blobs/:hash", accessAuth, async (c) => {
+app.put("/api/blobs/:hash", writeAuth, async (c) => {
   const result = await putBlob(c.env, c.req.param("hash") ?? "", c.req.raw);
   if (!result.ok) {
     const status = result.code === "too_large" ? 413 : result.code === "length_required" ? 411 : 422;
@@ -363,13 +398,13 @@ app.put("/api/blobs/:hash", accessAuth, async (c) => {
   return c.json({ existed: result.existed }, result.existed ? 200 : 201);
 });
 
-app.get("/api/blobs/:hash", accessAuth, async (c) => {
+app.get("/api/blobs/:hash", readAuth, async (c) => {
   const obj = await getBlob(c.env, c.req.param("hash") ?? "");
   if (obj === null) return c.json(errJson("not_found", "unknown blob"), 404);
   return new Response(obj.body, { headers: { "content-type": "application/octet-stream" } });
 });
 
-app.post("/api/commit", accessAuth, async (c) => {
+app.post("/api/commit", writeAuth, async (c) => {
   const startedAt = performance.now();
   let body: unknown;
   try {
