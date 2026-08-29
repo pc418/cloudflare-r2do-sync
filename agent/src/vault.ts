@@ -9,7 +9,7 @@
 import { SyncApi, ApiError, type HttpClient } from "../../plugin/src/api";
 import { VaultCrypto, manifestAad, settingsAad } from "../../plugin/src/crypto";
 import { sha256Hex } from "../../plugin/src/hash";
-import { makeScopeFilter, parseGlobs, type ScopeRules } from "../../plugin/src/paths";
+import { makeScopeFilter, parseGlobs } from "../../plugin/src/paths";
 import { isSettingsDoc } from "../../plugin/src/settings-doc";
 import { blobKey, parseFileEntries, type FileEntry, type Manifest } from "../../plugin/src/types";
 
@@ -41,8 +41,30 @@ export const fetchHttp: HttpClient = async (url, req) => {
 /** A failure worth reporting to the model in words, rather than a stack trace. */
 export class VaultError extends Error {}
 
+/**
+ * Reads one glob list out of the shared policy, failing closed.
+ *
+ * Absent is a real answer — an unset field means no rule. A field that is *present but not
+ * text* is a document this agent does not understand, and quietly reading it as "no excludes"
+ * would widen scope to the whole vault at exactly the moment the policy stopped making sense.
+ */
+function globList(value: unknown, field: string): string[] {
+  if (value === undefined || value === null) return [];
+  if (typeof value !== "string") {
+    throw new VaultError(
+      `the shared settings' "${field}" is not text, so this vault's policy cannot be read — refusing to fall back to no restrictions`
+    );
+  }
+  return parseGlobs(value);
+}
+
 export interface Snapshot {
   head: string;
+  /**
+   * Identifies the shared policy this view was filtered with. Part of the cache key and of
+   * the search index's freshness check: `files` depends on the policy as much as on the head.
+   */
+  policy: string;
   /** In-scope paths: what the tools may see. */
   files: Record<string, FileEntry>;
   /**
@@ -83,8 +105,15 @@ export class VaultView {
   readonly #configDir: string;
   #cached: Snapshot | null = null;
 
-  /** Cached shared policy. `null` until first load; the inner value is null when none exists. */
-  #scope: ((path: string) => boolean) | null = null;
+  /**
+   * The shared policy, cached by the revision it came from.
+   *
+   * Keyed by `rev` rather than held forever: a policy is edited on a phone and published
+   * without any snapshot being committed, so a cache that only ever refreshed when the head
+   * moved would keep exposing a folder the owner had just excluded — indefinitely, since the
+   * Durable Object outlives the request.
+   */
+  #policy: { rev: number; fingerprint: string; scope: (path: string) => boolean } | null = null;
 
   constructor(opts: {
     api: SyncApi;
@@ -102,6 +131,17 @@ export class VaultView {
     return this.#configDir;
   }
 
+  get writable(): boolean {
+    return this.#writeApi !== null;
+  }
+
+  #mutator(): SyncApi {
+    if (this.#writeApi === null) {
+      throw new VaultError("this connector holds no write credential for the vault");
+    }
+    return this.#writeApi;
+  }
+
   /**
    * The vault's own scope rules, from the shared settings document.
    *
@@ -117,9 +157,22 @@ export class VaultView {
    * so it propagates.
    */
   async scope(): Promise<(path: string) => boolean> {
-    if (this.#scope !== null) return this.#scope;
+    return (await this.#policyNow()).scope;
+  }
 
-    let rules: ScopeRules = { excludes: [], onlyPaths: [], syncConfigDir: false, configDir: this.#configDir };
+  /**
+   * Reads the shared settings document and returns the current policy.
+   *
+   * The document is fetched every time — one request — because the alternative is answering
+   * with an exclusion list the owner has already changed. Decryption and glob parsing are
+   * skipped when the revision is one already seen.
+   *
+   * A 404 means no policy has been published, which is a real state (a fresh vault), and the
+   * hard skips still apply. Any *other* failure is not evidence of an absent policy — treating
+   * a 401 or a 5xx as "no excludes" would open the vault wide exactly when something is wrong —
+   * so it propagates.
+   */
+  async #policyNow(): Promise<{ rev: number; fingerprint: string; scope: (path: string) => boolean }> {
     let raw: unknown;
     try {
       raw = await this.#api.getSettingsDoc();
@@ -128,47 +181,53 @@ export class VaultView {
       else throw error;
     }
 
-    if (raw !== null && raw !== undefined) {
-      if (!isSettingsDoc(raw)) throw new VaultError("the shared settings document is malformed");
-      let plain: Record<string, unknown>;
-      if (raw.v === 2 || raw.v === 3) {
-        if (this.#crypto.keyId !== raw.keyId) {
-          throw new VaultError(
-            "the shared settings were written with a different master key than this agent holds"
-          );
-        }
-        plain = await this.#crypto.decryptSettingsJson<Record<string, unknown>>(
-          raw.enc,
-          raw.v === 3
-            ? settingsAad({ v: 3, rev: raw.rev ?? 0, device: raw.device, keyId: raw.keyId, vaultSalt: raw.vaultSalt })
-            : undefined
-        );
-      } else {
-        plain = raw.plain;
+    if (raw === null || raw === undefined) {
+      const fingerprint = `none:${this.#configDir}`;
+      if (this.#policy?.fingerprint !== fingerprint) {
+        this.#policy = {
+          rev: 0,
+          fingerprint,
+          scope: makeScopeFilter({
+            excludes: [],
+            onlyPaths: [],
+            syncConfigDir: false,
+            configDir: this.#configDir,
+          }),
+        };
       }
-      rules = {
-        excludes: parseGlobs(typeof plain.excludes === "string" ? plain.excludes : ""),
-        onlyPaths: parseGlobs(typeof plain.onlyPaths === "string" ? plain.onlyPaths : ""),
-        syncConfigDir: false,
-        configDir: this.#configDir,
-      };
+      return this.#policy;
     }
 
-    // The engine's own predicate, not a second implementation: it already composes
-    // `alwaysSkip`, `pathError`, the config-directory rule, the excludes and the allow-list.
-    this.#scope = makeScopeFilter(rules);
-    return this.#scope;
-  }
+    if (!isSettingsDoc(raw)) throw new VaultError("the shared settings document is malformed");
+    const rev = raw.rev ?? 0;
+    const fingerprint = `${rev}:${raw.updatedAt}:${this.#configDir}`;
+    if (this.#policy?.fingerprint === fingerprint) return this.#policy;
 
-  get writable(): boolean {
-    return this.#writeApi !== null;
-  }
-
-  #mutator(): SyncApi {
-    if (this.#writeApi === null) {
-      throw new VaultError("this connector holds no write credential for the vault");
+    let plain: Record<string, unknown>;
+    if (raw.v === 2 || raw.v === 3) {
+      if (this.#crypto.keyId !== raw.keyId) {
+        throw new VaultError(
+          "the shared settings were written with a different master key than this agent holds"
+        );
+      }
+      plain = await this.#crypto.decryptSettingsJson<Record<string, unknown>>(
+        raw.enc,
+        raw.v === 3
+          ? settingsAad({ v: 3, rev, device: raw.device, keyId: raw.keyId, vaultSalt: raw.vaultSalt })
+          : undefined
+      );
+    } else {
+      plain = raw.plain;
     }
-    return this.#writeApi;
+
+    const scope = makeScopeFilter({
+      excludes: globList(plain.excludes, "excludes"),
+      onlyPaths: globList(plain.onlyPaths, "onlyPaths"),
+      syncConfigDir: false,
+      configDir: this.#configDir,
+    });
+    this.#policy = { rev, fingerprint, scope };
+    return this.#policy;
   }
 
   /** The key this vault is read and written under. `null` would mean a plaintext vault. */
@@ -183,13 +242,17 @@ export class VaultView {
    * it is right now, not the one this isolate happened to see a minute ago.
    */
   async snapshot(opts: { fresh?: boolean } = {}): Promise<Snapshot> {
-    const head = await this.#api.getHead();
+    const [head, policy] = await Promise.all([this.#api.getHead(), this.#policyNow()]);
     if (head === null) throw new VaultError("this vault has no snapshots yet");
-    if (this.#cached?.head === head && opts.fresh !== true) return this.#cached;
+    // Keyed by the policy too: the visible half of a snapshot is a function of both, and a
+    // policy can change while the head stands still.
+    if (this.#cached?.head === head && this.#cached.policy === policy.fingerprint && opts.fresh !== true) {
+      return this.#cached;
+    }
 
     const manifest = await this.#api.getManifest(head);
     const all = await this.#decryptPathMap(manifest);
-    const inScope = await this.scope();
+    const inScope = policy.scope;
 
     // The reading side of the sync policy. `all` keeps everything, because a commit must carry
     // it; `files` is what the tools may look at.
@@ -200,7 +263,7 @@ export class VaultView {
       else hidden++;
     }
 
-    this.#cached = { head, files, all, hidden };
+    this.#cached = { head, policy: policy.fingerprint, files, all, hidden };
     return this.#cached;
   }
 

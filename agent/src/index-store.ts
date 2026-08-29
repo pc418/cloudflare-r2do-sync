@@ -26,13 +26,13 @@ import { isProbablyText, MAX_FILE_BYTES, type SearchHit, type SearchResult } fro
 export type BlobReader = { read(entry: FileEntry): Promise<Uint8Array> };
 
 /**
- * Notes read into the index per catch-up. Bounds the work, not the eventual coverage.
+ * Notes read into one catch-up when nothing else is spending. Bounds the work, not the
+ * eventual coverage — a large vault converges over a handful of questions.
  *
- * Same wall as the scan: the Free plan allows **50 external subrequests per invocation**, and
- * a catch-up runs after a search has already spent some. 30 converges a large vault over a
- * handful of questions without ever risking the limit mid-build.
+ * A caller that has already fetched blobs in the same invocation must pass what is left of
+ * `BLOB_BUDGET` instead; see `search`, which scans and then catches up in one invocation.
  */
-export const INDEX_CHUNK = 30;
+export const INDEX_CHUNK = 25;
 
 export interface IndexStatus {
   /** The head the index fully describes, or null while it is still catching up. */
@@ -99,9 +99,11 @@ export class SearchIndex {
    */
   async catchUp(
     view: BlobReader,
-    head: string,
-    files: Record<string, FileEntry>
+    key: string,
+    files: Record<string, FileEntry>,
+    opts: { budget?: number } = {}
   ): Promise<boolean> {
+    const budget = Math.max(0, Math.min(opts.budget ?? INDEX_CHUNK, INDEX_CHUNK));
     // Paths that left the vault, or stopped being indexable, go first: it is cheap and keeps a
     // deleted note from answering a later search.
     const live = new Set(Object.keys(files).filter((p) => indexable(p, files[p])));
@@ -110,7 +112,7 @@ export class SearchIndex {
     }
 
     const outstanding = this.#outstanding(files);
-    for (const path of outstanding.slice(0, INDEX_CHUNK)) {
+    for (const path of outstanding.slice(0, budget)) {
       try {
         const text = new TextDecoder().decode(await view.read(files[path]));
         this.#sql.exec(
@@ -130,14 +132,20 @@ export class SearchIndex {
       }
     }
 
-    const complete = outstanding.length <= INDEX_CHUNK;
-    this.#setMeta("head", complete ? head : null);
+    const complete = outstanding.length <= budget;
+    this.#setMeta("head", complete ? key : null);
     return complete;
   }
 
-  /** True when the index describes exactly this head and can answer for it. */
-  isCurrent(head: string): boolean {
-    return this.#meta("head") === head;
+  /**
+   * True when the index describes exactly this snapshot *under this policy*.
+   *
+   * The key is head **and** policy fingerprint, never the head alone: excluding a folder
+   * changes which notes may be searched without moving the head, and an index keyed on the
+   * head would go on answering with rows the owner has just put out of scope.
+   */
+  isCurrent(key: string): boolean {
+    return this.#meta("head") === key;
   }
 
   /**

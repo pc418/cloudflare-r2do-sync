@@ -12,14 +12,25 @@ import type { FileEntry } from "../../plugin/src/types";
 import type { VaultView } from "./vault";
 
 /**
- * Blobs one search may fetch.
- *
- * The binding constraint is not time, it is the Free plan's **50 external subrequests per
- * invocation**: every blob is a `fetch` to the sync Worker, and the head, the manifest and the
- * settings document have already spent three. Exceeding it does not degrade, it throws
- * mid-scan. 40 leaves room for those three plus the write path's own requests.
+ * The Free plan allows **50 external subrequests per invocation**, and every blob is a `fetch`
+ * to the sync Worker. Exceeding it does not degrade, it throws mid-operation.
  */
-export const MAX_SCAN_FILES = 40;
+export const SUBREQUEST_LIMIT = 50;
+
+/** Settings, head and manifest are spent before a single blob is read. */
+export const REQUEST_OVERHEAD = 3;
+
+/**
+ * What one invocation may spend on blobs, all together.
+ *
+ * "All together" is the whole point: a search that misses the index scans *and then* advances
+ * the index in the same invocation, so two separately-reasonable budgets add up to one that
+ * blows the limit. The scan takes from this, the catch-up gets what is left.
+ */
+export const BLOB_BUDGET = SUBREQUEST_LIMIT - REQUEST_OVERHEAD - 5;
+
+/** Blobs one scan may fetch, when it is the only thing spending. */
+export const MAX_SCAN_FILES = 25;
 /** Plaintext bytes one search may scan, whichever limit binds first. */
 export const MAX_SCAN_BYTES = 2 * 1024 * 1024;
 /** Files large enough that they are almost certainly not prose worth grepping. */
@@ -79,9 +90,10 @@ export async function search(
   view: VaultView,
   files: Record<string, FileEntry>,
   query: string,
-  opts: { folder?: string; glob?: string; maxResults?: number } = {}
+  opts: { folder?: string; glob?: string; maxResults?: number; budget?: number } = {}
 ): Promise<SearchResult> {
   const maxResults = Math.max(1, Math.min(opts.maxResults ?? 20, 100));
+  const fileBudget = Math.min(opts.budget ?? MAX_SCAN_FILES, MAX_SCAN_FILES);
   const needle = query.toLowerCase();
   if (needle === "") throw new Error("search needs a non-empty query");
 
@@ -92,7 +104,7 @@ export async function search(
   let more = false;
 
   for (const path of candidates) {
-    if (scanned >= MAX_SCAN_FILES || bytes >= MAX_SCAN_BYTES) {
+    if (scanned >= fileBudget || bytes >= MAX_SCAN_BYTES) {
       more = true;
       break;
     }

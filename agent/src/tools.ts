@@ -11,7 +11,7 @@
 import { globToRegExp } from "../../plugin/src/paths";
 import type { FileEntry } from "../../plugin/src/types";
 import type { SearchIndex } from "./index-store";
-import { search } from "./search";
+import { BLOB_BUDGET, search } from "./search";
 import { VaultError, type VaultView } from "./vault";
 import type { WriteOp } from "./write";
 
@@ -230,7 +230,7 @@ export async function callTool(
 ): Promise<string> {
   switch (name) {
     case "search": {
-      const { files, head } = await ctx.view.snapshot();
+      const { files, head, policy } = await ctx.view.snapshot();
       const query = asString(args, "query");
       const folder = optional(args, "folder");
       const glob = optional(args, "glob");
@@ -239,8 +239,10 @@ export async function callTool(
       // The index answers the whole vault with no network; the scan sees only a budget's
       // worth. Prefer the index, but only while it describes exactly this head — a stale one
       // would answer confidently about notes that have since changed.
+      // Head AND policy: `files` is a function of both, so the index must be keyed on both.
+      const key = `${head}|${policy}`;
       let result;
-      if (ctx.index !== undefined && ctx.index.isCurrent(head)) {
+      if (ctx.index !== undefined && ctx.index.isCurrent(key)) {
         result = ctx.index.query(query, {
           folder,
           glob: glob === undefined ? null : globToRegExp(glob),
@@ -248,9 +250,12 @@ export async function callTool(
         });
       } else {
         result = await search(ctx.view, files, query, { folder, glob, maxResults });
-        // Advance the index a chunk on the way out, so repeated questions converge on the
-        // complete answer instead of paying for the scan forever.
-        if (ctx.index !== undefined) await ctx.index.catchUp(ctx.view, head, files);
+        // Advance the index on the way out, so repeated questions converge on the complete
+        // answer instead of paying for the scan forever — but out of what the scan LEFT.
+        // Two separately-reasonable budgets in one invocation is how the limit gets blown.
+        if (ctx.index !== undefined) {
+          await ctx.index.catchUp(ctx.view, key, files, { budget: BLOB_BUDGET - result.scanned });
+        }
       }
       if (result.hits.length === 0) {
         const where =

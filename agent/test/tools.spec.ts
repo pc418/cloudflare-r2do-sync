@@ -3,8 +3,10 @@ import { SyncApi } from "../../plugin/src/api";
 import { callTool, TOOLS, type ToolContext } from "../src/tools";
 import { fetchHttp, VaultView } from "../src/vault";
 import { PLUGIN_DIR } from "../../plugin/src/paths";
-import { INDEX_CHUNK } from "../src/index-store";
-import { MAX_SCAN_FILES } from "../src/search";
+import { INDEX_CHUNK, SearchIndex } from "../src/index-store";
+import { BLOB_BUDGET, MAX_SCAN_FILES, REQUEST_OVERHEAD, SUBREQUEST_LIMIT } from "../src/search";
+import { env, runInDurableObject } from "cloudflare:test";
+import type { AgentState } from "../src/agent-state";
 import { VaultWriter, refuseWrite, type WriteOp } from "../src/write";
 import { fakeVault, seed, testCrypto } from "./helpers";
 
@@ -348,6 +350,33 @@ describe("the shared sync policy governs the agent too", () => {
     await expect(callTool("list", {}, ctx2)).rejects.toThrow();
   });
 
+  // A policy is edited on a phone and published without any snapshot being committed. A cache
+  // that only refreshed when the head moved would keep exposing a just-excluded folder for the
+  // lifetime of the Durable Object.
+  it("notices a policy change even though the head never moved", async () => {
+    const { ctx, vault } = await withPolicy({ excludes: "" }, { "Welcome.md": "hi\n", "Secrets/k.md": "TOPSECRET\n" });
+    expect(await callTool("list", {}, ctx)).toContain("Secrets/k.md");
+    expect(await callTool("search", { query: "TOPSECRET" }, ctx)).toContain("Secrets/k.md");
+
+    const head = vault.head;
+    vault.settings = { v: 1, updatedAt: 1_754_000_000_001, device: "phone", rev: 2, plain: { excludes: "Secrets/**" } };
+    expect(vault.head).toBe(head); // nothing was committed
+
+    expect(await callTool("list", {}, ctx)).not.toContain("Secrets/k.md");
+    expect(await callTool("search", { query: "TOPSECRET" }, ctx)).toContain("No matches");
+    await expect(callTool("append", { path: "Secrets/k.md", text: "x" }, ctx)).rejects.toThrow(
+      /outside what this vault syncs/
+    );
+  });
+
+  // A present-but-not-text policy field is a document this agent does not understand. Reading
+  // it as "no excludes" would widen scope to the whole vault exactly when the policy stopped
+  // making sense.
+  it("fails closed on a malformed policy field instead of exposing everything", async () => {
+    const { ctx } = await withPolicy({ excludes: ["Secrets/**"] }, { "Welcome.md": "hi\n" });
+    await expect(callTool("list", {}, ctx)).rejects.toThrow(/is not text/);
+  });
+
   // Excluded and hard-skipped entries are carried through snapshots on purpose. A commit built
   // from the visible subset deletes every one of them.
   it("carries hidden entries through a commit instead of deleting them", async () => {
@@ -366,12 +395,46 @@ describe("budgets and configuration", () => {
   // The Free plan allows 50 EXTERNAL subrequests per invocation. Every blob is a fetch to the
   // sync Worker, and head + manifest + settings have already spent three. Exceeding it does
   // not degrade gracefully — it throws mid-scan.
-  it("keeps the scan and the index build under the external subrequest limit", () => {
-    const EXTERNAL_SUBREQUEST_LIMIT = 50;
-    const OVERHEAD = 3; // head, manifest, settings
-    expect(MAX_SCAN_FILES + OVERHEAD).toBeLessThan(EXTERNAL_SUBREQUEST_LIMIT);
-    expect(INDEX_CHUNK + MAX_SCAN_FILES + OVERHEAD).toBeLessThanOrEqual(EXTERNAL_SUBREQUEST_LIMIT * 2);
-    expect(INDEX_CHUNK + OVERHEAD).toBeLessThan(EXTERNAL_SUBREQUEST_LIMIT);
+  // The earlier version of this test allowed the combined work to reach TWO limits, which is
+  // exactly the mistake: a search that misses the index scans and then catches up in the SAME
+  // invocation, so the two budgets add.
+  it("keeps one invocation's worst case under the external subrequest limit", () => {
+    expect(REQUEST_OVERHEAD + BLOB_BUDGET).toBeLessThanOrEqual(SUBREQUEST_LIMIT);
+    expect(MAX_SCAN_FILES).toBeLessThanOrEqual(BLOB_BUDGET);
+    expect(INDEX_CHUNK).toBeLessThanOrEqual(BLOB_BUDGET);
+    // The worst case is a full scan followed by a catch-up taking what is left, never both caps.
+    expect(REQUEST_OVERHEAD + MAX_SCAN_FILES + (BLOB_BUDGET - MAX_SCAN_FILES)).toBeLessThanOrEqual(
+      SUBREQUEST_LIMIT
+    );
+  });
+
+  it("spends no more blob reads in one search than the shared budget allows", async () => {
+    const notes: Record<string, string> = {};
+    for (let i = 0; i < BLOB_BUDGET * 2; i++) notes[`n${i}.md`] = `note ${i}\nneedle here\n`;
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, notes);
+
+    // Entirely inside the Durable Object: its SQLite handle cannot be used from outside it.
+    const blobReads = await runInDurableObject(
+      env.AGENT.getByName(`b-${Math.random().toString(36).slice(2)}`),
+      async (_i: AgentState, state) => {
+        const view = new VaultView({
+          api: new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http }),
+          crypto,
+        });
+        const ctx: ToolContext = {
+          view,
+          writable: false,
+          enqueue: async () => ({ head: "", summary: "" }),
+          index: new SearchIndex(state.storage.sql),
+        };
+        vault.requests.length = 0;
+        await callTool("search", { query: "needle", max_results: 1000 }, ctx);
+        return vault.requests.filter((r) => r.startsWith("GET /api/blobs/")).length;
+      }
+    );
+    expect(blobReads).toBeLessThanOrEqual(BLOB_BUDGET);
   });
 
   // A vault whose Obsidian folder was renamed still has credentials under the ACTIVE directory.
