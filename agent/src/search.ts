@@ -28,10 +28,18 @@ export interface SearchHit {
 
 export interface SearchResult {
   hits: SearchHit[];
+  /** Notes actually looked at: read over the network for a scan, held in SQLite for an index. */
   scanned: number;
+  /** Notes eligible to be looked at. For an index that is the whole indexed vault. */
   candidates: number;
-  /** True when the budget or the result cap stopped the scan before the vault ran out. */
+  /** True when the budget or the result cap stopped it before the vault ran out. */
   more: boolean;
+  /**
+   * Which path answered. The two have genuinely different coverage — a scan sees a budget's
+   * worth, an index sees everything it holds — so a result that could not say which one it
+   * came from could not honestly describe its own completeness.
+   */
+  source: "scan" | "index";
 }
 
 /** Text-ish extensions. A binary blob would only waste budget and produce noise. */
@@ -110,5 +118,5 @@ export async function search(
     }
   }
 
-  return { hits, scanned, candidates: candidates.length, more };
+  return { hits, scanned, candidates: candidates.length, more, source: "scan" };
 }

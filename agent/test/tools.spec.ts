@@ -4,7 +4,7 @@ import { callTool, TOOLS, type ToolContext } from "../src/tools";
 import { fetchHttp, VaultView } from "../src/vault";
 import { PLUGIN_DIR } from "../../plugin/src/paths";
 import { VaultWriter, refuseWrite, type WriteOp } from "../src/write";
-import { fakeVault, seed, testCrypto, type FakeVault } from "./helpers";
+import { fakeVault, seed, testCrypto } from "./helpers";
 
 const NOTES = {
   "Welcome.md": "# Welcome\n\nThis vault is a test fixture.\nNothing here is real.\n",

@@ -40,7 +40,7 @@ export default {
       return Response.json({ ok: true, service: "obsidian-vault-agent" });
     }
 
-    if (url.pathname !== "/mcp") {
+    if (url.pathname !== "/mcp" && url.pathname !== "/admin/index") {
       return new Response(JSON.stringify({ error: "not found" }), {
         status: 404,
         headers: { "content-type": "application/json" },
@@ -56,6 +56,18 @@ export default {
 
     // One instance, so the decrypted path map is shared across a burst and writes serialise.
     const state = env.AGENT.getByName("default");
+
+    /**
+     * Drop or inspect the search index. Behind the same bearer as the tools, which is not a
+     * widening: that bearer already commands every tool. The index holds nothing that is not
+     * in R2, so dropping it costs a rebuild and loses nothing.
+     */
+    if (url.pathname === "/admin/index") {
+      if (request.method === "GET") return Response.json(await state.indexStatus());
+      if (request.method === "DELETE") return Response.json(await state.dropIndex());
+      return new Response("method not allowed", { status: 405, headers: { allow: "GET, DELETE" } });
+    }
+
     return handleMcp(request, {
       call: (name, args) => state.call(name, args),
       writable: () => state.writable(),

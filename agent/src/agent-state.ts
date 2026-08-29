@@ -11,8 +11,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { SyncApi } from "../../plugin/src/api";
 import { VaultCrypto } from "../../plugin/src/crypto";
+import { SearchIndex, type IndexStatus } from "./index-store";
 import { callTool, type ToolContext } from "./tools";
-import { fetchHttp, VaultError, VaultView } from "./vault";
+import { fetchHttp, VaultView } from "./vault";
 import { VaultWriter, type WriteOp, type WriteOutcome } from "./write";
 import type { AgentEnv } from "./env";
 
@@ -47,6 +48,13 @@ export class AgentState extends DurableObject<AgentEnv> {
     return { view: this.#view, writer: this.#writer };
   }
 
+  #index: SearchIndex | null = null;
+
+  #searchIndex(): SearchIndex {
+    this.#index ??= new SearchIndex(this.ctx.storage.sql);
+    return this.#index;
+  }
+
   /** Runs one tool call. Called over RPC from the Worker's MCP layer. */
   async call(name: string, args: Record<string, unknown>): Promise<string> {
     const { view } = await this.#ready();
@@ -54,8 +62,20 @@ export class AgentState extends DurableObject<AgentEnv> {
       view,
       writable: view.writable,
       enqueue: (op) => this.#enqueue(op),
+      index: this.#searchIndex(),
     };
     return callTool(name, args, ctx);
+  }
+
+  /** Drops the search index. It holds nothing that is not in R2, so this only costs a rebuild. */
+  async dropIndex(): Promise<IndexStatus> {
+    const index = this.#searchIndex();
+    index.drop();
+    return index.status();
+  }
+
+  async indexStatus(): Promise<IndexStatus> {
+    return this.#searchIndex().status();
   }
 
   /** Which tools this deployment advertises. A read-only agent never mentions the write ones. */

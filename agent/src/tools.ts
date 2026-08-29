@@ -10,6 +10,7 @@
  */
 import { globToRegExp } from "../../plugin/src/paths";
 import type { FileEntry } from "../../plugin/src/types";
+import type { SearchIndex } from "./index-store";
 import { search } from "./search";
 import { VaultError, type VaultView } from "./vault";
 import type { WriteOp } from "./write";
@@ -20,6 +21,12 @@ export interface ToolContext {
   enqueue: (op: WriteOp) => Promise<{ head: string; summary: string }>;
   /** False on a read-only deployment: the write tools are then not even advertised. */
   writable: boolean;
+  /**
+   * The SQLite-backed search index. Optional: absent, or merely behind, `search` falls back to
+   * the bounded scan. It is a cache of content that already exists in R2 and is never the only
+   * copy of anything.
+   */
+  index?: SearchIndex;
 }
 
 /**
@@ -224,22 +231,47 @@ export async function callTool(
   switch (name) {
     case "search": {
       const { files, head } = await ctx.view.snapshot();
-      const result = await search(ctx.view, files, asString(args, "query"), {
-        folder: optional(args, "folder"),
-        glob: optional(args, "glob"),
-        maxResults: asInt(args, "max_results", 20),
-      });
+      const query = asString(args, "query");
+      const folder = optional(args, "folder");
+      const glob = optional(args, "glob");
+      const maxResults = asInt(args, "max_results", 20);
+
+      // The index answers the whole vault with no network; the scan sees only a budget's
+      // worth. Prefer the index, but only while it describes exactly this head — a stale one
+      // would answer confidently about notes that have since changed.
+      let result;
+      if (ctx.index !== undefined && ctx.index.isCurrent(head)) {
+        result = ctx.index.query(query, {
+          folder,
+          glob: glob === undefined ? null : globToRegExp(glob),
+          maxResults,
+        });
+      } else {
+        result = await search(ctx.view, files, query, { folder, glob, maxResults });
+        // Advance the index a chunk on the way out, so repeated questions converge on the
+        // complete answer instead of paying for the scan forever.
+        if (ctx.index !== undefined) await ctx.index.catchUp(ctx.view, head, files);
+      }
       if (result.hits.length === 0) {
-        return `No matches in ${result.scanned} of ${result.candidates} candidate notes.${
-          result.more ? " The scan hit its budget before covering the whole vault — narrow it with folder or glob." : ""
-        }\nhead at ${shortSnapshot(head)}`;
+        const where =
+          result.source === "index"
+            ? `No matches across all ${result.scanned} indexed note(s).`
+            : `No matches in ${result.scanned} of ${result.candidates} candidate notes.${
+                result.more
+                  ? " The scan hit its budget before covering the whole vault — narrow it with folder or glob."
+                  : ""
+              }`;
+        return `${where}\nhead at ${shortSnapshot(head)}`;
       }
       const body = result.hits
         .map((hit) => `${hit.path}:${hit.line}\n${hit.context.map((l) => `    ${l}`).join("\n")}`)
         .join("\n\n");
-      const note = result.more
-        ? `\n\n(scanned ${result.scanned} of ${result.candidates} candidate notes before hitting the budget — there may be more)`
-        : `\n\n(scanned ${result.scanned} notes)`;
+      const note =
+        result.source === "index"
+          ? `\n\n(searched all ${result.scanned} indexed notes${result.more ? "; more matches exist than were returned — raise max_results" : ""})`
+          : result.more
+            ? `\n\n(scanned ${result.scanned} of ${result.candidates} candidate notes before hitting the budget — there may be more)`
+            : `\n\n(scanned ${result.scanned} notes)`;
       return `${result.hits.length} match(es):\n\n${body}${note}\nhead at ${shortSnapshot(head)}`;
     }
 
