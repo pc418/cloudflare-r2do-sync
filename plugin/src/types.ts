@@ -1,4 +1,4 @@
-import type { EncPayload } from "./crypto";
+import { manifestAad, type EncPayload, type VaultCrypto } from "./crypto";
 
 export interface FileEntry {
   /** sha256 of the file's plaintext. */
@@ -128,6 +128,39 @@ export function parseManifest(value: unknown): Manifest {
 }
 
 /** Validates a decrypted path map, which arrives as opaque JSON from inside the ciphertext. */
+/**
+ * Assembles a snapshot manifest.
+ *
+ * A free function rather than a `SyncEngine` method because the agent Worker builds manifests
+ * too, and it holds no vault replica to instantiate an engine around. It must not re-derive
+ * these six lines: the v3 envelope's shape and the `manifestAad` binding over it are a wire
+ * format two implementations would drift on, and the drift would present as snapshots one
+ * side cannot authenticate rather than as an obvious error.
+ *
+ * `id`, `device` and `createdAt` are injected because the callers disagree about all three —
+ * the engine has a seeded ULID and clock for tests, the agent has neither.
+ */
+export async function buildManifest(opts: {
+  crypto: VaultCrypto | null;
+  parent: string | null;
+  files: Record<string, FileEntry>;
+  blobs: string[];
+  id: string;
+  device: string;
+  createdAt: string;
+}): Promise<Manifest> {
+  const common = {
+    id: opts.id,
+    parent: opts.parent,
+    device: opts.device,
+    createdAt: opts.createdAt,
+  };
+  if (opts.crypto === null) return { v: 1, ...common, files: opts.files };
+  // The envelope has to exist before the ciphertext can authenticate it.
+  const envelope = { v: 3 as const, ...common, keyId: opts.crypto.keyId, blobs: opts.blobs };
+  return { ...envelope, enc: await opts.crypto.encryptJson(opts.files, manifestAad(envelope)) };
+}
+
 export function parseFileEntries(value: unknown): Record<string, FileEntry> {
   if (typeof value !== "object" || value === null) {
     throw new Error("decrypted snapshot is not a path map");

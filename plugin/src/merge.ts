@@ -94,7 +94,7 @@ export function isMergeableText(path: string): boolean {
 export function decodeText(bytes: Uint8Array): string | null {
   let text: string;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
   } catch {
     return null;
   }

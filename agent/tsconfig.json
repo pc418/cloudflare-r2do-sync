@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true
+  },
+  // Only this Worker's own files. The plugin modules it imports are pulled in transitively
+  // and still type-checked against workers-types (no DOM) — which is what proves they are
+  // runtime-agnostic. Globbing ../plugin/src would instead drag in main.ts, the Obsidian UI,
+  // which is DOM-bound by design and is emphatically not part of the reuse closure.
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

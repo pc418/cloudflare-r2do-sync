@@ -35,6 +35,7 @@ import { createUlidFactory } from "./ulid";
 import { isSyncMode, type SyncMode } from "./sync-policy";
 import {
   blobKey,
+  buildManifest,
   isEmptyManifest,
   type FileEntry,
   type HistoryEntry,
@@ -714,7 +715,7 @@ export function isBlankContent(bytes: Uint8Array): boolean {
   if (bytes.byteLength === 0) return true;
   let text: string;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
   } catch {
     return false;
   }
@@ -3260,16 +3261,15 @@ export class SyncEngine {
     files: Record<string, FileEntry>,
     blobs: string[]
   ): Promise<Manifest> {
-    const common = {
-      id: this.#ulid(),
+    return buildManifest({
+      crypto,
       parent,
+      files,
+      blobs,
+      id: this.#ulid(),
       device: this.#deviceName,
       createdAt: new Date(this.#now()).toISOString(),
-    };
-    if (crypto === null) return { v: 1, ...common, files };
-    // The envelope has to exist before the ciphertext can authenticate it.
-    const envelope = { v: 3 as const, ...common, keyId: crypto.keyId, blobs };
-    return { ...envelope, enc: await crypto.encryptJson(files, manifestAad(envelope)) };
+    });
   }
 
   async #uploadHash(

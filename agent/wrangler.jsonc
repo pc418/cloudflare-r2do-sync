@@ -1,0 +1,15 @@
+// LOCAL TEST CONFIG ONLY — see worker/wrangler.jsonc for why this is never a deploy path.
+// The agent Worker is deployed by scripts/deploy-agent.mjs over the REST API.
+//
+// No R2 binding and no vault storage: this Worker reaches the vault only through the sync
+// Worker's public /api/*, as an ordinary device. Every real value is a secret, set at deploy.
+{
+  "name": "obsidian-vault-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-03",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "AGENT", "class_name": "AgentState" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentState"] }]
+}

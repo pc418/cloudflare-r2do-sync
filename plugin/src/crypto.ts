@@ -315,8 +315,20 @@ export class VaultCrypto {
   }
 }
 
-function algorithm(iv: Uint8Array, aad?: string): AesGcmParams {
-  const params: AesGcmParams = { name: "AES-GCM", iv: view(iv) };
+/**
+ * Structural, not the DOM's `AesGcmParams`. This module runs under three different type
+ * environments — Obsidian (DOM lib), the Node test runner, and workerd via
+ * `@cloudflare/workers-types`, which has no DOM and does not declare that name. Spelling the
+ * shape out keeps one implementation of the crypto compiling everywhere it has to run.
+ */
+interface AesGcmAlgorithm {
+  name: "AES-GCM";
+  iv: BufferSource;
+  additionalData?: BufferSource;
+}
+
+function algorithm(iv: Uint8Array, aad?: string): AesGcmAlgorithm {
+  const params: AesGcmAlgorithm = { name: "AES-GCM", iv: view(iv) };
   if (aad !== undefined) params.additionalData = view(new TextEncoder().encode(aad));
   return params;
 }
