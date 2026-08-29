@@ -48,6 +48,14 @@ export interface SearchResult {
   hits: SearchHit[];
   /** Notes actually looked at: read over the network for a scan, held in SQLite for an index. */
   scanned: number;
+  /**
+   * External subrequests this spent on blobs — **attempts**, not successes.
+   *
+   * A fetch that fails has still been spent, so budgeting on successes lets a run of
+   * unreadable blobs walk straight past the limit, and hands the index catch-up a remainder
+   * that was already used. Zero for an index query, which touches the network not at all.
+   */
+  spent: number;
   /** Notes eligible to be looked at. For an index that is the whole indexed vault. */
   candidates: number;
   /** True when the budget or the result cap stopped it before the vault ran out. */
@@ -100,11 +108,13 @@ export async function search(
   const candidates = candidatePaths(files, opts);
   const hits: SearchHit[] = [];
   let scanned = 0;
+  let spent = 0;
   let bytes = 0;
   let more = false;
 
   for (const path of candidates) {
-    if (scanned >= fileBudget || bytes >= MAX_SCAN_BYTES) {
+    // `spent`, not `scanned`: the budget is subrequests, and a failed one is still gone.
+    if (spent >= fileBudget || bytes >= MAX_SCAN_BYTES) {
       more = true;
       break;
     }
@@ -114,6 +124,7 @@ export async function search(
     }
     const entry = files[path];
     let text: string;
+    spent++;
     try {
       text = new TextDecoder().decode(await view.read(entry));
     } catch {
@@ -137,5 +148,5 @@ export async function search(
     }
   }
 
-  return { hits, scanned, candidates: candidates.length, more, source: "scan" };
+  return { hits, scanned, spent, candidates: candidates.length, more, source: "scan" };
 }

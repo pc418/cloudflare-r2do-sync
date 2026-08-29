@@ -190,7 +190,7 @@ export class SearchIndex {
     }
 
     const total = this.#sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM notes").toArray()[0]?.n ?? 0;
-    return { hits, scanned: total, candidates: matchedFiles, more, source: "index" };
+    return { hits, scanned: total, spent: 0, candidates: matchedFiles, more, source: "index" };
   }
 }
 

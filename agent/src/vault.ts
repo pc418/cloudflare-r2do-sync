@@ -49,7 +49,9 @@ export class VaultError extends Error {}
  * would widen scope to the whole vault at exactly the moment the policy stopped making sense.
  */
 function globList(value: unknown, field: string): string[] {
-  if (value === undefined || value === null) return [];
+  // Only `undefined` is absence. An explicit `null` is a value this agent does not understand,
+  // and reading it as "no rule" is the same widening as reading an array that way.
+  if (value === undefined) return [];
   if (typeof value !== "string") {
     throw new VaultError(
       `the shared settings' "${field}" is not text, so this vault's policy cannot be read — refusing to fall back to no restrictions`

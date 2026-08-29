@@ -377,6 +377,18 @@ describe("the shared sync policy governs the agent too", () => {
     await expect(callTool("list", {}, ctx)).rejects.toThrow(/is not text/);
   });
 
+  // `null` is a PRESENT value, not an absent field. Reading it as "no rule" widens scope
+  // exactly as reading an array that way would.
+  it("refuses an explicitly null policy field", async () => {
+    const { ctx } = await withPolicy({ excludes: null }, { "Welcome.md": "hi\n" });
+    await expect(callTool("list", {}, ctx)).rejects.toThrow(/is not text/);
+  });
+
+  it("still accepts a policy that simply omits a field", async () => {
+    const { ctx } = await withPolicy({ excludes: "Secrets/**" }, { "Welcome.md": "hi\n" });
+    expect(await callTool("list", {}, ctx)).toContain("Welcome.md");
+  });
+
   // Excluded and hard-skipped entries are carried through snapshots on purpose. A commit built
   // from the visible subset deletes every one of them.
   it("carries hidden entries through a commit instead of deleting them", async () => {
@@ -434,6 +446,41 @@ describe("budgets and configuration", () => {
         return vault.requests.filter((r) => r.startsWith("GET /api/blobs/")).length;
       }
     );
+    expect(blobReads).toBeLessThanOrEqual(BLOB_BUDGET);
+  });
+
+  // A failed fetch has still been spent. Budgeting on successes lets a run of unreadable
+  // blobs walk past the limit, and hands the catch-up a remainder that was already used.
+  it("counts a failed blob read against the budget, not only a successful one", async () => {
+    const notes: Record<string, string> = {};
+    for (let i = 0; i < BLOB_BUDGET * 2; i++) notes[`n${i}.md`] = `note ${i}\nneedle\n`;
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, notes);
+    // Every blob fetch fails, so `scanned` would stay at zero forever.
+    vault.before = async (path, method) => {
+      if (method === "GET" && path.startsWith("/api/blobs/")) vault.blobs.clear();
+    };
+
+    const blobReads = await runInDurableObject(
+      env.AGENT.getByName(`f-${Math.random().toString(36).slice(2)}`),
+      async (_i: AgentState, state) => {
+        const view = new VaultView({
+          api: new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http }),
+          crypto,
+        });
+        const ctx: ToolContext = {
+          view,
+          writable: false,
+          enqueue: async () => ({ head: "", summary: "" }),
+          index: new SearchIndex(state.storage.sql),
+        };
+        vault.requests.length = 0;
+        await callTool("search", { query: "needle", max_results: 1000 }, ctx);
+        return vault.requests.filter((r) => r.startsWith("GET /api/blobs/")).length;
+      }
+    );
+    expect(blobReads).toBeGreaterThan(0);
     expect(blobReads).toBeLessThanOrEqual(BLOB_BUDGET);
   });
 

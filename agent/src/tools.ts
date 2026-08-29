@@ -254,7 +254,7 @@ export async function callTool(
         // answer instead of paying for the scan forever — but out of what the scan LEFT.
         // Two separately-reasonable budgets in one invocation is how the limit gets blown.
         if (ctx.index !== undefined) {
-          await ctx.index.catchUp(ctx.view, key, files, { budget: BLOB_BUDGET - result.scanned });
+          await ctx.index.catchUp(ctx.view, key, files, { budget: BLOB_BUDGET - result.spent });
         }
       }
       if (result.hits.length === 0) {
