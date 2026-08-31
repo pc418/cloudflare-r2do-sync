@@ -16,8 +16,20 @@ import { ulid } from "./ulid";
 
 export type WriteOp =
   | { kind: "append"; path: string; text: string }
-  | { kind: "edit"; path: string; oldText: string; newText: string }
-  | { kind: "write"; path: string; content: string; expectedHash?: string };
+  | { kind: "edit"; path: string; oldText: string; newText: string; replaceAll?: boolean }
+  | { kind: "write"; path: string; content: string }
+  | { kind: "delete"; path: string }
+  | { kind: "move"; from: string; to: string };
+
+/**
+ * Every vault path an op touches — both ends of a `move`.
+ *
+ * The refusal and scope gates iterate this rather than a single `path`, because a `move` whose
+ * destination nobody checked is a way to write outside the policy using a source inside it.
+ */
+export function opPaths(op: WriteOp): readonly string[] {
+  return op.kind === "move" ? [op.from, op.to] : [op.path];
+}
 
 export interface WriteOutcome {
   head: string;
@@ -70,8 +82,8 @@ export class VaultWriter {
    */
   async apply(ops: readonly WriteOp[]): Promise<WriteOutcome> {
     if (ops.length === 0) throw new VaultError("no operations to apply");
-    for (const op of ops) {
-      const refusal = refuseWrite(op.path, this.#configDir);
+    for (const path of ops.flatMap(opPaths)) {
+      const refusal = refuseWrite(path, this.#configDir);
       if (refusal !== null) throw new VaultError(refusal);
     }
 
@@ -79,10 +91,10 @@ export class VaultWriter {
     // devices deliberately do not scan, so committing it would report success for a note that
     // never reaches anyone's disk.
     const inScope = await this.#view.scope();
-    for (const op of ops) {
-      if (!inScope(op.path)) {
+    for (const path of ops.flatMap(opPaths)) {
+      if (!inScope(path)) {
         throw new VaultError(
-          `"${op.path}" is outside what this vault syncs (its exclude or only-paths policy), so writing it would publish a note no device would download`
+          `"${path}" is outside what this vault syncs (its exclude or only-paths policy), so writing it would publish a note no device would download`
         );
       }
     }
@@ -99,10 +111,7 @@ export class VaultWriter {
       for (const op of ops) {
         // Sequential, and reading `files` as it goes, so two ops on one path in the same
         // batch chain instead of racing — the second sees what the first wrote.
-        const next = await this.#applyOne(op, files);
-        const c = await this.#view.store(next.entry.h, next.bytes);
-        files[op.path] = c === undefined ? next.entry : { ...next.entry, c };
-        applied.push(next.summary);
+        applied.push(await this.#applyOne(op, files));
       }
 
       // Everything the resulting map references, including entries carried untouched from the
@@ -132,8 +141,54 @@ export class VaultWriter {
     );
   }
 
-  async #applyOne(
-    op: WriteOp,
+  /**
+   * Applies one op to the in-progress path map and says what it did.
+   *
+   * It mutates `files` itself because two of the five ops change no content at all: `delete`
+   * removes a key and `move` renames one. Routing those through a "here is the new entry"
+   * return would have needed a second shape for "and here is the key to drop", which is how a
+   * map mutation ends up expressed in two places.
+   */
+  async #applyOne(op: WriteOp, files: Record<string, FileEntry>): Promise<string> {
+    if (op.kind === "delete") {
+      // Deliberately no hash, no confirmation, no percent cap: `rm` semantics, owner's call.
+      // Recovery is snapshot history within GC retention, which is what that budget buys.
+      if (files[op.path] === undefined) {
+        throw new VaultError(`"${op.path}" does not exist, so there is nothing to delete`);
+      }
+      delete files[op.path];
+      return `deleted ${op.path}`;
+    }
+
+    if (op.kind === "move") {
+      const entry = files[op.from];
+      if (entry === undefined) {
+        throw new VaultError(`"${op.from}" does not exist, so there is nothing to move`);
+      }
+      // The one deliberate departure from `rename`'s silent clobber. Overwriting a *different*
+      // note by accident is the worst surprise this surface can produce, and an agent that
+      // means it can delete the destination first.
+      if (files[op.to] !== undefined) {
+        throw new VaultError(
+          `"${op.to}" already exists, so moving "${op.from}" onto it would replace a different note. Delete it first if that is what you want.`
+        );
+      }
+      // Entry carried byte-for-byte, `mtime` included: nothing about the note changed, only
+      // its key in the map. Per-file keys are derived from `blob:<content hash>` — content, not
+      // path — so the ciphertext and its blob are untouched and no re-encryption is needed.
+      delete files[op.from];
+      files[op.to] = entry;
+      return `moved ${op.from} to ${op.to}`;
+    }
+
+    const { entry, bytes, summary } = await this.#nextContent(op, files);
+    const c = await this.#view.store(entry.h, bytes);
+    files[op.path] = c === undefined ? entry : { ...entry, c };
+    return summary;
+  }
+
+  async #nextContent(
+    op: Extract<WriteOp, { kind: "append" | "edit" | "write" }>,
     files: Record<string, FileEntry>
   ): Promise<{ entry: FileEntry; bytes: Uint8Array; summary: string }> {
     const existing = files[op.path];
@@ -158,10 +213,18 @@ export class VaultWriter {
       case "edit": {
         if (current === null) throw new VaultError(`"${op.path}" does not exist, so there is nothing to edit`);
         const count = current.split(op.oldText).length - 1;
+        // Zero still fails loud in both modes. "Replace every one of them" is not an answer to
+        // "there are none of them", and silently succeeding would report an edit that no
+        // subsequent read could find.
         if (count === 0) throw new VaultError(`the text to replace does not appear in "${op.path}"`);
+        if (op.replaceAll === true) {
+          text = current.split(op.oldText).join(op.newText);
+          summary = `edited ${op.path} (${count} occurrence(s) replaced)`;
+          break;
+        }
         if (count > 1) {
           throw new VaultError(
-            `the text to replace appears ${count} times in "${op.path}" — include enough surrounding context to make it unique`
+            `the text to replace appears ${count} times in "${op.path}" — include enough surrounding context to make it unique, or pass replace_all to change all of them`
           );
         }
         text = current.replace(op.oldText, op.newText);
@@ -169,21 +232,12 @@ export class VaultWriter {
         break;
       }
       case "write": {
-        // An overwrite is approval for one specific version and is bound to it. Creating is
-        // free — there is nothing to lose — but replacing is not, so an absent hash is a
-        // refusal rather than a default. Without that, a model that never read the note could
-        // discard it wholesale on a guessed path, which is the one accident this surface
-        // cannot offer an undo for.
-        if (current !== null && op.expectedHash === undefined) {
-          throw new VaultError(
-            `"${op.path}" already exists. Read it first and pass expected_hash to replace it, or use append/edit to change part of it.`
-          );
-        }
-        if (current !== null && existing.h !== op.expectedHash) {
-          throw new VaultError(
-            `"${op.path}" changed since it was read (${existing.h.slice(0, 8)} now, expected ${(op.expectedHash ?? "").slice(0, 8)}). Nothing was written; read it again.`
-          );
-        }
+        // Unconditional create-or-replace, like `fs.writeFile` (owner's filesystem-semantics
+        // call, 2026-08-31). The version-bound overwrite this used to require is retired for
+        // the agent surface, and the trade is stated rather than hidden: a device edit racing
+        // this write can be replaced without warning, recoverable only from snapshot history
+        // within GC retention. Sync correctness is unaffected — the CAS mini-pass around this
+        // still absorbs the live head and re-applies.
         text = op.content;
         summary = current === null ? `created ${op.path}` : `replaced ${op.path}`;
         break;

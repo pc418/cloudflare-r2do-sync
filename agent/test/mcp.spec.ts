@@ -168,6 +168,8 @@ describe("tools/list", () => {
       "append",
       "edit",
       "write",
+      "delete",
+      "move",
     ]);
     for (const tool of body.result.tools) expect(tool.title).toBeTruthy();
   });

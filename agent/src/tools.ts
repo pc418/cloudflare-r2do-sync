@@ -5,8 +5,13 @@
  * trained on — because that, plus paging and line anchors, is what makes a remote tool feel
  * native. The transport is irrelevant to the model.
  *
- * Deliberately absent: `delete` and `move` (where unattended accidents live), anything that
- * runs a command, and any editor/cursor tool (structurally impossible remotely).
+ * `delete` and `move` act on **single files only** — there are no folder operations of any
+ * kind. That is what keeps the deny surface honest: file globs remain the whole of it, and
+ * both tools pass through the same `view.scope()` gate as every other write, source *and*
+ * destination.
+ *
+ * Deliberately absent: anything that runs a command, any editor/cursor tool (structurally
+ * impossible remotely), and any folder-level operation.
  */
 import { globToRegExp } from "../../plugin/src/paths";
 import type { FileEntry } from "../../plugin/src/types";
@@ -99,14 +104,19 @@ export const TOOLS: ToolDescriptor[] = [
     name: "search",
     title: "Search notes",
     description:
-      "Search note text for a case-insensitive substring, never a regular expression. No matches is not proof of absence — the scan is budgeted, and the result says when it could not cover everything." +
+      "Search note text case-insensitively: a substring by default, or a regular expression with `regex: true`. No matches is not proof of absence — the scan is budgeted, and the result says when it could not cover everything." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
       properties: {
         query: str("Text to look for."),
+        regex: {
+          type: "boolean",
+          description:
+            "Treat the query as a regular expression (default false). Slower: regular expressions cannot use the index, so the search always falls back to the budgeted scan.",
+        },
         folder: str("Restrict to a folder, subfolders included, e.g. \"Projects\"."),
-        glob: str("Optional path glob, e.g. \"Daily/**\" or \"**/*.md\"."),
+        glob: str("Optional path glob, e.g. \"Daily/**\" or \"**/*.md\". ANDed with folder when both are given."),
         max_results: int("Maximum hits to return (default 20, cap 100)."),
       },
       required: ["query"],
@@ -118,7 +128,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "read",
     title: "Read a note",
     description:
-      "Read one note, returning line-numbered text and the content hash that `write` requires to replace it.",
+      "Read one note, returning its text with line numbers added for reference — they are display only and are not part of the note.",
     inputSchema: {
       type: "object",
       properties: {
@@ -141,7 +151,7 @@ export const TOOLS: ToolDescriptor[] = [
       type: "object",
       properties: {
         folder: str("Folder to list, subfolders included, e.g. \"Daily\"."),
-        glob: str("Optional path glob, e.g. \"**/*.md\"."),
+        glob: str("Optional path glob, e.g. \"**/*.md\". ANDed with folder when both are given."),
         max_results: int("Maximum paths to return (default 200, cap 1000)."),
       },
       additionalProperties: false,
@@ -188,7 +198,12 @@ export const TOOLS: ToolDescriptor[] = [
       type: "object",
       properties: {
         path: str("Exact vault path."),
-        old_text: str("Exact text to replace. Must appear exactly once in the note."),
+        replace_all: {
+          type: "boolean",
+          description:
+            "Replace every occurrence instead of requiring exactly one (default false). Text that appears nowhere still fails.",
+        },
+        old_text: str("Exact text to replace, as it appears in the note — without `read`'s line-number prefix. Must appear exactly once unless replace_all is set."),
         new_text: str("Replacement text."),
       },
       required: ["path", "old_text", "new_text"],
@@ -200,18 +215,50 @@ export const TOOLS: ToolDescriptor[] = [
     name: "write",
     title: "Create or replace a note",
     description:
-      "Create a note, or replace one entirely — replacing an existing note requires expected_hash from a prior `read`. For a partial change prefer `append` or `edit`.",
+      "Create a note, or replace an existing one entirely and without warning. For a partial change prefer `append` or `edit`.",
     inputSchema: {
       type: "object",
       properties: {
         path: str("Exact vault path."),
         content: str("The note's full new content."),
-        expected_hash: str("The hash from `read`. Refused if stale — read again and retry."),
       },
       required: ["path", "content"],
       additionalProperties: false,
     },
     annotations: WRITES(true),
+  },
+  {
+    name: "delete",
+    title: "Delete a note",
+    description:
+      "Delete one note permanently; only a missing note is an error. Folders are never deleted, and a folder path is not a valid argument.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: str("Exact vault path of the note to delete."),
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+    annotations: WRITES(true),
+  },
+  {
+    name: "move",
+    title: "Move or rename a note",
+    description:
+      "Move one note to a path that does not already exist, which is how a rename is done. Refuses rather than replacing the destination; delete it first if that is what you want. Folders are implicit in the path — no folder is created or removed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from: str("Exact vault path of the note to move."),
+        to: str("New vault path. Must not already exist."),
+      },
+      required: ["from", "to"],
+      additionalProperties: false,
+    },
+    // Not destructive: nothing is replaced or lost, because an occupied destination is refused
+    // rather than overwritten. That refusal is what earns the softer hint.
+    annotations: WRITES(false),
   },
 ];
 
@@ -238,8 +285,39 @@ const optional = (args: Record<string, unknown>, key: string): string | undefine
   return typeof value === "string" && value !== "" ? value : undefined;
 };
 
-/** `head at kmnpqrs` — every result that touched a head names it, so a session is auditable. */
-const shortSnapshot = (head: string): string => head.slice(-8).toLowerCase();
+const asBool = (args: Record<string, unknown>, key: string): boolean => {
+  const value = args[key];
+  if (value === undefined || value === null) return false;
+  if (typeof value === "boolean") return value;
+  // Clients have been seen sending JSON-schema booleans as strings. Accepting the two literals
+  // is cheap; accepting anything truthy would turn "false" into true, which is the wrong way
+  // for a flag that widens `edit` from one occurrence to all of them.
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new VaultError(`"${key}" must be true or false`);
+};
+
+/** Builds the write op for a tool call, so the dispatch stays one line per tool. */
+function writeOp(name: string, args: Record<string, unknown>): WriteOp {
+  switch (name) {
+    case "append":
+      return { kind: "append", path: asString(args, "path"), text: asString(args, "text") };
+    case "edit":
+      return {
+        kind: "edit",
+        path: asString(args, "path"),
+        oldText: asString(args, "old_text"),
+        newText: asString(args, "new_text"),
+        replaceAll: asBool(args, "replace_all"),
+      };
+    case "write":
+      return { kind: "write", path: asString(args, "path"), content: asString(args, "content") };
+    case "delete":
+      return { kind: "delete", path: asString(args, "path") };
+    default:
+      return { kind: "move", from: asString(args, "from"), to: asString(args, "to") };
+  }
+}
 
 function entryOf(files: Record<string, FileEntry>, path: string): FileEntry {
   const entry = files[path];
@@ -264,6 +342,10 @@ export async function callTool(
       const folder = optional(args, "folder");
       const glob = optional(args, "glob");
       const maxResults = asInt(args, "max_results", 20);
+      // DO SQLite has `LIKE` and no regular expressions, so the index cannot answer this mode
+      // at all — it is the scan or nothing. Stated in the field description rather than left
+      // for the caller to infer from a slow call.
+      const regex = asBool(args, "regex");
 
       // The index answers the whole vault with no network; the scan sees only a budget's
       // worth. Prefer the index, but only while it describes exactly this head — a stale one
@@ -271,14 +353,14 @@ export async function callTool(
       // Head AND policy: `files` is a function of both, so the index must be keyed on both.
       const key = `${head}|${policy}`;
       let result;
-      if (ctx.index !== undefined && ctx.index.isCurrent(key)) {
+      if (!regex && ctx.index !== undefined && ctx.index.isCurrent(key)) {
         result = ctx.index.query(query, {
           folder,
           glob: glob === undefined ? null : globToRegExp(glob),
           maxResults,
         });
       } else {
-        result = await search(ctx.view, files, query, { folder, glob, maxResults });
+        result = await search(ctx.view, files, query, { folder, glob, maxResults, regex });
         // Advance the index on the way out, so repeated questions converge on the complete
         // answer instead of paying for the scan forever — but out of what the scan LEFT.
         // Two separately-reasonable budgets in one invocation is how the limit gets blown.
@@ -295,7 +377,7 @@ export async function callTool(
                   ? " The scan hit its budget before covering the whole vault — narrow it with folder or glob."
                   : ""
               }`;
-        return `${where}\nhead at ${shortSnapshot(head)}`;
+        return where;
       }
       const body = result.hits
         .map((hit) => `${hit.path}:${hit.line}\n${hit.context.map((l) => `    ${l}`).join("\n")}`)
@@ -306,17 +388,17 @@ export async function callTool(
           : result.more
             ? `\n\n(scanned ${result.scanned} of ${result.candidates} candidate notes before hitting the budget — there may be more)`
             : `\n\n(scanned ${result.scanned} notes)`;
-      return `${result.hits.length} match(es):\n\n${body}${note}\nhead at ${shortSnapshot(head)}`;
+      return `${result.hits.length} match(es):\n\n${body}${note}`;
     }
 
     case "read": {
-      const { files, head } = await ctx.view.snapshot();
+      const { files } = await ctx.view.snapshot();
       const path = asString(args, "path");
       const entry = entryOf(files, path);
       const bytes = await ctx.view.read(entry);
       // A note is text or it is not; guessing and returning mojibake is worse than refusing.
       if (bytes.includes(0)) {
-        return `"${path}" is binary (${entry.size} bytes) and cannot be shown as text.\nhead at ${shortSnapshot(head)}`;
+        return `"${path}" is binary (${entry.size} bytes) and cannot be shown as text.`;
       }
       const lines = new TextDecoder().decode(bytes).split("\n");
       const offset = Math.max(1, asInt(args, "offset", 1));
@@ -326,17 +408,16 @@ export async function callTool(
       const body = slice.map((l, i) => `${String(offset + i).padStart(width)}  ${l}`).join("\n");
       const truncated = offset - 1 + slice.length < lines.length;
       return [
-        `${path} (${lines.length} lines, hash ${entry.h})`,
+        `${path} (${lines.length} lines)`,
         body,
         truncated ? `... ${lines.length - (offset - 1 + slice.length)} more line(s); read again with offset ${offset + slice.length}` : "",
-        `head at ${shortSnapshot(head)}`,
       ]
         .filter((s) => s !== "")
         .join("\n");
     }
 
     case "list": {
-      const { files, head, hidden } = await ctx.view.snapshot();
+      const { files, hidden } = await ctx.view.snapshot();
       const folder = optional(args, "folder")?.replace(/\/+$/, "");
       const glob = optional(args, "glob");
       const max = Math.max(1, Math.min(asInt(args, "max_results", 200), 1000));
@@ -354,14 +435,13 @@ export async function callTool(
         rows,
         matched.length > shown.length ? `... ${matched.length - shown.length} more; raise max_results or narrow the folder` : "",
         hidden > 0 ? `(${hidden} path(s) this vault never syncs are not listed)` : "",
-        `head at ${shortSnapshot(head)}`,
       ]
         .filter((s) => s !== "")
         .join("\n");
     }
 
     case "recent": {
-      const { files, head } = await ctx.view.snapshot();
+      const { files } = await ctx.view.snapshot();
       const days = Math.max(1, asInt(args, "days", 7));
       const max = Math.max(1, Math.min(asInt(args, "max_results", 100), 1000));
       const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
@@ -369,39 +449,23 @@ export async function callTool(
         .filter((p) => files[p].mtime >= cutoff)
         .sort((a, b) => files[b].mtime - files[a].mtime)
         .slice(0, max);
-      if (recent.length === 0) return `No notes modified in the last ${days} day(s).\nhead at ${shortSnapshot(head)}`;
+      if (recent.length === 0) return `No notes modified in the last ${days} day(s).`;
       const rows = recent
         .map((p) => `${new Date(files[p].mtime).toISOString().slice(0, 16).replace("T", " ")}  ${p}`)
         .join("\n");
-      return `${recent.length} note(s) modified in the last ${days} day(s):\n${rows}\nhead at ${shortSnapshot(head)}`;
+      return `${recent.length} note(s) modified in the last ${days} day(s):\n${rows}`;
     }
 
     case "append":
     case "edit":
-    case "write": {
+    case "write":
+    case "delete":
+    case "move": {
       if (!ctx.writable) {
         throw new VaultError("this connector is read-only; it cannot change the vault");
       }
-      const path = asString(args, "path");
-      let op: WriteOp;
-      if (name === "append") op = { kind: "append", path, text: asString(args, "text") };
-      else if (name === "edit") {
-        op = {
-          kind: "edit",
-          path,
-          oldText: asString(args, "old_text"),
-          newText: asString(args, "new_text"),
-        };
-      } else {
-        op = {
-          kind: "write",
-          path,
-          content: asString(args, "content"),
-          expectedHash: optional(args, "expected_hash"),
-        };
-      }
-      const { head, summary } = await ctx.enqueue(op);
-      return `${summary}\nhead at ${shortSnapshot(head)}`;
+      const { summary } = await ctx.enqueue(writeOp(name, args));
+      return summary;
     }
 
     default:

@@ -70,13 +70,15 @@ describe("tool surface", () => {
   // caller just does not know the rule it is about to break.
   it("states each tool's load-bearing contract in its first sentence", () => {
     const contracts: Record<string, RegExp> = {
-      search: /case-insensitive substring, never a regular expression/,
-      read: /hash that `write` requires/,
+      search: /case-insensitively: a substring by default, or a regular expression/,
+      read: /line numbers added for reference/,
       list: /downloading no note content/,
       recent: /downloading no note content/,
       append: /at the very end of a note/,
       edit: /failing unless that string appears exactly once/,
-      write: /requires expected_hash from a prior `read`/,
+      write: /replace an existing one entirely and without warning/,
+      delete: /Delete one note permanently/,
+      move: /a path that does not already exist/,
     };
     expect(Object.keys(contracts).sort()).toEqual(TOOLS.map((t) => t.name).sort());
     for (const tool of TOOLS) {
@@ -122,7 +124,6 @@ describe("read tools", () => {
     vault.requests.length = 0;
     const out = await callTool("list", {}, ctx);
     expect(out).toContain("Projects/Roadmap.md");
-    expect(out).toContain("head at");
     expect(vault.requests.filter((r) => r.includes("/api/blobs/"))).toEqual([]);
   });
 
@@ -136,14 +137,15 @@ describe("read tools", () => {
     expect(glob).not.toContain("Projects/Tea.md");
   });
 
-  it("reads a note with line numbers and its hash", async () => {
+  it("reads a note with line numbers, and no hash or snapshot id", async () => {
     const { ctx } = await context();
     const out = await callTool("read", { path: "Projects/Tea.md" }, ctx);
     expect(out).toContain("Gyokuro wants 60C water.");
-    // The FULL hash: `write` compares `expected_hash` against all 64 characters, so a
-    // truncated one made the advertised read-then-write workflow impossible.
-    expect(out).toMatch(/^Projects\/Tea\.md \(\d+ lines, hash [0-9a-f]{64}\)/);
+    expect(out).toMatch(/^Projects\/Tea\.md \(\d+ lines\)/);
     expect(out).toContain("1  # Tea");
+    // Filesystem semantics: nothing on this surface asks the model to reason about versions
+    // or snapshots, so neither the content hash nor the head may leak back into a result.
+    expect(out).not.toMatch(/hash|head at/);
   });
 
   it("pages a long note and says how much is left", async () => {
@@ -172,6 +174,26 @@ describe("read tools", () => {
   it("says plainly when a search found nothing", async () => {
     const { ctx } = await context();
     expect(await callTool("search", { query: "kombucha" }, ctx)).toContain("No matches");
+  });
+
+  it("matches a regular expression only when asked, and stays case-insensitive", async () => {
+    const { ctx } = await context();
+    // A pattern that is meaningless as a substring: proof the mode is doing the work.
+    const pattern = "gyokuro.*[0-9]+C";
+    expect(await callTool("search", { query: pattern }, ctx)).toContain("No matches");
+    const out = await callTool("search", { query: pattern, regex: true }, ctx);
+    expect(out).toContain("Projects/Tea.md:3");
+  });
+
+  it("reports an unparseable pattern instead of burning the scan budget on it", async () => {
+    const { ctx, vault } = await context();
+    vault.requests.length = 0;
+    await expect(callTool("search", { query: "unclosed(", regex: true }, ctx)).rejects.toThrow(
+      /not a valid regular expression/
+    );
+    // Compiled before the first blob is fetched: a search that spent its budget and *then*
+    // reported a syntax error would charge the caller for their own typo.
+    expect(vault.requests.filter((r) => r.includes("/api/blobs/"))).toEqual([]);
   });
 
   it("restricts a search to a folder", async () => {
@@ -260,6 +282,28 @@ describe("write tools", () => {
     }
   });
 
+  it("replaces every occurrence when asked, and still fails on none", async () => {
+    const { ctx, view } = await context();
+    // Two occurrences: the exactly-once contract refuses this, `replace_all` is the opt-in.
+    expect(
+      await callTool(
+        "edit",
+        { path: "Projects/Roadmap.md", old_text: "- [", new_text: "* [", replace_all: true },
+        ctx
+      )
+    ).toContain("2 occurrence(s)");
+    const snap = await view.snapshot({ fresh: true });
+    const text = new TextDecoder().decode(await view.read(snap.files["Projects/Roadmap.md"]));
+    expect(text).not.toContain("- [");
+    expect(text.split("* [").length - 1).toBe(2);
+
+    // Zero matches fails in both modes. "Replace all of them" is not an answer to "there are
+    // none of them", and succeeding silently would report an edit no later read could find.
+    await expect(
+      callTool("edit", { path: "Welcome.md", old_text: "absent", new_text: "x", replace_all: true }, ctx)
+    ).rejects.toThrow(/does not appear/);
+  });
+
   it("edits a unique string, and refuses an ambiguous or absent one", async () => {
     const { ctx, view } = await context();
     expect(await callTool("edit", { path: "Projects/Tea.md", old_text: "60C", new_text: "50C" }, ctx)).toContain(
@@ -276,41 +320,94 @@ describe("write tools", () => {
     ).rejects.toThrow(/appears 2 times/);
   });
 
-  it("binds an overwrite to the version that was read", async () => {
-    const { ctx, view } = await context();
-    const snap = await view.snapshot();
-    const stale = "0".repeat(64);
-    await expect(
-      callTool("write", { path: "Welcome.md", content: "replaced\n", expected_hash: stale }, ctx)
-    ).rejects.toThrow(/changed since it was read/);
-
-    const good = snap.files["Welcome.md"].h;
-    expect(
-      await callTool("write", { path: "Welcome.md", content: "replaced\n", expected_hash: good }, ctx)
-    ).toContain("replaced Welcome.md");
-  });
-
-  it("creates a new note with write and needs no hash for it", async () => {
+  it("creates a new note with write", async () => {
     const { ctx } = await context();
     expect(await callTool("write", { path: "Fresh.md", content: "brand new\n" }, ctx)).toContain(
       "created Fresh.md"
     );
   });
 
-  // Creating is free; replacing is not. An absent hash on an existing note must be a refusal,
-  // or a model that never read the note could discard it wholesale on a guessed path.
-  it("refuses to replace an existing note when no hash was supplied at all", async () => {
+  // Filesystem semantics, owner's call 2026-08-31: `write` replaces unconditionally, like
+  // `fs.writeFile`. The version-bound overwrite this surface used to require is retired, and
+  // the trade is history within GC retention. Pinned so nobody restores the guard by accident
+  // — and so the schema cannot quietly regrow an `expected_hash` nothing reads.
+  it("replaces an existing note unconditionally, with no hash anywhere on the tool", async () => {
+    const { ctx, view } = await context();
+    expect(
+      await callTool("write", { path: "Welcome.md", content: "replaced\n" }, ctx)
+    ).toContain("replaced Welcome.md");
+    const snap = await view.snapshot({ fresh: true });
+    expect(new TextDecoder().decode(await view.read(snap.files["Welcome.md"]))).toBe("replaced\n");
+
+    const schema = TOOLS.find((t) => t.name === "write")!.inputSchema as {
+      properties: Record<string, unknown>;
+    };
+    expect(Object.keys(schema.properties)).toEqual(["path", "content"]);
+  });
+
+  it("deletes one note and leaves every other entry identical", async () => {
+    const { ctx, view } = await context();
+    const before = await view.snapshot();
+    expect(await callTool("delete", { path: "Projects/Tea.md" }, ctx)).toContain(
+      "deleted Projects/Tea.md"
+    );
+    const after = await view.snapshot({ fresh: true });
+    expect(Object.keys(after.files)).not.toContain("Projects/Tea.md");
+    for (const path of Object.keys(before.files)) {
+      if (path === "Projects/Tea.md") continue;
+      expect(after.files[path]).toEqual(before.files[path]);
+    }
+  });
+
+  it("refuses to delete a note that is not there", async () => {
+    const { ctx } = await context();
+    await expect(callTool("delete", { path: "Nope.md" }, ctx)).rejects.toThrow(
+      /does not exist.*nothing to delete/
+    );
+  });
+
+  it("moves a note, carrying its entry byte-for-byte and uploading no blob", async () => {
+    const { ctx, view, vault } = await context();
+    const before = await view.snapshot();
+    const entry = before.files["Projects/Tea.md"];
+    vault.requests.length = 0;
+
+    expect(await callTool("move", { from: "Projects/Tea.md", to: "Tea.md" }, ctx)).toContain(
+      "moved Projects/Tea.md to Tea.md"
+    );
+    const after = await view.snapshot({ fresh: true });
+    expect(Object.keys(after.files)).not.toContain("Projects/Tea.md");
+    // Byte-for-byte, `mtime` included: nothing about the note changed, only its key in the map.
+    expect(after.files["Tea.md"]).toEqual(entry);
+    // Per-file keys derive from `blob:<content hash>` — content, never path — so a move is a
+    // rename inside the encrypted path map and the blob is untouched. If a key derivation ever
+    // becomes path-dependent, this fails and `move` has to download and re-encrypt.
+    expect(vault.requests.filter((r) => r.startsWith("PUT /api/blobs/"))).toEqual([]);
+  });
+
+  // The one deliberate departure from `rename`'s silent clobber: replacing a *different* note
+  // by accident is the worst surprise this surface can produce.
+  it("refuses a move onto an occupied path, and one from a missing source", async () => {
     const { ctx, view } = await context();
     await expect(
-      callTool("write", { path: "Welcome.md", content: "clobbered\n" }, ctx)
-    ).rejects.toThrow(/already exists.*expected_hash/s);
-    const snap = await view.snapshot({ fresh: true });
-    expect(new TextDecoder().decode(await view.read(snap.files["Welcome.md"]))).toContain("# Welcome");
+      callTool("move", { from: "Projects/Tea.md", to: "Welcome.md" }, ctx)
+    ).rejects.toThrow(/already exists/);
+    await expect(callTool("move", { from: "Nope.md", to: "Fine.md" }, ctx)).rejects.toThrow(
+      /does not exist.*nothing to move/
+    );
+    // Refused means nothing moved and nothing was replaced.
+    const after = await view.snapshot({ fresh: true });
+    expect(new TextDecoder().decode(await view.read(after.files["Welcome.md"]))).toContain(
+      "# Welcome"
+    );
+    expect(Object.keys(after.files)).toContain("Projects/Tea.md");
   });
 
   it("is refused entirely when the deployment holds no write credential", async () => {
     const { ctx } = await context({ writable: false });
     await expect(callTool("append", { path: "a.md", text: "x" }, ctx)).rejects.toThrow(/read-only/);
+    await expect(callTool("delete", { path: "a.md" }, ctx)).rejects.toThrow(/read-only/);
+    await expect(callTool("move", { from: "a.md", to: "b.md" }, ctx)).rejects.toThrow(/read-only/);
   });
 
   it("cannot commit when the sync token itself is read-only, even if asked", async () => {
@@ -391,6 +488,28 @@ describe("the shared sync policy governs the agent too", () => {
     await expect(
       callTool("append", { path: "Private/secret.md", text: "x" }, ctx)
     ).rejects.toThrow(/outside what this vault syncs/);
+  });
+
+  // A move has two ends, and only checking the source would make it a way to write outside the
+  // policy from a path inside it — the destination is where the note actually lands.
+  it("checks both ends of a move against the policy", async () => {
+    const { ctx, view } = await withPolicy(
+      { excludes: "Private/**" },
+      { "Welcome.md": "hello\n" }
+    );
+    await expect(
+      callTool("move", { from: "Welcome.md", to: "Private/smuggled.md" }, ctx)
+    ).rejects.toThrow(/outside what this vault syncs/);
+    const after = await view.snapshot({ fresh: true });
+    expect(Object.keys(after.files)).toContain("Welcome.md");
+  });
+
+  // Same gate, sharper case: `selfDirs` holds this device's access token and master key.
+  it("refuses a move that would land inside the plugin's own folder", async () => {
+    const { ctx } = await context();
+    await expect(
+      callTool("move", { from: "Welcome.md", to: `${PLUGIN_DIR}/data.json` }, ctx)
+    ).rejects.toThrow(/device credentials|not a path this vault syncs/);
   });
 
   it("honours an only-paths allow-list in both directions", async () => {
@@ -520,6 +639,40 @@ describe("budgets and configuration", () => {
       }
     );
     expect(blobReads).toBeLessThanOrEqual(BLOB_BUDGET);
+  });
+
+  // DO SQLite has `LIKE` and no regular expressions, so an index that answered a `regex: true`
+  // query would be applying substring semantics to a pattern — confidently wrong rather than
+  // slow. The scan is the only correct path, current index or not.
+  it("never lets the index answer a regular-expression search", async () => {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, { "Tea.md": "# Tea\n\nGyokuro wants 60C water.\n" });
+
+    const [indexed, viaRegex] = await runInDurableObject(
+      env.AGENT.getByName(`r-${Math.random().toString(36).slice(2)}`),
+      async (_i: AgentState, state) => {
+        const view = new VaultView({
+          api: new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http }),
+          crypto,
+        });
+        const ctx: ToolContext = {
+          view,
+          writable: false,
+          enqueue: async () => ({ head: "", summary: "" }),
+          index: new SearchIndex(state.storage.sql),
+        };
+        // First call scans and catches the index up, so the second would be index-served.
+        await callTool("search", { query: "gyokuro" }, ctx);
+        const fromIndex = await callTool("search", { query: "gyokuro" }, ctx);
+        const fromRegex = await callTool("search", { query: "gyokuro.*[0-9]+C", regex: true }, ctx);
+        return [fromIndex, fromRegex];
+      }
+    );
+    // The index really was current — otherwise this test proves nothing about bypassing it.
+    expect(indexed).toContain("indexed notes");
+    expect(viaRegex).toContain("Tea.md:3");
+    expect(viaRegex).not.toContain("indexed notes");
   });
 
   // A failed fetch has still been spent. Budgeting on successes lets a run of unreadable

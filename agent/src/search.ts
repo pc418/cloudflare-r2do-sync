@@ -94,16 +94,49 @@ export function candidatePaths(
     .sort((a, b) => files[b].mtime - files[a].mtime || a.localeCompare(b));
 }
 
+/**
+ * Compiles the query into a line predicate.
+ *
+ * Case-insensitive in both modes, so `regex: true` changes the grammar and nothing else. An
+ * unparseable pattern fails here, before a single blob is fetched — a search that burned its
+ * budget and *then* reported a syntax error would charge the caller for their own typo.
+ */
+function matcherFor(query: string, regex: boolean): (line: string) => boolean {
+  if (query === "") throw new Error("search needs a non-empty query");
+  if (!regex) {
+    const needle = query.toLowerCase();
+    return (line) => line.toLowerCase().includes(needle);
+  }
+  let re: RegExp;
+  try {
+    re = new RegExp(query, "i");
+  } catch (error) {
+    throw new Error(
+      `"${query}" is not a valid regular expression: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error }
+    );
+  }
+  // A fresh `lastIndex` is not a concern without /g, but `test` on a shared object still reads
+  // better as a pure predicate.
+  return (line) => re.test(line);
+}
+
 export async function search(
   view: VaultView,
   files: Record<string, FileEntry>,
   query: string,
-  opts: { folder?: string; glob?: string; maxResults?: number; budget?: number } = {}
+  opts: {
+    folder?: string;
+    glob?: string;
+    maxResults?: number;
+    budget?: number;
+    /** Compile the query as a regular expression instead of matching it as a substring. */
+    regex?: boolean;
+  } = {}
 ): Promise<SearchResult> {
   const maxResults = Math.max(1, Math.min(opts.maxResults ?? 20, 100));
   const fileBudget = Math.min(opts.budget ?? MAX_SCAN_FILES, MAX_SCAN_FILES);
-  const needle = query.toLowerCase();
-  if (needle === "") throw new Error("search needs a non-empty query");
+  const matches = matcherFor(query, opts.regex === true);
 
   const candidates = candidatePaths(files, opts);
   const hits: SearchHit[] = [];
@@ -138,7 +171,7 @@ export async function search(
 
     const lines = text.split("\n");
     for (let i = 0; i < lines.length && hits.length < maxResults; i++) {
-      if (!lines[i].toLowerCase().includes(needle)) continue;
+      if (!matches(lines[i])) continue;
       hits.push({
         path,
         line: i + 1,

@@ -221,8 +221,17 @@ If the dialog has no *Request headers* section, your account lacks that gated be
 auth is unavailable; there is currently no other supported path.
 
 **Tools.** Read-only by default: `search`, `read`, `list`, `recent`. `--agent-writable` mints a
-second, independently revocable token and adds `append`, `edit`, `write`. Without it no object
-in the Worker is capable of committing — that is structural, not a policy check.
+second, independently revocable token and adds `append`, `edit`, `write`, `delete`, `move`.
+Without it no object in the Worker is capable of committing — that is structural, not a policy
+check.
+
+The write tools have filesystem semantics: `write` replaces a note outright, `delete` removes
+one, and neither asks for confirmation. **Your undo is snapshot history**, so the retention
+window is what a mistake costs — the plugin's own history and restore are how you get a note
+back, and the agent cannot do it for you. `move` is the one exception to the plain-`rm`
+reading: it refuses an occupied destination rather than replacing a different note. All five
+act on single files; there are no folder operations, and a deletion arriving on your devices
+goes through the same mass-deletion guard as any other device's.
 
 **What it will not touch.** Your vault's own exclude and only-paths policy binds the agent on
 reads as well as writes, and the hard-skipped paths (plugin credentials, the Obsidian config
