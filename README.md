@@ -184,6 +184,56 @@ to `.env`, fill in `CLOUDFLARE_TOKEN` (scopes: *Workers Scripts:Edit*, *Workers 
 Storage:Edit*) and `CLOUDFLARE_ACCOUNT_ID`, then `node scripts/setup.mjs --token`. With both
 present this path is chosen automatically; the script never silently switches accounts.
 
+## Reading your vault from Claude (optional agent)
+
+An optional **second Worker** lets Claude read — and, if you allow it, write — this vault over
+[MCP](https://modelcontextprotocol.io), with no Obsidian running anywhere. It is off by
+default, deployed by a separate flag, and entirely skippable: nothing in the plugin depends
+on it.
+
+Understand the trade before you deploy it. **This Worker holds your vault master key**, which
+is the one secret the sync Worker never sees. It decrypts your notes in order to answer, so
+whatever it reads reaches your model provider as plaintext. The sync Worker's "the server
+cannot read your notes" property does not extend to this one — that is the point of it being a
+separate script you have to ask for. Deleting the script and revoking its token ends it.
+
+```bash
+# The vault and its agent in one pass. Without --agent, no agent is deployed.
+node scripts/deploy.mjs --vault my-vault --agent
+node scripts/deploy.mjs --vault my-vault --agent --agent-writable   # plus capture
+```
+
+`--agent` requires `--vault`. It refuses to stand an agent over the default deployment, so the
+master key of your main vault cannot reach a Worker secret by way of a flag on a routine
+deploy. The confirmation screen names the agent Worker before anything is created.
+
+The deploy prints what you need to connect it. In Claude → *Settings* → *Connectors* →
+*Add custom connector*:
+
+- **URL**: the agent's URL with **`/mcp`** appended. Never `/sse` — that is read as the legacy
+  transport. Register the `workers.dev` URL exactly; a redirect to another host silently drops
+  the credential.
+- **Authentication**: **None**, plus a request header `Authorization` = `Bearer <token>`. The
+  value is sent verbatim, so it must include the word `Bearer` and the space. The token is
+  written to `.env.agent.<vault>` and is never printed.
+
+If the dialog has no *Request headers* section, your account lacks that gated beta and bearer
+auth is unavailable; there is currently no other supported path.
+
+**Tools.** Read-only by default: `search`, `read`, `list`, `recent`. `--agent-writable` mints a
+second, independently revocable token and adds `append`, `edit`, `write`. Without it no object
+in the Worker is capable of committing — that is structural, not a policy check.
+
+**What it will not touch.** Your vault's own exclude and only-paths policy binds the agent on
+reads as well as writes, and the hard-skipped paths (plugin credentials, the Obsidian config
+directory) are filtered out of reads too — this process holds the master key, and old snapshots
+carry that content. Writes go through the same commit path as any device: a scoped mini-pass
+that absorbs the head, carries every other entry byte-for-byte, and commits under CAS.
+
+Health check: `curl <AGENT_URL>/health`. An unauthenticated `GET /mcp` answers **401**, not
+405 — the bearer is checked before the method, so that is the correct answer to an anonymous
+probe rather than a broken deployment.
+
 ## Security model
 
 - **Encryption happens on the device.** Contents and paths are AES-256-GCM encrypted with

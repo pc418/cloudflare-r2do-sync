@@ -534,6 +534,8 @@ export function renderRestDeployCheck({
   retention,
   deploymentName = null,
   envFile = ".env",
+  withAgent = false,
+  agentWritable = false,
 }) {
   return [
     "",
@@ -561,6 +563,20 @@ export function renderRestDeployCheck({
     bucketOwned
       ? "  This is a redeploy onto storage this checkout provisioned."
       : "  If that bucket already exists on this account, setup will stop rather than adopt it.",
+    // The agent is a SECOND Worker, and the only one holding the vault master key. A screen
+    // that listed one Worker while the run stood up two would be asking for approval of
+    // something other than what happens.
+    ...(withAgent
+      ? [
+          "",
+          `  PLUS AN AGENT WORKER: ${scriptName}-agent  (--agent)`,
+          "  It is handed this vault's MASTER KEY as a Worker secret — the one secret the sync",
+          "  Worker never sees — and serves what it decrypts to whoever holds its MCP bearer.",
+          agentWritable
+            ? "  --agent-writable: a second, sync-scoped token as well. It can WRITE to this vault."
+            : "  Read-only: no sync-scoped token, so nothing in it can commit.",
+        ]
+      : []),
     // A second vault shares nothing but the account. Said here because the failure it
     // prevents is a person pointing an existing device at it and finding an empty vault.
     ...(deploymentName !== null && !bucketOwned

@@ -49,6 +49,11 @@ export async function deployViaRest({
   adoptWorker = false,
   migrateRename = false,
   deploymentName = null,
+  // Disclosure only: this function never deploys the agent. It states on the confirmation
+  // screen that the run intends to, because approving one Worker while two are stood up is
+  // approving something other than what happens.
+  withAgent = false,
+  agentWritable = false,
 } = {}) {
   const base = loadWorkerDeployConfig();
   // Validated against the default deployment's own names, so a "second vault" that is really
@@ -171,6 +176,8 @@ export async function deployViaRest({
         retention: VARS,
         deploymentName: VAULT,
         envFile: ENV_FILE,
+        withAgent,
+        agentWritable,
       })
     );
     if (!proceed) throw new Error("cancelled — nothing was deployed");
@@ -318,14 +325,34 @@ if (invokedDirectly) {
     const adoptWorker = argv.includes("--adopt-worker");
     const assumeYes = argv.includes("--yes") || argv.includes("-y");
     const migrateRename = argv.includes("--migrate-rename");
-    const known = ["--adopt-bucket", "--adopt-worker", "--yes", "-y", "--migrate-rename", "--vault"];
+    // Off unless asked for. The agent is a SECOND Worker holding the vault master key — the
+    // one secret the sync Worker never sees — so it is never a side effect of deploying the
+    // vault. `--agent` is the whole opt-in.
+    const withAgent = argv.includes("--agent");
+    const agentWritable = argv.includes("--agent-writable");
+    const known = [
+      "--adopt-bucket",
+      "--adopt-worker",
+      "--yes",
+      "-y",
+      "--migrate-rename",
+      "--vault",
+      "--agent",
+      "--agent-writable",
+    ];
     const unknown = argv.find((a, i) => !known.includes(a) && argv[i - 1] !== "--vault");
     if (unknown) {
       throw new Error(
         `unknown option "${unknown}"\n\n` +
           "usage: node scripts/deploy.mjs [--vault <name>] [--adopt-bucket] [--adopt-worker]\n" +
-          "                               [--migrate-rename] [--yes]"
+          "                               [--migrate-rename] [--agent [--agent-writable]] [--yes]"
       );
+    }
+    // Stated rather than silently ignored: asking for write tools without asking for the agent
+    // reads as "capture is on", and getting a read-only agent instead would be a nasty surprise
+    // in the other direction.
+    if (agentWritable && !withAgent) {
+      throw new Error("--agent-writable does nothing without --agent");
     }
     const vaultFlag = argv.includes("--vault") ? (argv[argv.indexOf("--vault") + 1] ?? "") : null;
     if (vaultFlag !== null && (vaultFlag === "" || vaultFlag.startsWith("--"))) {
@@ -342,12 +369,30 @@ if (invokedDirectly) {
     if (migrateRename && assumeYes) {
       throw new Error("--migrate-rename cannot be combined with --yes: confirm the target by hand");
     }
+    // Before anything is created, so a refusal leaves nothing behind — the same ordering rule
+    // the Worker-name check follows.
+    //
+    // The agent reads its vault's identity from `.env.<name>` alone, which production does not
+    // have: production is `.env`. That is not a gap to paper over. Standing an agent over
+    // production means handing the production master key to a Worker secret, and the ordered
+    // precondition for that — getting a credentials folder out of the synced set — is an owner action
+    // that is still open. So this refuses rather than inventing a path to it.
+    if (withAgent && deploymentName === null) {
+      throw new Error(
+        "--agent needs --vault <name>: the agent reads .env.<name>, and production keeps its\n" +
+          "identity in .env. Deploying an agent over production would put the production master\n" +
+          "key into a Worker secret, whose precondition (a credentials folder out of the synced set) is an\n" +
+          "open owner action. Nothing was deployed."
+      );
+    }
 
     const { url, adminToken, adminTokenKept, bucketClaim, envFile } = await deployViaRest({
       adoptBucket,
       adoptWorker,
       migrateRename,
       deploymentName,
+      withAgent,
+      agentWritable,
       confirm: assumeYes ? null : askToProceed,
     });
     // The admin credential is never shown to a person — it lives in the deployment's env file
@@ -366,6 +411,33 @@ if (invokedDirectly) {
     );
     console.log(`admin credential ${adminTokenKept ? "unchanged" : "rotated"} — ./${envFile} updated (WORKER_URL, ADMIN_TOKEN)`);
     console.log(`\nDEPLOYED: ${url}`);
+
+    // Second, and only on request. Imported here rather than at the top so the ordinary deploy
+    // never loads the agent's bundler path at all, and so a syntax error in the agent script
+    // cannot break a vault deploy that was not asking for one.
+    if (withAgent) {
+      console.log(`\n--- agent (--agent) ---`);
+      const { deployAgent, mcpSetupInstructions } = await import("./deploy-agent.mjs");
+      // The vault deploy already succeeded and its env file is written, which is what the
+      // agent deploy reads. A failure past this point leaves a working vault and no agent —
+      // said plainly, because "deploy failed" after "DEPLOYED" is otherwise ambiguous.
+      try {
+        const result = await deployAgent({
+          vault: deploymentName,
+          writable: agentWritable,
+          rotateBearer: false,
+          name: null,
+        });
+        console.log(mcpSetupInstructions(result));
+      } catch (error) {
+        console.error(
+          `\nthe vault deployed, but its agent did not: ${error instanceof Error ? error.message : error}` +
+            `\nThe vault at ${url} is live and unaffected. Re-run just the agent with:` +
+            `\n  node scripts/deploy-agent.mjs --vault ${deploymentName}${agentWritable ? " --writable" : ""}`
+        );
+        process.exit(1);
+      }
+    }
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
     process.exit(1);

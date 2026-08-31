@@ -58,8 +58,37 @@ const log = (m) => {
   console.log(m);
 };
 
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
+/**
+ * The connector setup text, in one place because two callers print it: this script run on its
+ * own, and `deploy.mjs --agent`, which deploys the vault and its agent in one pass.
+ *
+ * The bearer itself is deliberately NOT interpolated. It is a credential to the process
+ * holding the master key, and printing it would put it in terminal scrollback and in any
+ * transcript of the deploy; the file it lives in is named instead.
+ */
+export function mcpSetupInstructions({ url, agentEnvName, writable }) {
+  return `
+agent live at ${url}
+credentials recorded in ${agentEnvName} (gitignored)
+tools: ${writable ? "search, read, list, recent, append, edit, write" : "search, read, list, recent (read-only)"}
+
+Add it in Claude → Settings → Connectors → Add custom connector:
+  URL     ${url}/mcp
+  Auth    None, plus a request header:
+            Authorization: Bearer <MCP_BEARER from ${agentEnvName}>
+
+The header value must include the word "Bearer" and the space — Claude sends it verbatim.
+The URL must end in /mcp, never /sse: Anthropic reads /sse as the legacy transport.
+Register this workers.dev URL exactly — a redirect to another host drops the header.
+Auth settings are immutable once the connector exists; rotating the bearer
+(--rotate-bearer) means removing and re-adding it.
+
+Health check: curl ${url}/health  →  {"ok":true,...}
+An unauthenticated GET ${url}/mcp answers 401, not 405: the bearer is checked before
+the method, so 401 there is the correct answer to an anonymous probe, not a broken deploy.`;
+}
+
+export async function deployAgent(opts) {
   const vault = opts.vault;
   const scriptName = opts.name ?? `${vault}-agent`;
 
@@ -248,20 +277,16 @@ async function main() {
     WRITE_TOKEN_ID: writeToken === null ? "" : (writeToken.tokenId ?? writeToken.id ?? ""),
   }, agentEnvName);
 
-  log(`
-agent live at ${url}
-credentials recorded in ${agentEnvName} (gitignored)
-tools: ${opts.writable ? "search, read, list, recent, append, edit, write" : "search, read, list, recent (read-only)"}
-
-Add it in Claude → Settings → Connectors → Add custom connector:
-  URL     ${url}/mcp
-  Auth    None, plus a request header:
-            Authorization: Bearer <MCP_BEARER from ${agentEnvName}>
-
-The header value must include the word "Bearer" and the space — Claude sends it verbatim.`);
+  return { url, agentEnvName, writable: opts.writable, scriptName, vault };
 }
 
-main().catch((error) => {
-  console.error(`\ndeploy-agent failed: ${error.message}`);
-  process.exit(1);
-});
+const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
+  try {
+    const result = await deployAgent(parseArgs(process.argv.slice(2)));
+    log(mcpSetupInstructions(result));
+  } catch (error) {
+    console.error(`\ndeploy-agent failed: ${error.message}`);
+    process.exit(1);
+  }
+}
