@@ -31,6 +31,16 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const AGENT_DIR = path.join(ROOT, "agent");
 
+/** The deployment name production answers to here. It has no vault name of its own. */
+export const LIVE = "live";
+
+/** Production's Worker host is the only name it has; the agent's is derived from it. */
+export function liveScriptBase(workerUrl) {
+  const host = String(workerUrl ?? "").replace(/^https?:\/\//, "").split(".")[0];
+  if (host === "") throw new Error(".env WORKER_URL is missing or unparseable");
+  return host;
+}
+
 /** Lowercase RFC-4648 base32. 5 bytes → exactly 8 characters, all legal in a Worker name. */
 const B32 = "abcdefghijklmnopqrstuvwxyz234567";
 
@@ -75,6 +85,10 @@ const USAGE = `usage: node scripts/deploy-agent.mjs --vault <name> [--writable] 
                      (the connector must then be removed and re-added)
   --rotate-tokens    issue a new vault access token pair and revoke the one it replaces
                      (invisible to any client; nothing needs reconfiguring)
+  --live             deploy against the PRODUCTION vault in .env, not a named one.
+                     Requires --deny: this is the gate that put the production master key
+                     into a Worker secret, and the precondition was always that
+                     credential-bearing folders are out of the agent's reach.
   --deny <globs>     paths this agent has no permission on, comma or newline separated
                      (e.g. --deny "Private/**, Keys/**"). Recorded and kept across
                      redeploys; pass --deny "" to clear it. Denial beats the vault's
@@ -87,7 +101,7 @@ The agent is a SEPARATE Worker holding the vault master key. Deploying it agains
 whose own credentials are not in .env.<vault> is refused.`;
 
 function parseArgs(argv) {
-  const opts = { vault: null, writable: false, rotateBearer: false, rotateTokens: false, name: null, deny: null };
+  const opts = { vault: null, live: false, writable: false, rotateBearer: false, rotateTokens: false, name: null, deny: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const next = () => {
@@ -98,6 +112,7 @@ function parseArgs(argv) {
     if (arg === "--vault") opts.vault = next();
     else if (arg === "--name") opts.name = next();
     else if (arg === "--writable") opts.writable = true;
+    else if (arg === "--live") opts.live = true;
     else if (arg === "--rotate-bearer") opts.rotateBearer = true;
     else if (arg === "--rotate-tokens") opts.rotateTokens = true;
     // Not `next()`: an empty value is meaningful here — `--deny ""` is how a deny list is
@@ -116,6 +131,10 @@ function parseArgs(argv) {
       console.log(USAGE);
       process.exit(0);
     } else throw new Error(`unknown option "${arg}"\n\n${USAGE}`);
+  }
+  if (opts.live) {
+    if (opts.vault !== null) throw new Error("--live and --vault name different deployments; pass one");
+    opts.vault = LIVE;
   }
   if (opts.vault === null) throw new Error(`--vault is required\n\n${USAGE}`);
   return opts;
@@ -311,17 +330,26 @@ async function deployAgentLocked(opts) {
   const scriptName =
     opts.name ??
     agentEnv.AGENT_SCRIPT ??
-    (agentEnv.AGENT_URL ? `${vault}-agent` : randomAgentScriptName(vault));
+    (agentEnv.AGENT_URL
+      ? `${vault}-agent`
+      : randomAgentScriptName(vault === LIVE ? liveScriptBase(loadEnvFile(ROOT).WORKER_URL) : vault));
 
   // --- credentials -----------------------------------------------------------
   const base = loadEnvFile(ROOT);
-  const vaultEnvPath = path.join(ROOT, `.env.${vault}`);
+  // Production keeps its identity in `.env`, with no vault name anywhere — which is why
+  // `deploy.mjs --agent` refuses it and why this needs its own door rather than a `.env.<name>`
+  // faked to look like a named vault. A duplicated ADMIN_TOKEN in a second file is how a later
+  // `deploy.mjs --vault obsidian-log-sync` would fork production into a second deployment.
+  const live = vault === LIVE;
+  const vaultEnvPath = path.join(ROOT, live ? ".env" : `.env.${vault}`);
   if (!existsSync(vaultEnvPath)) {
     throw new Error(
-      `no .env.${vault} — stand the vault up first with:\n  node scripts/setup.mjs --token --vault ${vault}`
+      live
+        ? "no .env — production's identity lives there"
+        : `no .env.${vault} — stand the vault up first with:\n  node scripts/setup.mjs --token --vault ${vault}`
     );
   }
-  const vaultEnv = loadEnvFile(ROOT, `.env.${vault}`);
+  const vaultEnv = live ? base : loadEnvFile(ROOT, `.env.${vault}`);
   const TOKEN = process.env.CLOUDFLARE_TOKEN ?? vaultEnv.CLOUDFLARE_TOKEN ?? base.CLOUDFLARE_TOKEN;
   const ACCOUNT_ID =
     process.env.CLOUDFLARE_ACCOUNT_ID ?? vaultEnv.CLOUDFLARE_ACCOUNT_ID ?? base.CLOUDFLARE_ACCOUNT_ID;
@@ -335,12 +363,23 @@ async function deployAgentLocked(opts) {
   // Worker as a secret.
   const keyFile = path.join(ROOT, `testvault/${vault.replace(/^obsidian-/, "")}-master-key.txt`);
   const fromEnv = process.env.VAULT_MASTER_KEY !== undefined && process.env.VAULT_MASTER_KEY !== "";
-  const keySource = fromEnv ? "VAULT_MASTER_KEY" : path.relative(ROOT, keyFile);
-  const masterKey = (process.env.VAULT_MASTER_KEY ?? (existsSync(keyFile) ? readFileSync(keyFile, "utf8") : "")).trim();
+  // Production's key is the backup recorded in `.env`; a named vault's is the file its own
+  // setup produced. Neither is ever generated or written here.
+  const keySource = fromEnv
+    ? "VAULT_MASTER_KEY"
+    : live
+      ? ".env BACKUP_MASTER"
+      : path.relative(ROOT, keyFile);
+  const masterKey = (
+    process.env.VAULT_MASTER_KEY ??
+    (live ? (base.BACKUP_MASTER ?? "") : existsSync(keyFile) ? readFileSync(keyFile, "utf8") : "")
+  ).trim();
   if (masterKey === "") {
     throw new Error(
-      `no master key. Put it in VAULT_MASTER_KEY, or at ${path.relative(ROOT, keyFile)}.\n` +
-        "Without it the agent can reach the vault but not read a single note."
+      live
+        ? "no master key. Put it in VAULT_MASTER_KEY, or in .env as BACKUP_MASTER."
+        : `no master key. Put it in VAULT_MASTER_KEY, or at ${path.relative(ROOT, keyFile)}.\n` +
+          "Without it the agent can reach the vault but not read a single note."
     );
   }
 
@@ -349,6 +388,17 @@ async function deployAgentLocked(opts) {
   const timezone = resolveDeployZone(process.env.AGENT_TZ ?? vaultEnv.AGENT_TZ);
 
   const deny = resolveDeny(opts.deny, agentEnv.AGENT_DENY);
+  // Enforced, not merely documented. This deployment puts the production master key into a
+  // Worker secret; the standing precondition was that credential-bearing folders are out of
+  // the agent's reach first, and a rule nothing checks is a rule that gets skipped once.
+  if (live && deny === "") {
+    throw new Error(
+      "--live requires --deny. This puts the production master key into a Worker secret, and\n" +
+        "the agent then decrypts whatever it reads. Name the folders it must not touch, e.g.\n" +
+        `  node scripts/deploy-agent.mjs --live --deny "Some Folder/**"\n` +
+        "Note this limits what the AGENT may decrypt; those bytes stay in existing snapshots."
+    );
+  }
 
   const API = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}`;
   const cf = async (pathname, init = {}) => {

@@ -182,7 +182,7 @@ test("an existing agent deployment never gets a fresh random name", () => {
   // Recorded name wins over generation, and a pre-suffix deployment falls back to its legacy
   // name rather than generating one.
   assert.match(source, /agentEnv\.AGENT_SCRIPT \?\?/);
-  assert.match(source, /agentEnv\.AGENT_URL \? `\$\{vault\}-agent` : randomAgentScriptName\(vault\)/);
+  assert.match(source, /agentEnv\.AGENT_URL\s*\n?\s*\? `\$\{vault\}-agent`/);
   // And the chosen name is persisted, or the next run would generate again.
   assert.match(source, /AGENT_SCRIPT: scriptName/);
 
@@ -497,4 +497,26 @@ test("--deny will not swallow the next option as its value", async () => {
   // a read-only agent that denies nothing, reported as one valid rule.
   assert.match(source, /value !== "" && value\.startsWith\("--"\)/);
   assert.match(source, /--deny needs a glob list, or "" to clear/);
+});
+
+test("--live is a separate door, and it is gated on a deny list", async () => {
+  const { LIVE, liveScriptBase } = await import("./deploy-agent.mjs");
+  assert.equal(LIVE, "live");
+  // Production's Worker host is the only name it has; a named vault has a vault name.
+  assert.equal(liveScriptBase("https://obsidian-log-sync.example.workers.dev"), "obsidian-log-sync");
+  assert.throws(() => liveScriptBase(""), /WORKER_URL is missing/);
+  assert.throws(() => liveScriptBase(undefined), /WORKER_URL is missing/);
+
+  const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
+  // Production keeps its identity in .env with no vault name, which is why this needs its own
+  // door. Faking a .env.<name> would let a later `deploy.mjs --vault <name>` fork production
+  // into a second deployment with a duplicated admin token.
+  assert.match(source, /const live = vault === LIVE;/);
+  assert.match(source, /live \? ".env" : `\.env\.\$\{vault\}`/);
+  // The precondition is enforced, not documented. This deployment is what puts the production
+  // master key into a Worker secret; a rule nothing checks is a rule that gets skipped once.
+  assert.match(source, /if \(live && deny === ""\)/);
+  assert.match(source, /--live requires --deny/);
+  // And --live/--vault are mutually exclusive, or the target would be ambiguous.
+  assert.match(source, /--live and --vault name different deployments/);
 });
