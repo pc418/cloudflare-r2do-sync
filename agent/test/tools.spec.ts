@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { SyncApi } from "../../plugin/src/api";
-import { callTool, TOOLS, type ToolContext } from "../src/tools";
+import { callTool, lastWeekday, TOOLS, type ToolContext } from "../src/tools";
 import { fetchHttp, VaultView } from "../src/vault";
 import { PLUGIN_DIR } from "../../plugin/src/paths";
 import { INDEX_CHUNK, SearchIndex } from "../src/index-store";
@@ -975,7 +975,7 @@ describe("list: sort and date range", () => {
 
   it("fails loud on a date it cannot read", async () => {
     const { ctx } = await dated();
-    await expect(callTool("list", { modified_after: "last tuesday" }, ctx)).rejects.toThrow(
+    await expect(callTool("list", { modified_after: "next tuesday" }, ctx)).rejects.toThrow(
       /not a date I can read/
     );
   });
@@ -986,5 +986,47 @@ describe("list: sort and date range", () => {
     const { ctx } = await dated();
     expect(paths(await callTool("list", { sort: "modified", max_results: 1 }, ctx))).toEqual(["b.md"]);
     expect(paths(await callTool("list", { sort: "size", max_results: 1 }, ctx))).toEqual(["a.md"]);
+  });
+});
+
+describe("last <weekday> date bounds", () => {
+  // Fixed clock: Monday 2026-08-31T09:00Z. Every expectation below is UTC midnight.
+  const MON = Date.parse("2026-08-31T09:00:00Z");
+  const day = (iso: string) => Date.parse(`${iso}T00:00:00Z`);
+
+  it("resolves to the most recent past occurrence, never today", () => {
+    expect(lastWeekday("last tuesday", MON)).toBe(day("2026-08-25"));
+    expect(lastWeekday("last sunday", MON)).toBe(day("2026-08-30"));
+    // On a Monday, "last monday" is a week back — today is never the answer, or a range
+    // ending at it would silently include work done this morning.
+    expect(lastWeekday("last monday", MON)).toBe(day("2026-08-24"));
+  });
+
+  it("is case- and space-insensitive, and rejects anything else", () => {
+    expect(lastWeekday("  Last   Tuesday ", MON)).toBe(day("2026-08-25"));
+    // Not weekday grammar: these fall through to ISO parsing rather than being guessed at.
+    for (const t of ["last week", "3 days ago", "yesterday", "last octopus", "2026-08-25"]) {
+      expect(lastWeekday(t, MON), t).toBeNull();
+    }
+  });
+
+  it("filters a listing, and still fails loud on anything it cannot read", async () => {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    // Long before any "last tuesday", so the assertion does not depend on the day the suite runs.
+    await seed(vault, crypto, { "old.md": "old\n", "new.md": "new\n" }, {
+      mtimes: { "old.md": day("2020-01-06"), "new.md": day("2020-01-08") },
+    });
+    const api = new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const view = new VaultView({ api, crypto });
+    const ctx: ToolContext = { view, writable: false, enqueue: async () => ({ head: "", summary: "" }) };
+
+    // Whatever weekday it is when this runs, a bound of "last tuesday" is in the past and
+    // must exclude the 2026 fixtures entirely — asserting on the mechanism, not on the clock.
+    const out = await callTool("list", { modified_after: "last tuesday" }, ctx);
+    expect(out).toContain("0 note(s)");
+    await expect(callTool("list", { modified_after: "last octopus" }, ctx)).rejects.toThrow(
+      /not a date I can read.*last tuesday/s
+    );
   });
 });

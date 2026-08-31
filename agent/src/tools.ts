@@ -199,10 +199,10 @@ export const TOOLS: ToolDescriptor[] = [
             "Order (default \"path\"). Path A-Z, modified newest first, size largest first. Keeps sorted first-N.",
         },
         modified_after: str(
-          "At or after this ISO 8601 time. A date alone is UTC midnight."
+          "At or after. ISO 8601 or \"last tuesday\". UTC midnight."
         ),
         modified_before: str(
-          "Strictly before this ISO 8601 time, exclusive. A date alone is UTC midnight."
+          "Strictly before, exclusive. ISO 8601 or \"last tuesday\". UTC midnight."
         ),
         folder: str("Folder to list, subfolders included, e.g. \"Daily\"."),
         glob: str("Optional path glob, e.g. \"**/*.md\". ANDed with folder when both are given."),
@@ -374,6 +374,30 @@ function entryOf(files: Record<string, FileEntry>, path: string): FileEntry {
   );
 }
 
+/** Sunday-first, matching `Date.getUTCDay()`. */
+const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+
+/**
+ * `last tuesday` → that day's UTC midnight, or null if the text is not that shape.
+ *
+ * Weekday grammar only. A model frequently does not know today's date, so asking it to compute
+ * `2026-08-25` invites an answer it cannot check; naming the weekday moves the arithmetic to
+ * the side that owns a clock. Wider grammars ("3 days ago", "last month") are deliberately
+ * absent — ISO 8601 already covers anything precise, and each extra form is another way to be
+ * ambiguous about a boundary.
+ *
+ * **Never today**: on a Tuesday, `last tuesday` is seven days back, not this morning.
+ */
+export function lastWeekday(text: string, now: number): number | null {
+  const m = /^last\s+(\w+)$/.exec(text.trim().toLowerCase());
+  if (m === null) return null;
+  const target = WEEKDAYS.indexOf(m[1]);
+  if (target === -1) return null;
+  const d = new Date(now);
+  const back = ((d.getUTCDay() - target + 6) % 7) + 1;
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - back * 86_400_000;
+}
+
 /**
  * An ISO 8601 bound from the arguments, or null.
  *
@@ -383,10 +407,12 @@ function entryOf(files: Record<string, FileEntry>, path: string): FileEntry {
 function when(args: Record<string, unknown>, key: string): number | null {
   const raw = optional(args, key);
   if (raw === undefined) return null;
+  const weekday = lastWeekday(raw, Date.now());
+  if (weekday !== null) return weekday;
   const at = Date.parse(raw);
   if (Number.isNaN(at)) {
     throw new VaultError(
-      `"${key}" is not a date I can read: "${raw}". Use ISO 8601 — "2026-08-01" or "2026-08-01T12:00:00Z".`
+      `"${key}" is not a date I can read: "${raw}". Use ISO 8601 ("2026-08-01", "2026-08-01T12:00:00Z") or "last tuesday".`
     );
   }
   return at;
