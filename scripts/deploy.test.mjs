@@ -180,3 +180,24 @@ test("the agent health endpoint does not identify itself", () => {
   assert.match(source, /pathname === "\/health"/);
   assert.doesNotMatch(source, /Response\.json\(\{ ok: true, service:/);
 });
+
+test("the deploy names which master key it used, and never the key", () => {
+  // The wrong vault's key gives an agent that authenticates perfectly and decrypts nothing —
+  // found much later, and confusing on arrival. Naming the source makes it checkable at deploy
+  // time; printing the key itself would put the whole vault in the operator's scrollback.
+  const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
+  assert.match(source, /master key from \$\{keySource\}/);
+  assert.match(source, /never printed/);
+  // The value reaches exactly one place: the Worker's secret binding.
+  const logged = source.match(/log\(`[^`]*\$\{masterKey\}[^`]*`\)/);
+  assert.equal(logged, null, "the master key must never be logged");
+  assert.match(source, /name: "VAULT_MASTER_KEY", text: masterKey/);
+
+  // `keySource` is a const in the same function scope as the line that logs it, so using it
+  // before its declaration would be a TDZ ReferenceError at runtime — which `node --check`
+  // does not catch, and which would abort the deploy after the credentials were read.
+  const declaredAt = source.indexOf("const keySource =");
+  const usedAt = source.indexOf("log(`master key from ${keySource}");
+  assert.ok(declaredAt > 0 && usedAt > 0, "expected both the declaration and the log");
+  assert.ok(declaredAt < usedAt, "keySource must be declared before it is logged");
+});

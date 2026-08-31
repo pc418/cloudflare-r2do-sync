@@ -196,6 +196,8 @@ export async function deployAgent(opts) {
   // it is read from the file the vault's own setup produced, and handed straight to the
   // Worker as a secret.
   const keyFile = path.join(ROOT, `testvault/${vault.replace(/^obsidian-/, "")}-master-key.txt`);
+  const fromEnv = process.env.VAULT_MASTER_KEY !== undefined && process.env.VAULT_MASTER_KEY !== "";
+  const keySource = fromEnv ? "VAULT_MASTER_KEY" : path.relative(ROOT, keyFile);
   const masterKey = (process.env.VAULT_MASTER_KEY ?? (existsSync(keyFile) ? readFileSync(keyFile, "utf8") : "")).trim();
   if (masterKey === "") {
     throw new Error(
@@ -226,6 +228,10 @@ export async function deployAgent(opts) {
   };
 
   log(`agent "${scriptName}" for vault "${vault}" (${SYNC_URL})`);
+  // Which key, not the key. The wrong vault's key produces an agent that authenticates
+  // perfectly and then decrypts nothing — a failure found much later, and confusing when it
+  // arrives. Naming the source makes it checkable here, for free.
+  log(`master key from ${keySource} (uploaded as a Worker secret; never printed)`);
 
   // --- refuse to upload over an unrelated Worker ------------------------------
   // The upload is a PUT: against a name somebody else owns it would replace that Worker's
@@ -362,7 +368,7 @@ export async function deployAgent(opts) {
     WRITE_TOKEN_ID: writeToken === null ? "" : (writeToken.tokenId ?? writeToken.id ?? ""),
   }, agentEnvName);
 
-  return { url, agentEnvName, writable: opts.writable, scriptName, vault };
+  return { url, agentEnvName, writable: opts.writable, scriptName, vault, keySource };
 }
 
 const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
