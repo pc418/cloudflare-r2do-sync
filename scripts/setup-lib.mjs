@@ -48,12 +48,40 @@ export const WRANGLER_CMD = "node worker/node_modules/wrangler/bin/wrangler.js";
 const splitLines = (text) => text.split(/\r?\n/);
 
 /** `.env` values, if the file exists. Real environment variables take precedence. */
+/**
+ * Values that are safe to write bare: no whitespace, no glob or shell metacharacters.
+ *
+ * These files are `source`d by hand all the time — every runbook in this repo starts with
+ * `. ./.env.<vault>` — so a value the shell would expand is not merely ugly, it makes the file
+ * unusable. A deny list is the first value this writes with a space and a glob in it, and it
+ * broke sourcing outright: zsh answered "no matches found" and set nothing at all.
+ */
+const BARE_ENV_VALUE = /^[A-Za-z0-9_./:@+-]*$/;
+
+export function quoteEnvValue(value) {
+  const text = String(value);
+  if (BARE_ENV_VALUE.test(text)) return text;
+  // POSIX single-quoting: everything is literal inside, and an embedded quote is closed,
+  // escaped and reopened. Survives globs, spaces, $, and emoji alike.
+  return `'${text.replace(/'/g, "'\\''")}'`;
+}
+
+export function unquoteEnvValue(text) {
+  if (text.length >= 2 && text.startsWith("'") && text.endsWith("'")) {
+    return text.slice(1, -1).replace(/'\\''/g, "'");
+  }
+  // Double quotes are not written by this module; accepted because a hand-edited file may use
+  // them, and stripping one pair is what this has always done.
+  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) return text.slice(1, -1);
+  return text;
+}
+
 export function loadEnvFile(root = ROOT, fileName = ".env") {
   const out = {};
   try {
     for (const line of splitLines(readFileSync(path.join(root, fileName), "utf8"))) {
       const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$/);
-      if (m) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
+      if (m) out[m[1]] = unquoteEnvValue(m[2].trim());
     }
   } catch (error) {
     if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
@@ -81,11 +109,11 @@ export function upsertEnvFile(root, values, fileName = ".env") {
   const updated = lines.map((line) => {
     const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=/);
     if (!m || !pending.has(m[1])) return line;
-    const next = `${m[1]}=${pending.get(m[1])}`;
+    const next = `${m[1]}=${quoteEnvValue(pending.get(m[1]))}`;
     pending.delete(m[1]);
     return next;
   });
-  for (const [key, value] of pending) updated.push(`${key}=${value}`);
+  for (const [key, value] of pending) updated.push(`${key}=${quoteEnvValue(value)}`);
 
   writeFileSync(file, `${updated.join("\n")}\n`, { mode: 0o600 });
   // `mode:` only applies when the file is CREATED. An .env that already existed keeps

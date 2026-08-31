@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -777,4 +777,30 @@ test("a summary without an access token is a bug, not a message to explain", () 
     () => renderSetupSummary({ workerUrl: "https://sync.example.com", accessToken: null }),
     /setup always issues one/
   );
+});
+
+test("env values survive the shell, and round-trip through the loader", async () => {
+  const { loadEnvFile, quoteEnvValue, unquoteEnvValue, upsertEnvFile } = await import("./setup-lib.mjs");
+  // These files are sourced by hand in every runbook here. AGENT_DENY was the first value
+  // with a space and a glob in it, and it broke `. ./.env.<vault>` outright — zsh answered
+  // "no matches found" and set nothing at all, so the file became unusable rather than wrong.
+  const deny = "\u{1F4C1} Some Folder/**, Archive/**";
+  assert.equal(quoteEnvValue(deny), `'${deny}'`);
+  assert.equal(unquoteEnvValue(quoteEnvValue(deny)), deny);
+  // Bare when it is safe: quoting every value would churn the whole file on one edit.
+  for (const bare of ["plain", "https://x.example/y", "a-b_c.d:e@f", ""]) {
+    assert.equal(quoteEnvValue(bare), bare);
+  }
+  // An apostrophe in a folder name is legal, so closing/escaping/reopening has to work.
+  assert.equal(unquoteEnvValue(quoteEnvValue("it's here")), "it's here");
+
+  const dir = mkdtempSync(path.join(tmpdir(), "env-"));
+  upsertEnvFile(dir, { AGENT_DENY: deny, PLAIN: "x" }, ".env.t");
+  const read = loadEnvFile(dir, ".env.t");
+  assert.equal(read.AGENT_DENY, deny);
+  assert.equal(read.PLAIN, "x");
+  // And an update of one key must not mangle the quoting of the others.
+  upsertEnvFile(dir, { PLAIN: "y" }, ".env.t");
+  assert.equal(loadEnvFile(dir, ".env.t").AGENT_DENY, deny);
+  rmSync(dir, { recursive: true });
 });
