@@ -167,30 +167,46 @@ export function mcpHandoffSection({ url, bearer, writable, vaultUrl }) {
     "  MCP CONNECTOR",
     "-".repeat(88),
     "",
-    "Claude -> Settings -> Connectors -> Add custom connector.",
-    "Request headers are a gated beta: if that section is absent, your account does not have",
-    "it, and there is no other supported path yet — OAuth is not built.",
-    "",
     `  URL       ${url}/mcp`,
-    "  Auth      None, plus one request header:",
     "",
-    `  Header name   Authorization`,
-    `  Header value  Bearer ${bearer}`,
+    "  Two ways in, both ending at the same token. Use whichever your client offers.",
     "",
-    "  Paste the header value EXACTLY as printed, including the word Bearer and the space.",
+    "  1. SIGN IN  (ChatGPT, Claude web and desktop, MCP Inspector)",
+    "",
+    "     Add the URL and choose OAuth or \"sign in\". A browser page titled",
+    "     \"Authorize this connector\" opens and asks for one thing — this:",
+    "",
+    `       ${bearer}`,
+    "",
+    "     There is no account and no password. That token IS the sign-in.",
+    "",
+    "  2. REQUEST HEADER  (Claude Code, Codex, anything scriptable)",
+    "",
+    `       Header name   Authorization`,
+    `       Header value  Bearer ${bearer}`,
+    "",
+    "     Sent verbatim: the word Bearer and the space are part of the value.",
     "",
     `  tools     ${writable ? "search, recent, read, list, append, edit, write, move, delete" : "search, recent, read, list (read-only)"}`,
     writable
       ? "            write, delete and move act like a file system: no confirmation, and your\n            undo is snapshot history within the retention window."
       : "",
     "",
+    "  Sized for ONE NOTE AT A TIME: append to a log, save a conversation, revise or replace a",
+    "  single note, look something up. Each call absorbs the vault head, applies one change and",
+    "  commits — which is what makes it safe from a phone, and the wrong shape for bulk work.",
+    "  For a rename sweep, a reformat across a folder, anything touching many files: point",
+    "  Claude Code or Codex at the vault FOLDER ON DISK instead. One pass, one diff to review,",
+    "  one snapshot — rather than one commit per file and a mass-change prompt on your devices.",
+    "",
     "  Four things that each cost an hour if missed:",
-    "   1. The header value is sent verbatim — it must include \"Bearer \".",
-    "   2. The URL must end in /mcp, never /sse — Anthropic reads /sse as the legacy transport.",
-    "   3. Register this workers.dev URL exactly; a redirect to another host drops the header.",
+    "   1. The URL must end in /mcp, never /sse — Anthropic reads /sse as the legacy transport.",
+    "   2. Register this workers.dev URL exactly. A redirect to another host drops the header,",
+    "      and sign-in discovery starts from whatever host you typed.",
+    "   3. The header value is sent verbatim — it must include \"Bearer \".",
     "   4. Connector auth settings are immutable once created, so this bearer is never",
     "      rotated by a deploy. Only --rotate-bearer changes it, and then the connector has",
-    "      to be removed and re-added.",
+    "      to be removed and re-added — that one token is both ways in.",
     "",
     `  Check it   curl ${url}/health          -> {"ok":true}`,
     `             An unauthenticated GET ${url}/mcp answers 401, not 405.`,
@@ -214,9 +230,10 @@ token ids and script name recorded in ${agentEnvName} (gitignored)
 
   CONNECTOR SETTINGS, INCLUDING THE BEARER:  ${handoffFile}
 
-That file holds everything you paste into Claude, in one place, created 0600 and gitignored.
-Store the values somewhere safe and delete it. The bearer survives every redeploy — only
---rotate-bearer changes it, and that means re-adding the connector.
+That file holds everything a client needs, in one place, created 0600 and gitignored. The same
+token signs you in through the browser and works as a request header. Store the values
+somewhere safe and delete it. The bearer survives every redeploy — only --rotate-bearer changes
+it, and that means re-adding the connector.
 `;
 }
 

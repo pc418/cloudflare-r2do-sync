@@ -104,7 +104,7 @@ test("the handover section carries everything the connector form needs", async (
   // The two halves that used to live apart: the endpoint and the value to paste.
   assert.match(text, /https:\/\/a\.example\.workers\.dev\/mcp/);
   assert.ok(text.includes(`Bearer ${bearer}`), "the header value must be complete and pasteable");
-  assert.match(text, /including the word Bearer and the space/);
+  assert.match(text, /the word Bearer and the space are part of the value/);
   // The traps that each cost an hour, per the connector guide.
   assert.match(text, /never \/sse/);
   assert.match(text, /redirect to another host drops the header/);
@@ -113,14 +113,18 @@ test("the handover section carries everything the connector form needs", async (
   assert.match(text, /401, not 405/);
   assert.match(text, /read-only/);
 
-  // The gated beta is the hard stop: without a "Request headers" section in the dialog there
-  // is no supported path at all, and a user who is not told that hunts for a field that does
-  // not exist. It has to come before the values, not after them.
-  const gate = text.indexOf("Request headers");
-  const values = text.indexOf("/mcp");
-  assert.ok(gate > 0, "expected the request-headers beta caveat");
-  assert.ok(gate < values, "the caveat must precede the values it gates");
-  assert.match(text, /OAuth is not built/);
+  // Sign-in comes first, because it is the only way in for ChatGPT and for a Claude account
+  // without the gated request-headers beta — and it needs the token *bare*, without the
+  // `Bearer ` prefix that the header form requires. Someone who reads only the header line
+  // and pastes it into the consent page is refused with nothing to explain why.
+  const signIn = text.indexOf("SIGN IN");
+  const header = text.indexOf("REQUEST HEADER");
+  assert.ok(signIn > 0, "expected the browser sign-in path");
+  assert.ok(signIn < header, "sign-in works for every client; the header does not");
+  assert.ok(
+    new RegExp(`^\\s+${bearer}$`, "m").test(text),
+    "the consent page takes the token bare — it must appear without the Bearer prefix"
+  );
 
   // The custody trade, and the sync Worker named so the contrast is concrete.
   assert.match(text, /MASTER KEY/);

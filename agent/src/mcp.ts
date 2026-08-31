@@ -108,17 +108,21 @@ const MAX_RESULT_CHARS = 120_000;
 export const MAX_REQUEST_BYTES = 1024 * 1024;
 
 /**
- * The body as text, or `null` if it exceeds the cap.
+ * The body as text, or `null` if it exceeds `limit`.
  *
  * Streamed and counted rather than measured by `Content-Length`, because a chunked body carries
  * no such header and a stated one is not evidence of what will arrive. The read is abandoned at
  * the first chunk that crosses the line, so an oversized body is never fully held.
+ *
+ * Exported because the OAuth routes need the same guarantee at a smaller size, and they are
+ * *unauthenticated* — discovery and registration happen before anyone has proved anything — so
+ * they need it more than this one does.
  */
-async function readBounded(request: Request): Promise<string | null> {
+export async function readBounded(request: Request, limit = MAX_REQUEST_BYTES): Promise<string | null> {
   const declared = Number(request.headers.get("content-length"));
   // NaN when absent or unparsable, and NaN fails every comparison — which is the right
   // outcome: an unstated length is decided by the streamed count below, not by this line.
-  if (declared > MAX_REQUEST_BYTES) return null;
+  if (declared > limit) return null;
   if (request.body === null) return "";
 
   // workers-types declares `Request.body` as `ReadableStream<any>`, so the chunks arrive
@@ -131,7 +135,7 @@ async function readBounded(request: Request): Promise<string | null> {
     const { done, value } = await reader.read();
     if (done) break;
     total += value.byteLength;
-    if (total > MAX_REQUEST_BYTES) {
+    if (total > limit) {
       await reader.cancel();
       return null;
     }

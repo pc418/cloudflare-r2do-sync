@@ -135,33 +135,34 @@ Everything a client needs lands in one file at the repository root:
 DEPLOY-CREDENTIALS.my-vault.txt        (mode 0600, gitignored)
 ```
 
-The URL, the header name and the complete header value, ready to paste. The terminal shows only
-the URL and a short fingerprint — enough to tell one deploy from another, useless for signing in
-— so the credential never sits in your scroll-back. **Store the values somewhere safe, then
-delete the file.**
+The URL and the token, ready to paste. The terminal shows only the URL and a short fingerprint —
+enough to tell one deploy from another, useless for signing in — so the credential never sits in
+your scroll-back. **Store the values somewhere safe, then delete the file.**
 
 ### Point a client at it
 
-| | |
+The URL is the one ending in **`/mcp`**, never `/sse`. There is **one token**, and two ways to
+present it. Use whichever your client offers; they end at the same place.
+
+**Sign in.** Add the URL and pick OAuth. A page titled *Authorize this connector* opens in your
+browser and asks for one thing — the token, pasted bare. There is no account and no password:
+that token is the sign-in. Nothing is stored server-side, so there is nobody to lock out but the
+holder of the token.
+
+**Send a header.** `Authorization: Bearer <token>`, verbatim, `Bearer` and the space included.
+Scriptable clients prefer this — no browser, nothing to click.
+
+| client | how |
 |---|---|
-| **URL** | the one ending in `/mcp` — never `/sse` |
-| **Authentication** | **None**, plus a request header |
-| **Header name** | `Authorization` |
-| **Header value** | `Bearer …` — copy the whole line, `Bearer` and space included |
+| **Claude** (web, desktop) | Settings → Connectors → Add custom connector, paste the URL, sign in when prompted. A **Request headers** section, if your account has that beta, works too. |
+| **ChatGPT** | Settings → Connectors → add the URL and sign in. Speaking OAuth is what that surface requires, so this is the ordinary connector path — developer mode is not needed. Web only; write tools may be restricted by plan. |
+| **Claude Code** | `claude mcp add --transport http obsidian <url>/mcp --header "Authorization: Bearer <token>"`. Use `-s user`; avoid `-s project`, which writes the credential into a committed `.mcp.json`. Servers load at startup, so restart the session. |
+| **Codex** | `codex mcp add obsidian --url <url>/mcp --bearer-token-env-var OBSIDIAN_MCP_TOKEN`, then export that variable from your shell profile rather than a config file. No `Bearer ` prefix there; Codex adds it. |
 
-Anything speaking **streamable HTTP** with a custom header works; there is no OAuth, no session,
-nothing to install locally.
-
-- **Claude (web and desktop)** — Settings → Connectors → Add custom connector. Check for a
-  **Request headers** section in that dialog *first*: it is a gated beta, and without it there is
-  no supported way in. Auth settings cannot be edited once a connector exists, which is why a
-  redeploy never reissues the header value; if you do run `--rotate-bearer`, remove and re-add.
-- **Claude Code** — `claude mcp add --transport http obsidian <url>/mcp --header "Authorization:
-  Bearer <value>"`. Add `-s user` for every project; avoid `-s project`, which writes the
-  credential into a committed `.mcp.json`. Servers load at startup, so restart the session.
-- **Codex** — `codex mcp add obsidian --url <url>/mcp --bearer-token-env-var OBSIDIAN_MCP_TOKEN`,
-  then export that variable from your shell profile rather than a config file. No `Bearer `
-  prefix there; Codex adds it.
+Register the `workers.dev` URL **exactly**. A redirect to another host drops the header, and
+sign-in discovery starts from whatever host you typed. Connector auth cannot be edited after
+creation, which is why a redeploy never reissues the token; if you run `--rotate-bearer`, remove
+and re-add the connector.
 
 ### What it can do
 
@@ -179,6 +180,21 @@ so "yesterday" means what you mean.
 
 Your vault's own exclude and only-paths rules bind it on reads as well as writes, and everything
 it writes syncs to your devices like any other device's changes, mass-deletion guard included.
+
+### What to use it for, and what not to
+
+The connector is sized for **one note at a time**: appending to a log, saving a conversation,
+revising or replacing a single note, looking something up. Every call is a round trip that
+absorbs the vault head, applies one change and commits — which is what makes it safe from a
+phone with no Obsidian running, and what makes it the wrong shape for bulk work.
+
+**For anything that touches many files at once** — a rename sweep, a bulk reformat, a
+find-and-replace across a folder, a restructure — point Claude Code or Codex at the vault folder
+on disk instead. They already have the filesystem, so it is one pass over local files with a
+normal diff to review, and the plugin syncs the result as one snapshot. Driving the same job
+through the connector means one commit per file, a slower run, and a mass-change guard that will
+stop your other devices to ask about it. Use both: the connector when you are away from the
+vault, the local tools when you are in it.
 
 ### Keeping folders out of its reach
 
@@ -224,7 +240,7 @@ you ask**, so a working client keeps working.
 
 | To change | Pass | What it costs |
 |---|---|---|
-| the header value a client sends | `--rotate-bearer` | connector auth cannot be edited after creation, so remove and re-add the connector |
+| the connector token (sign-in and header alike) | `--rotate-bearer` | connector auth cannot be edited after creation, so remove and re-add the connector |
 | the agent's own vault tokens | `--rotate-tokens` | nothing — no client sees these; the pair it replaces is revoked once the new one answers |
 | what it may not touch | `--deny "…"` | immediate; `--deny ""` clears it |
 | read-only ⇄ read-write | add or drop `--writable` | dropping it deletes the write credential outright, not just the tool list |
