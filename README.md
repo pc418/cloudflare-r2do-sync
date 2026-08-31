@@ -5,7 +5,6 @@ with an optional MCP server that lets Claude or any AI assistant read and write 
 
 [![CI](https://github.com/pc418/cloudflare-r2do-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/pc418/cloudflare-r2do-sync/actions/workflows/ci.yml)
 [![latest release](https://img.shields.io/github/v/release/pc418/cloudflare-r2do-sync?sort=semver&label=release)](https://github.com/pc418/cloudflare-r2do-sync/releases/latest)
-[![downloads](https://img.shields.io/github/downloads-pre/pc418/cloudflare-r2do-sync/latest/main.js?sort=semver&label=downloads)](https://github.com/pc418/cloudflare-r2do-sync/releases)
 [![license](https://img.shields.io/github/license/pc418/cloudflare-r2do-sync?label=license)](LICENSE)
 
 No third-party service and no subscription: a Worker, an R2 bucket and a Durable Object you
