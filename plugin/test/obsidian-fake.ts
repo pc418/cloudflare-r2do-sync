@@ -63,9 +63,9 @@ class FakeInput {
 
 export class FakeElement {
   readonly children: FakeElement[] = [];
-  // Enough of a textarea to model the secret-bearing ones the UI falls back to when the
-  // clipboard is unavailable: the value must be readable, and "was it offered for manual
-  // selection" is the difference between a dead end and a working escape hatch.
+  // Enough of a textarea to model the secret-bearing ones. The plugin never touches the
+  // clipboard, so this field is the only export route: the value must be readable, and "was
+  // it offered for manual selection" is the difference between a dead end and a working one.
   value = "";
   readOnly = false;
   rows = 0;
@@ -82,7 +82,16 @@ export class FakeElement {
     /** True for a container the UI itself owns and re-renders wholesale. */
     readonly root: boolean = false
   ) {}
-  focus(): void {}
+  readonly #listeners = new Map<string, Array<(arg?: unknown) => void>>();
+  addEventListener(event: string, fn: (arg?: unknown) => void): void {
+    const list = this.#listeners.get(event) ?? [];
+    list.push(fn);
+    this.#listeners.set(event, list);
+  }
+  /** Real `focus()` dispatches a focus event, and the secret field relies on that to select. */
+  focus(): void {
+    for (const fn of this.#listeners.get("focus") ?? []) fn();
+  }
   select(): void {
     this.selected = true;
   }
@@ -260,7 +269,14 @@ export class ButtonComponent {
   setTooltip(): this {
     return this;
   }
+  /** Recorded so a destructive button can be asserted as one, whichever call marked it. */
+  destructive = false;
   setWarning(): this {
+    this.destructive = true;
+    return this;
+  }
+  setDestructive(): this {
+    this.destructive = true;
     return this;
   }
   setCta(): this {

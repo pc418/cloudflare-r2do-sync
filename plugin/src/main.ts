@@ -9,6 +9,7 @@ import {
   TFolder,
   requestUrl,
   setIcon,
+  type ButtonComponent,
   type Vault,
   type TAbstractFile,
 } from "obsidian";
@@ -2587,6 +2588,18 @@ function describePaths(paths: string[], noun: string): string {
   return `${head} (${shown.join(", ")}${rest > 0 ? `, +${rest} more` : ""})`;
 }
 
+/**
+ * Marks a button as the destructive choice. `setDestructive` arrived in Obsidian 1.13 and
+ * deprecates `setWarning`, but `minAppVersion` here is 1.5.0, so the older call has to stay
+ * reachable — hence a runtime check rather than a substitution. Returns the same component so
+ * it still composes into the `setButtonText(…).onClick(…)` chains it replaced.
+ */
+export function markDestructive(button: ButtonComponent): ButtonComponent {
+  const modern = button as ButtonComponent & { setDestructive?: () => ButtonComponent };
+  if (typeof modern.setDestructive === "function") return modern.setDestructive();
+  return button.setWarning();
+}
+
 function addReveal(setting: Setting, input: HTMLInputElement): void {
   setting.addExtraButton((b) =>
     b
@@ -2601,9 +2614,14 @@ function addReveal(setting: Setting, input: HTMLInputElement): void {
 }
 
 /**
- * A secret shown where it can be read and copied: selectable, and still there after the
- * clipboard is refused. A `Notice` cannot do this job — it floats over the page until it is
- * dismissed, cannot be selected on a phone, and is what ends up in a screenshot.
+ * A secret shown where it can be read and copied by hand. A `Notice` cannot do this job — it
+ * floats over the page until it is dismissed, cannot be selected on a phone, and is what ends
+ * up in a screenshot.
+ *
+ * This field is the *only* export route: the plugin does not touch `navigator.clipboard`, so
+ * it asks for no clipboard permission and cannot be refused one. Copying is the user's own
+ * action, in their own app, which is also the only version of this that behaves the same on
+ * desktop, on mobile, and under a permission prompt nobody read.
  */
 function secretField(parent: HTMLElement, value: string, label: string): HTMLTextAreaElement {
   // The class is what makes it legible: full width, monospace, and breaking mid-token. A
@@ -2614,19 +2632,13 @@ function secretField(parent: HTMLElement, value: string, label: string): HTMLTex
   field.readOnly = true;
   field.rows = 4;
   field.setAttr("aria-label", label);
-  return field;
-}
-
-/** Copies a secret, falling back to selecting it when the platform refuses the clipboard. */
-async function copySecret(value: string, field: HTMLTextAreaElement, label: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(value);
-    new Notice(`${label} copied`);
-  } catch (error) {
-    new Notice(`Could not copy the ${label.toLowerCase()}: ${message(error)}. Select it manually.`, 10_000);
-    field.focus();
+  // Select the whole thing on focus, because the alternative is dragging across 400
+  // unbroken characters on a phone. Nothing is copied here — this only spares the user the
+  // selection, leaving the copy itself to them.
+  field.addEventListener("focus", () => {
     field.select();
-  }
+  });
+  return field;
 }
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -2709,10 +2721,7 @@ class MassChangeModal extends Modal {
 
     new Setting(contentEl)
       .addButton((b) =>
-        b
-          .setButtonText("Apply remote")
-          .setWarning()
-          .onClick(() => this.#answer("apply-remote"))
+        markDestructive(b.setButtonText("Apply remote")).onClick(() => this.#answer("apply-remote"))
       )
       .addButton((b) =>
         b
@@ -2817,9 +2826,7 @@ class ContinuityModal extends Modal {
           .onClick(() => this.#answer("stop"));
       })
       .addButton((b) => {
-        b.setButtonText("Merge anyway")
-          .setWarning()
-          .onClick(() => this.#answer("continue"));
+        markDestructive(b.setButtonText("Merge anyway")).onClick(() => this.#answer("continue"));
       });
   }
 
@@ -3101,14 +3108,14 @@ export class HistoryModal extends Modal {
       .setDesc("Optional. Leave both empty for the most recent history.")
       .addText((t) => {
         t.inputEl.type = "date";
-        t.setPlaceholder("from");
+        t.setPlaceholder("From");
         t.onChange((value) => {
           this.#setRange("from", value);
         });
       })
       .addText((t) => {
         t.inputEl.type = "date";
-        t.setPlaceholder("to");
+        t.setPlaceholder("To");
         t.onChange((value) => {
           this.#setRange("to", value);
         });
@@ -3320,14 +3327,11 @@ export class SnapshotModal extends Modal {
           "edits this device has never synced would be lost."
       )
       .addButton((b) =>
-        b
-          .setButtonText("Restore all")
-          .setWarning()
-          .onClick(() => this.#confirmRestoreAll())
+        markDestructive(b.setButtonText("Restore all")).onClick(() => this.#confirmRestoreAll())
       );
 
     new Setting(contentEl).setName("Filter").addText((t) =>
-      t.setPlaceholder("path contains…").onChange((v) => {
+      t.setPlaceholder("Path contains…").onChange((v) => {
         this.#filter = v.trim().toLowerCase();
         this.#renderList();
       })
@@ -3563,35 +3567,32 @@ export class RestoreDestinationModal extends Modal {
           b.setButtonText("Replace current file").setDisabled(true);
           return;
         }
-        b
-          .setButtonText("Replace current file")
-          .setWarning()
-          .onClick(() => {
-            // Asked a second time because this is the one button here that destroys
-            // something: the copy path invents a new file, this one overwrites a note whose
-            // current contents may never have been synced anywhere. The window it sits in was
-            // raised by the restore, not chosen — so reaching it is not the same as meaning
-            // it. No typed phrase: this is one file, not the whole vault.
-            new ConfirmModal(this.app, {
-              title: "Replace the current file?",
-              body: [
-                `${this.opts.path} will be overwritten with the version from this snapshot. ` +
-                  "What is there now is replaced, not moved aside.",
-                unsyncedWarning(inspection.unsyncedEdits),
-              ],
-              confirmText: "Replace it",
-              cancelText: "Keep what is there",
-              onConfirm: async () => {
-                this.close();
-                // The version the paragraphs above described, not whatever is there by the
-                // time this write lands. The engine refuses the write if they differ.
-                await this.opts.onRestore({
-                  overwrite: true,
-                  expectedHash: inspection.currentHash,
-                });
-              },
-            }).open();
-          });
+        markDestructive(b.setButtonText("Replace current file")).onClick(() => {
+          // Asked a second time because this is the one button here that destroys
+          // something: the copy path invents a new file, this one overwrites a note whose
+          // current contents may never have been synced anywhere. The window it sits in was
+          // raised by the restore, not chosen — so reaching it is not the same as meaning
+          // it. No typed phrase: this is one file, not the whole vault.
+          new ConfirmModal(this.app, {
+            title: "Replace the current file?",
+            body: [
+              `${this.opts.path} will be overwritten with the version from this snapshot. ` +
+                "What is there now is replaced, not moved aside.",
+              unsyncedWarning(inspection.unsyncedEdits),
+            ],
+            confirmText: "Replace it",
+            cancelText: "Keep what is there",
+            onConfirm: async () => {
+              this.close();
+              // The version the paragraphs above described, not whatever is there by the
+              // time this write lands. The engine refuses the write if they differ.
+              await this.opts.onRestore({
+                overwrite: true,
+                expectedHash: inspection.currentHash,
+              });
+            },
+          }).open();
+        });
       })
       .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
   }
@@ -3912,8 +3913,7 @@ class ConfirmModal extends Modal {
     new Setting(contentEl)
       .addButton((b) => {
         confirm = b;
-        b.setButtonText(opts.confirmText ?? "Confirm")
-          .setWarning()
+        markDestructive(b.setButtonText(opts.confirmText ?? "Confirm"))
           .setDisabled(phrase !== undefined)
           .onClick(async () => {
             if (phrase !== undefined && typed !== phrase) return;
@@ -3961,14 +3961,9 @@ class BackupKeyModal extends Modal {
         "This key is the only way to recover encrypted snapshots. Save it in a password " +
         "manager now. Sync remains disabled until you confirm the backup.",
     });
-    const key = secretField(contentEl, this.opts.key, "Vault master key");
+    secretField(contentEl, this.opts.key, "Vault master key");
 
     new Setting(contentEl)
-      .addButton((button) =>
-        button
-          .setButtonText("Copy key")
-          .onClick(() => copySecret(this.opts.key, key, "Vault master key"))
-      )
       .addButton((button) =>
         button
           .setButtonText("I saved it")
@@ -4146,9 +4141,11 @@ export class DeviceSetupModal extends Modal {
           .setCta()
           .onClick(() => this.#render(out))
       )
-      // Returns the promise rather than discarding it: Obsidian ignores it, but a test that
-      // cannot await the copy can only assert on whatever happened to have settled by then.
-      .addButton((b) => b.setButtonText("Copy setup link").onClick(() => this.#copy(out)));
+      .addButton((b) => {
+        b.setButtonText("Show setup link").onClick(() => {
+          this.#showLink(out);
+        });
+      });
   }
 
   /**
@@ -4234,49 +4231,38 @@ export class DeviceSetupModal extends Modal {
     this.#linkField(out, uri);
   }
 
-  async #copy(out: HTMLElement): Promise<void> {
+  #showLink(out: HTMLElement): void {
     out.empty();
     const payload = this.#payload();
     if (payload === null) return;
 
     const uri = encodeSetupUri(payload);
     this.#warn(out, "link");
-    const field = this.#linkField(out, uri);
+    this.#linkField(out, uri);
     out.createEl("p", {
       text:
-        "On the other device: Settings → R2DO Sync → Apply a setup link → Paste link. " +
-        "Clear your clipboard afterwards.",
+        "Copy the link above, then on the other device: Settings → R2DO Sync → " +
+        "Apply a setup link, and paste it in. Clear your clipboard afterwards.",
     });
-    // The clipboard is a convenience over the field, not the only route: a platform that
-    // refuses it leaves the link on screen to select by hand.
-    await copySecret(uri, field, "Setup link");
   }
 
   /**
-   * The link itself, on screen and selectable, with a button for the ordinary case.
+   * The link itself, on screen and selectable, under a heading that says what it is.
    *
-   * A secret that only ever exists on the clipboard cannot be checked, cannot be read out,
-   * and is gone the moment anything else is copied.
+   * The row is placed before the box so the box is never an unlabelled mystery. There is no
+   * copy button: a secret that only ever exists on the clipboard cannot be checked, cannot be
+   * read out, and is gone the moment anything else is copied — and reaching for the clipboard
+   * API is what would make this plugin ask for a permission it does not need.
    */
-  /**
-   * The link, under a heading that says what it is.
-   *
-   * Order matters: the row is placed before the box so the box is never an unlabelled
-   * mystery, and the button is attached afterwards so the field it copies already exists.
-   */
-  #linkField(out: HTMLElement, uri: string): HTMLTextAreaElement {
-    const row = new Setting(out)
+  #linkField(out: HTMLElement, uri: string): void {
+    new Setting(out)
       .setName("Setup link")
       .setDesc(
         "The same thing the code carries, as text — for a device with no camera, or a scanner " +
-          "that opens the link in a browser instead of Obsidian. Paste it into the other " +
-          "device with \"Apply a setup link\"."
+          "that opens the link in a browser instead of Obsidian. Copy it and paste it into " +
+          "the other device with \"Apply a setup link\"."
       );
-    const field = secretField(out, uri, "Setup link");
-    row.addButton((b) =>
-      b.setButtonText("Copy link").onClick(() => void copySecret(uri, field, "Setup link"))
-    );
-    return field;
+    secretField(out, uri, "Setup link");
   }
 
   onClose(): void {
@@ -4374,15 +4360,13 @@ export class PasteSetupModal extends Modal {
     contentEl.createEl("h2", { text: "Apply a setup link" });
     contentEl.createEl("p", {
       text:
-        "On the configured device use \"Set up another device\" → \"Copy setup link\", then " +
-        "paste it here. It carries the server URL, the access token and the master key, so " +
-        "treat it like a password and clear your clipboard afterwards.",
+        "On the configured device use \"Set up another device\" → \"Show setup link\", copy " +
+        "what it shows, then paste it here. It carries the server URL, the access token and " +
+        "the master key, so treat it like a password and clear your clipboard afterwards.",
     });
 
     let text = "";
-    let field: HTMLTextAreaElement | null = null;
     new Setting(contentEl).setName("Setup link").addTextArea((t) => {
-      field = t.inputEl;
       t.setPlaceholder(`obsidian://${SETUP_ACTION}?d=…`).onChange((v) => {
         text = v;
       });
@@ -4406,23 +4390,9 @@ export class PasteSetupModal extends Modal {
     };
 
     new Setting(contentEl)
-      // The link is already on the clipboard — that is how it got to this device. Reading it
-      // here is one tap instead of a long-press paste into a field, which is the difference
-      // between routes on a phone, where this window is the main way in.
-      .addButton((b) =>
-        b.setButtonText("Paste from clipboard").onClick(async () => {
-          let read: string;
-          try {
-            read = await navigator.clipboard.readText();
-          } catch (e) {
-            fail(`Could not read the clipboard: ${message(e)}. Paste into the field instead.`);
-            return;
-          }
-          text = read;
-          if (field !== null) field.value = read;
-          advance();
-        })
-      )
+      // No "paste from clipboard" button: reading the clipboard is a permission this plugin
+      // otherwise never needs, and on the platforms where it is granted at all it is granted
+      // by a prompt that says nothing useful. The user pastes into the field themselves.
       .addButton((b) => b.setButtonText("Continue").setCta().onClick(advance))
       .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
   }
@@ -4631,9 +4601,9 @@ export class LogSyncSettingTab extends PluginSettingTab {
     join.appendText("On the device that already syncs, open ");
     join.createEl("strong", { text: "Settings → R2DO Sync → Set up another device" });
     join.appendText(
-      ". Scan the QR with this device's camera, or press \"Copy setup link\" there and paste " +
-        "it with the button above — that is the route for a second computer, which has " +
-        "nothing to scan with."
+      ". Scan the QR with this device's camera, or press \"Show setup link\" there, copy it, " +
+        "and paste it with the button above — that is the route for a second computer, which " +
+        "has nothing to scan with."
     );
 
     const first = containerEl.createEl("p");
@@ -4909,7 +4879,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
       .addText((t) => {
         const previous = this.plugin.settings.masterKey;
         t.inputEl.type = "password";
-        t.setPlaceholder("base64, 32 bytes");
+        t.setPlaceholder("Base64, 32 bytes");
         t.setValue(previous);
         addReveal(keySetting, t.inputEl);
 
@@ -4929,15 +4899,12 @@ export class LogSyncSettingTab extends PluginSettingTab {
         });
       })
       .addButton((b) =>
-        b
-          .setButtonText("Generate")
-          .setWarning()
-          .onClick(() => {
-            requestEncryptedTarget(
-              generateMasterKey(),
-              this.plugin.settings.vaultSalt || generateVaultSalt()
-            );
-          })
+        markDestructive(b.setButtonText("Generate")).onClick(() => {
+          requestEncryptedTarget(
+            generateMasterKey(),
+            this.plugin.settings.vaultSalt || generateVaultSalt()
+          );
+        })
       )
       .addButton((b) =>
         b.setButtonText("Set from passphrase").onClick(() =>
@@ -4969,7 +4936,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
         .setName("Turn off encryption")
         .setDesc("Transforms the complete remote snapshot to plaintext. This is not recommended.")
         .addButton((b) =>
-          b.setButtonText("Use plaintext").setWarning().onClick(() => {
+          markDestructive(b.setButtonText("Use plaintext")).onClick(() => {
             new ConfirmModal(this.app, {
               title: "Turn off encryption?",
               body:
@@ -5338,7 +5305,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
           "are kept as .conflict-… copies. Use it when this device is the one that is wrong."
       )
       .addButton((b) =>
-        b.setButtonText("Pull remote").setWarning().onClick(() => void this.plugin.forcePull())
+        markDestructive(b.setButtonText("Pull remote")).onClick(() => void this.plugin.forcePull())
       );
 
     new Setting(containerEl)
@@ -5349,7 +5316,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
           "stays in history. Use it when every other copy is the one that is wrong."
       )
       .addButton((b) =>
-        b.setButtonText("Push local").setWarning().onClick(() => void this.plugin.forcePush())
+        markDestructive(b.setButtonText("Push local")).onClick(() => void this.plugin.forcePush())
       );
 
     // Last, and warned about hardest: every other action on this page can be undone from
@@ -5364,7 +5331,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
           "24 hours."
       )
       .addButton((b) =>
-        b.setButtonText("Rebuild").setWarning().onClick(() => void this.plugin.rebuildHistory())
+        markDestructive(b.setButtonText("Rebuild")).onClick(() => void this.plugin.rebuildHistory())
       );
 
     this.#number(containerEl, {
@@ -5600,7 +5567,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
       )
       .addText((t) => {
         let stored = this.plugin.settings.logNoteFolder;
-        t.setPlaceholder("(vault root)");
+        t.setPlaceholder("(Vault root)");
         t.setValue(stored);
         this.#stage(t.inputEl, async () => {
           const next = t.inputEl.value.trim();

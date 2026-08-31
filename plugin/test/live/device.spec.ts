@@ -158,20 +158,30 @@ describe.skipIf(config === null)("This device", () => {
     expect(normalizeServerUrl(payload.url)).toBe(normalizeServerUrl(config!.url));
   });
 
-  it('Copy setup link parses back to this device\'s server/token/mode, and offers the field selected when the clipboard refuses', async () => {
+  it("Show setup link parses back to this device's server/token/mode without touching the clipboard", async () => {
     harness = await LiveHarness.start(config!);
     harness.render();
     harness.button("Set up another device").click();
-    // Deterministic failure rather than trusting Node's ambient (and version-dependent)
-    // `navigator.clipboard` to already be absent — the fallback path must be provably reached,
-    // not incidentally exercised.
+    // The plugin must not reach for the clipboard at all. The stub RECORDS rather than throws:
+    // the copy call this replaced sat in a try/catch, so a throw would be swallowed and this
+    // would pass with the permission quietly back.
+    const touched: string[] = [];
     vi.stubGlobal("navigator", {
       clipboard: {
-        writeText: () => Promise.reject(new Error("clipboard unavailable in this sandbox")),
+        writeText: () => {
+          touched.push("writeText");
+          return Promise.resolve();
+        },
+        readText: () => {
+          touched.push("readText");
+          return Promise.resolve("");
+        },
       },
     });
 
-    await harness.modalButton("Copy setup link").click();
+    harness.modalButton("Show setup link").click();
+
+    expect(touched).toEqual([]);
 
     const modal = harness.top();
     const field = modal.contentEl.byClass("r2do-secret").at(-1);
@@ -180,8 +190,8 @@ describe.skipIf(config === null)("This device", () => {
     expect(normalizeServerUrl(payload.url)).toBe(normalizeServerUrl(config!.url));
     expect(payload.token).toBe(config!.token);
     expect(payload.mode).toBe("plaintext"); // harness default; Group 3 covers encrypted mode
-    // The dead-end this test exists to catch: a clipboard failure that leaves the user with
-    // no way to get the secret out except retyping it by hand.
+    // The link has to be gettable without retyping it, so focusing the field selects it all.
+    field!.focus();
     expect(field!.selected).toBe(true);
   });
 
@@ -194,7 +204,7 @@ describe.skipIf(config === null)("This device", () => {
 
     // Build a real link the way a person would, on this same device.
     harness.button("Set up another device").click();
-    await harness.modalButton("Copy setup link").click();
+    harness.modalButton("Show setup link").click();
     const linkField = harness.top().contentEl.byClass("r2do-secret").at(-1);
     expect(linkField).toBeDefined();
     const uri = linkField!.value;
@@ -222,7 +232,7 @@ describe.skipIf(config === null)("This device", () => {
     // A distinct device name proves the payload's own value flowed through, not a leftover.
     harness.button("Set up another device").click();
     modalRow(harness.top(), "New device name").texts[0].change("second-device");
-    await harness.modalButton("Copy setup link").click();
+    harness.modalButton("Show setup link").click();
     const uri = harness.top().contentEl.byClass("r2do-secret").at(-1)!.value;
     harness.top().close();
 

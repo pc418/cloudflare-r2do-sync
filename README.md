@@ -141,8 +141,10 @@ plugin, which only ever sees a URL.
 ### Adding another device
 
 On the configured device, open **Set up another device**: **Show QR** for a phone (the code
-is an `obsidian://` link the camera opens directly) or **Copy setup link** for anything
-else, pasted into the new device with **Apply a setup link**. Nothing is typed by hand.
+is an `obsidian://` link the camera opens directly) or **Show setup link** for anything
+else. The link is shown as selectable text — copy it yourself and paste it into the new
+device with **Apply a setup link**. Nothing is typed by hand, and the plugin never reads or
+writes your clipboard, so it asks for no clipboard permission.
 
 **Do this before the new device's first sync.** URL and token typed in manually cannot join
 an encrypted vault — neither carries the master key — so the device halts and offers the

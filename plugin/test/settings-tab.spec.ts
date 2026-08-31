@@ -805,7 +805,7 @@ describe("settings tab rendering", () => {
     it("spells out where to click on the device that already syncs", () => {
       const said = render(FRESH).log.paragraphs.join(" ");
       expect(said).toContain("Settings → R2DO Sync → Set up another device");
-      expect(said).toContain("Copy setup link");
+      expect(said).toContain("Show setup link");
     });
 
     it("links to the instructions, for a user who installed the plugin and has no clone", () => {

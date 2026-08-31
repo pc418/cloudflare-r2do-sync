@@ -7,14 +7,16 @@ import { fromBase64, parseMasterKey, parseVaultSalt, toBase64 } from "./crypto";
  * the kind of manual step that produces silent misconfiguration, so the configured device
  * exports the whole payload as one `obsidian://` URI. A phone gets it as a QR code its own
  * camera app opens directly, which means no camera or QR-scanning code has to ship here; a
- * device that cannot scan — a second computer — gets the same URI copied to the clipboard.
+ * device that cannot scan — a second computer — gets the same URI as selectable text.
  *
  * The payload carries secrets — the access token and, on an encrypted vault, the master key.
- * It is built only at the user's explicit request and never sent to the server. It does leave
- * the app when copied: the system clipboard is storage outside Obsidian's control, and macOS
- * Universal Clipboard forwards it to the user's other Apple devices over iCloud. That is a
- * real off-device transmission of the master key, so the UI says what the link carries and
- * tells the user to clear their clipboard afterwards.
+ * It is built only at the user's explicit request and never sent to the server. **This code
+ * never touches the clipboard**: the link is shown, and copying it is the user's own action,
+ * so the plugin needs no clipboard permission and cannot be blamed for a copy it did not
+ * make. The warning still stands once they do copy it — the system clipboard is storage
+ * outside Obsidian's control, and macOS Universal Clipboard forwards it to the user's other
+ * Apple devices over iCloud, which is a real off-device transmission of the master key. So
+ * the UI says what the link carries and tells the user to clear their clipboard afterwards.
  */
 export const SETUP_ACTION = "r2do-sync-setup";
 

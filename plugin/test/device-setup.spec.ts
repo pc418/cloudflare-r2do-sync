@@ -62,25 +62,33 @@ function withSvgDocument(): void {
   });
 }
 
-/** Vitest's stub is used because `navigator` is a non-writable global in Node. */
-function withClipboard(impl: (text: string) => Promise<void>): string[] {
-  const written: string[] = [];
-  vi.stubGlobal("navigator", {
-    clipboard: {
-      async writeText(text: string) {
-        await impl(text);
-        written.push(text);
-      },
-    },
-  });
-  return written;
-}
-
 afterEach(() => {
   vi.unstubAllGlobals();
   Notice.shown.length = 0;
   Modal.shown.length = 0;
 });
+
+/**
+ * Stubs `navigator.clipboard` with methods that RECORD instead of throwing, and returns the
+ * log. Throwing would be the weaker guard: every clipboard call this code ever made sat in a
+ * try/catch, so a throw would be swallowed and the test would pass with the permission back.
+ */
+function touchRecorder(): string[] {
+  const touched: string[] = [];
+  vi.stubGlobal("navigator", {
+    clipboard: {
+      readText: () => {
+        touched.push("readText");
+        return Promise.resolve("");
+      },
+      writeText: () => {
+        touched.push("writeText");
+        return Promise.resolve();
+      },
+    },
+  });
+  return touched;
+}
 
 /** The buttons a window rendered, by label. */
 function buttonsOf(content: FakeElement) {
@@ -98,18 +106,17 @@ describe("DeviceSetupModal", () => {
   it("offers both exports, with the scannable one as the default", () => {
     const { button } = open();
     expect(button("Show QR").cta).toBe(true);
-    expect(button("Copy setup link").cta).toBe(false);
+    expect(button("Show setup link").cta).toBe(false);
   });
 
-  it("copies a link the paste side can actually parse", async () => {
-    const written = withClipboard(async () => {});
-    const { button } = open();
+  it("shows a link the paste side can actually parse", async () => {
+    const { content, button } = open();
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
-    expect(written).toHaveLength(1);
-    // The real acceptance test: the exact parser PasteSetupModal calls.
-    const payload = parseSetupText(written[0]);
+    // The real acceptance test: the exact parser PasteSetupModal calls, over what is on
+    // screen — which is the only place the link ever exists now.
+    const payload = parseSetupText(linkField(content)!.value);
     expect(payload).toEqual({
       v: 2,
       url: "https://vault.example.workers.dev",
@@ -122,31 +129,28 @@ describe("DeviceSetupModal", () => {
   });
 
   it("carries the plaintext vault's mode instead of a key it does not have", async () => {
-    const written = withClipboard(async () => {});
-    const { button } = open({ encryptionMode: "plaintext", masterKey: "", vaultSalt: "" });
+    const { content, button } = open({ encryptionMode: "plaintext", masterKey: "", vaultSalt: "" });
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
-    const payload = parseSetupText(written[0]);
+    const payload = parseSetupText(linkField(content)!.value);
     expect(payload.mode).toBe("plaintext");
     expect(payload).not.toHaveProperty("key");
   });
 
   it("names the new device from the field rather than this one", async () => {
-    const written = withClipboard(async () => {});
     const { content, button } = open();
     content.log.rows[0].texts[0].change("laptop");
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
-    expect(parseSetupText(written[0]).name).toBe("laptop");
+    expect(parseSetupText(linkField(content)!.value).name).toBe("laptop");
   });
 
-  it("says what the link carries before it is anywhere near a clipboard", async () => {
-    withClipboard(async () => {});
+  it("says what the link carries before the user copies it anywhere", async () => {
     const { content, button } = open();
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
     const warning = content.texts().find((t) => t.includes("Anyone who"));
     expect(warning).toContain("master key");
@@ -158,30 +162,38 @@ describe("DeviceSetupModal", () => {
     return content.children.flatMap((c) => [c, ...c.children]).find((c) => c.tag === "textarea");
   }
 
-  it("leaves the link selectable when the platform refuses the clipboard", async () => {
-    // A denied clipboard must not be a dead end: this link is the only route to a device
-    // that cannot scan the code, so there has to be something left to select by hand.
-    withClipboard(async () => {
-      throw new Error("denied");
-    });
+  it("hands the whole link over on focus, so it can be copied without dragging", async () => {
+    // The field is the only export route — nothing here touches the clipboard — and the link
+    // is ~400 unbroken characters, which is not a realistic hand-selection on a phone.
     const { content, button } = open();
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
     const field = linkField(content);
     expect(field?.value).toMatch(/^obsidian:\/\/r2do-sync-setup\?d=/);
     expect(field?.readOnly).toBe(true);
+    expect(field?.selected).toBe(false);
+    field!.focus();
     expect(field?.selected).toBe(true);
-    expect(Notice.shown.join(" ")).toContain("Select it manually");
   });
 
-  // The link only ever existed on the clipboard: nothing on screen, so it could not be read,
-  // checked or read out, and it was gone the moment anything else was copied.
-  it("shows the link itself, not just a promise that it was copied", async () => {
-    withClipboard(async () => {});
+  it("asks for no clipboard permission on the way", async () => {
+    // Regression guard for the whole point of this. It RECORDS calls rather than throwing on
+    // contact: the code this replaced wrapped its clipboard write in try/catch, so a stub that
+    // threw would be swallowed and this test would pass while the permission was quietly back.
+    const touched = touchRecorder();
     const { content, button } = open();
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
+
+    expect(touched).toEqual([]);
+    expect(linkField(content)?.value).toMatch(/^obsidian:\/\/r2do-sync-setup\?d=/);
+  });
+
+  it("shows the link itself, rather than a promise that it went somewhere", async () => {
+    const { content, button } = open();
+
+    await button("Show setup link").click();
 
     expect(linkField(content)?.value).toMatch(/^obsidian:\/\/r2do-sync-setup\?d=/);
     expect(linkField(content)?.readOnly).toBe(true);
@@ -191,10 +203,9 @@ describe("DeviceSetupModal", () => {
   // showing a dozen of them, so the first cut of this shipped as an unlabelled mystery field
   // that appeared to be empty — the opposite of "you can see the link now".
   it("renders the link legibly and says what it is", async () => {
-    withClipboard(async () => {});
     const { content, button } = open();
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
     const field = linkField(content);
     expect(field?.cls).toBe("r2do-secret");
@@ -202,7 +213,10 @@ describe("DeviceSetupModal", () => {
     // glitch, and this one holds the vault's master key.
     const row = content.log.settings.find((r) => r.name === "Setup link");
     expect(row?.desc).toContain("device with no camera");
-    expect(row?.controls).toContain("button");
+    // A label and an explanation, and no controls at all: the field below it is the whole
+    // mechanism now, so a button here could only be one that touches the clipboard.
+    expect(row?.controls).toEqual([]);
+    expect(row?.desc).toContain("Copy it");
   });
 
   // A QR is useless to a second computer, and a phone scanner that opens obsidian:// in a
@@ -222,27 +236,26 @@ describe("DeviceSetupModal", () => {
     expect(parseSetupText(shown!).mode).toBe("encrypted");
   });
 
-  it("copies from the shown field on request", async () => {
-    const written = withClipboard(async () => {});
+  it("offers no copy button beside the QR, only the field", async () => {
     withSvgDocument();
     const { content, button } = open();
     button("Show QR").click();
 
-    await buttonsOf(content)("Copy link").click();
-
-    expect(parseSetupText(written[0]).token).toBe("access-token");
+    expect(content.log.rows.flatMap((r) => r.buttons).map((b) => b.text)).not.toContain(
+      "Copy link"
+    );
+    expect(parseSetupText(linkField(content)!.value).token).toBe("access-token");
   });
 
   it.each([
     ["no server URL", { serverUrl: "" }, "Set the server URL"],
     ["no access token", { accessToken: "" }, "No token to share"],
   ])("refuses to export with %s, and says why", async (_label, over, said) => {
-    const written = withClipboard(async () => {});
-    const { button } = open(over);
+    const { content, button } = open(over);
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
-    expect(written).toEqual([]);
+    expect(linkField(content)).toBeUndefined();
     expect(Notice.shown.join(" ")).toContain(said);
   });
 
@@ -250,42 +263,39 @@ describe("DeviceSetupModal", () => {
   // this the acknowledgement is laundered by transit: the source exports a key it never
   // saved, and applySetup records it as backed up on the recipient.
   it("refuses to share a key whose backup gate is unfinished", async () => {
-    const written = withClipboard(async () => {});
-    const { button } = open({ masterKeyBackedUp: false });
+    const { content, button } = open({ masterKeyBackedUp: false });
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
-    expect(written).toEqual([]);
+    expect(linkField(content)).toBeUndefined();
     expect(Notice.shown.join(" ")).toContain("not a backup");
   });
 
   it("still shares a plaintext vault, which has no key to back up", async () => {
-    const written = withClipboard(async () => {});
-    const { button } = open({
+    const { content, button } = open({
       encryptionMode: "plaintext",
       masterKey: "",
       vaultSalt: "",
       masterKeyBackedUp: false,
     });
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
-    expect(written).toHaveLength(1);
+    expect(linkField(content)?.value).toMatch(/^obsidian:\/\/r2do-sync-setup\?d=/);
   });
 
   // Export used to check only that two strings were non-empty, so a link the parser rejects
-  // could be copied with a success notice — and the failure surfaced on the *other* device.
+  // could be shown as if it were usable — and the failure surfaced on the *other* device.
   it.each([
     ["an unset vault salt", { vaultSalt: "" }],
     ["a malformed master key", { masterKey: "not-a-key" }],
     ["a server URL that is not one", { serverUrl: "definitely not a url" }],
   ])("refuses to export with %s rather than promising a usable link", async (_label, over) => {
-    const written = withClipboard(async () => {});
-    const { button } = open(over);
+    const { content, button } = open(over);
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
-    expect(written).toEqual([]);
+    expect(linkField(content)).toBeUndefined();
     expect(Notice.shown.join(" ")).toContain("cannot produce a usable setup link");
   });
 
@@ -302,9 +312,8 @@ describe("DeviceSetupModal", () => {
   // An export left on screen after the fields changed describes a payload the page no longer
   // shows — and a QR is scanned by pointing a camera at it, long after any of this.
   it("discards a rendered export when the device name changes", async () => {
-    withClipboard(async () => {});
     const { content, button } = open();
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
     expect(content.texts().some((t) => t.includes("Anyone who"))).toBe(true);
 
     content.log.rows[0].texts[0].change("laptop");
@@ -313,9 +322,8 @@ describe("DeviceSetupModal", () => {
   });
 
   it("discards a rendered export when the token changes", async () => {
-    withClipboard(async () => {});
     const { content, button } = open();
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
     content.log.rows[1].texts[0].change("other-token");
 
@@ -323,13 +331,12 @@ describe("DeviceSetupModal", () => {
   });
 
   it("drops the token from memory when the window closes", async () => {
-    const written = withClipboard(async () => {});
-    const { modal, button } = open();
+    const { modal, content, button } = open();
     modal.onClose();
 
-    await button("Copy setup link").click();
+    await button("Show setup link").click();
 
-    expect(written).toEqual([]);
+    expect(linkField(content)).toBeUndefined();
     expect(Notice.shown.join(" ")).toContain("No token to share");
   });
 });
@@ -345,10 +352,7 @@ const PAYLOAD: SetupPayload = {
 };
 
 describe("PasteSetupModal", () => {
-  function open(clipboard?: () => Promise<string>) {
-    if (clipboard !== undefined) {
-      vi.stubGlobal("navigator", { clipboard: { readText: clipboard } });
-    }
+  function open() {
     const modal = new PasteSetupModal(new App() as never, fakePlugin() as never);
     modal.open();
     const content = modal.contentEl as unknown as FakeElement;
@@ -368,31 +372,38 @@ describe("PasteSetupModal", () => {
     expect(Modal.shown).toHaveLength(1); // still here — nothing was dismissed
   });
 
-  it("takes the link straight off the clipboard, which is how it got to this device", async () => {
-    const { button } = open(async () => encodeSetupUri(PAYLOAD));
+  it("applies a link the user pasted into the field themselves", () => {
+    const { button, field } = open();
+    field.change(encodeSetupUri(PAYLOAD));
 
-    await button("Paste from clipboard").click();
+    button("Continue").click();
 
     const applied = Modal.shown.at(-1);
     expect(applied).toBeInstanceOf(ApplySetupModal);
     expect((applied!.contentEl as unknown as FakeElement).texts().join(" ")).toContain(PAYLOAD.url);
   });
 
-  it("keeps the field usable when the platform refuses the clipboard", async () => {
-    const { content, button } = open(async () => {
-      throw new Error("denied");
-    });
+  it("offers no clipboard button and never reads the clipboard", () => {
+    // Records rather than throws, for the same reason as the export side: a swallowed throw
+    // would let a reintroduced clipboard read pass as clean.
+    const touched = touchRecorder();
+    const { content, button, field } = open();
 
-    await button("Paste from clipboard").click();
+    expect(content.log.rows.flatMap((r) => r.buttons).map((b) => b.text)).not.toContain(
+      "Paste from clipboard"
+    );
+    field.change(encodeSetupUri(PAYLOAD));
+    button("Continue").click();
 
-    expect(content.byClass("r2do-error")[0]?.text).toContain("Paste into the field instead");
-    expect(Modal.shown).toHaveLength(1);
+    expect(touched).toEqual([]);
+    expect(Modal.shown.at(-1)).toBeInstanceOf(ApplySetupModal);
   });
 
-  it("shows what it read when the clipboard held something else", async () => {
-    const { content, button, field } = open(async () => "a shopping list");
+  it("says so in place when the field holds something that is not a link", () => {
+    const { content, field, button } = open();
+    field.change("a shopping list");
 
-    await button("Paste from clipboard").click();
+    button("Continue").click();
 
     expect(field.getValue()).toBe("a shopping list");
     expect(content.byClass("r2do-error")[0]?.text).toContain("Cannot use that link");
