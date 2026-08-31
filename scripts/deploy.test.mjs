@@ -237,3 +237,53 @@ test("the timezone is uploaded as a binding the agent can read", () => {
   // nothing at all.
   assert.ok(source.indexOf("const timezone = resolveDeployZone(") < source.indexOf('name: "AGENT_TZ"'));
 });
+
+test("a redeploy retires the token pair it replaced, and nothing else", async () => {
+  const { supersededTokenIds } = await import("./deploy-agent.mjs");
+  // The ordinary redeploy: both recorded ids go, once the new ones are live.
+  assert.deepEqual(
+    supersededTokenIds({ READ_TOKEN_ID: "old-r", WRITE_TOKEN_ID: "old-w" }, ["new-r", "new-w"]),
+    ["old-r", "old-w"]
+  );
+  // A first deploy has nothing to retire.
+  assert.deepEqual(supersededTokenIds({}, ["new-r"]), []);
+  assert.deepEqual(supersededTokenIds({ READ_TOKEN_ID: "", WRITE_TOKEN_ID: "" }, ["new-r"]), []);
+  // A read-only redeploy over a writable one withdraws the write token: that IS the change.
+  assert.deepEqual(
+    supersededTokenIds({ READ_TOKEN_ID: "old-r", WRITE_TOKEN_ID: "old-w" }, ["new-r"]),
+    ["old-r", "old-w"]
+  );
+  // And it never revokes a credential this very run minted — that would be a deployment
+  // destroying its own agent.
+  assert.deepEqual(
+    supersededTokenIds({ READ_TOKEN_ID: "same", WRITE_TOKEN_ID: "old-w" }, ["same", "new-w"]),
+    ["old-w"]
+  );
+});
+
+test("a failed agent deploy leaves no vault credential behind", () => {
+  // P1 of the 2026-08-31 security review. These are permanent unexpiring credentials for the
+  // whole vault, minted before the upload, and a failure recorded no id anywhere — so a broken
+  // deploy used to leave a live token nothing could name afterwards.
+  const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
+  // Every mint is tracked, and the tracking is what the rollback iterates.
+  assert.match(source, /minted\.push\(tokenIdOf\(token\)\)/);
+  assert.match(source, /for \(const id of minted\)/);
+  // The guarded region starts at the first mint and ends no earlier than the health check.
+  const guard = source.indexOf("  try {");
+  assert.ok(guard < source.indexOf('log("minting a read-only vault token'), "mint must be inside the try");
+  assert.ok(source.indexOf("await waitForHealth(") < source.indexOf("  } catch (error) {"), "health check must be inside the try");
+});
+
+test("superseded tokens are revoked only after the new deployment is recorded and healthy", () => {
+  const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
+  // Revoking before /health would blind a working agent to save a failed deploy; revoking
+  // before the env file is written would risk losing the ids of the credentials now in use.
+  const health = source.indexOf("await waitForHealth(");
+  const record = source.indexOf("READ_TOKEN_ID: tokenIdOf(readToken)");
+  const retire = source.indexOf("const superseded = supersededTokenIds(");
+  assert.ok(health < record, "env file is written after the smoke test");
+  assert.ok(record < retire, "superseded tokens are retired after the new ids are on disk");
+  // A revocation that fails is reported by id, because nothing else can name it afterwards.
+  assert.match(source, /COULD NOT REVOKE/);
+});

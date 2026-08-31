@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   handleMcp,
   MAX_INSTRUCTION_CHARS,
+  MAX_REQUEST_BYTES,
   PREFERRED_VERSION,
   preamble,
   STATIC_INSTRUCTIONS,
@@ -246,5 +247,59 @@ describe("owner instructions from the vault", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { result: { instructions: string } };
     expect(body.result.instructions).toBe(preamble("UTC"));
+  });
+});
+
+describe("request bodies are bounded before they are parsed", () => {
+  // F2 of the 2026-08-31 security review. `request.json()` buffers whatever arrives, and
+  // Cloudflare accepts bodies far larger than the 128 MB isolate — so an authenticated caller
+  // could terminate the Worker rather than get an error it can act on.
+  const oversized = (): string => JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping", pad: "x".repeat(MAX_REQUEST_BYTES) });
+
+  it("refuses an oversized body with 413, without parsing it", async () => {
+    let called = false;
+    const res = await rpc(oversized(), { call: async () => { called = true; return "ok"; } });
+    expect(res.status).toBe(413);
+    const body = (await res.json()) as { error: { message: string } };
+    expect(body.error.message).toContain("larger than");
+    // Nothing downstream ran: the DO is never reached, which is the point of the cap.
+    expect(called).toBe(false);
+  });
+
+  // A chunked body carries no Content-Length, so a header check alone would let it through.
+  it("counts the stream, not the header", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const chunk = new TextEncoder().encode("x".repeat(64 * 1024));
+        for (let i = 0; i < 20; i++) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    const res = await handleMcp(
+      new Request("https://agent.test/mcp", { method: "POST", body: stream, duplex: "half" } as RequestInit),
+      { call: async () => "ok", writable: async () => false, instructions: async () => "", timezone: "UTC" }
+    );
+    expect(res.status).toBe(413);
+  });
+
+  // A lying header is still refused early — cheaply, before a byte is read.
+  it("refuses a body whose stated length is already over the cap", async () => {
+    const res = await handleMcp(
+      new Request("https://agent.test/mcp", {
+        method: "POST",
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+        headers: { "content-length": String(MAX_REQUEST_BYTES + 1) },
+      }),
+      { call: async () => "ok", writable: async () => false, instructions: async () => "", timezone: "UTC" }
+    );
+    expect(res.status).toBe(413);
+  });
+
+  it("still serves a body just under the cap", async () => {
+    // Same shape as the oversized one, a comfortable margin below the line.
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping", pad: "x".repeat(1000) });
+    const res = await rpc(body);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ result: {} });
   });
 });

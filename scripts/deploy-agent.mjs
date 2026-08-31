@@ -193,6 +193,18 @@ export function resolveDeployZone(named, machine = Intl.DateTimeFormat().resolve
   return zone;
 }
 
+/**
+ * The token ids a successful redeploy should retire: the pair this agent was using before.
+ *
+ * Filters out anything this run just minted, which is what makes a *first* deploy (no recorded
+ * ids) and a re-run that somehow re-recorded the same id both no-ops rather than a deployment
+ * that revokes its own live credentials. A read-only redeploy over a writable one retires the
+ * write token too — that is the capability actually being withdrawn.
+ */
+export function supersededTokenIds(agentEnv, minted) {
+  return [agentEnv.READ_TOKEN_ID, agentEnv.WRITE_TOKEN_ID].filter((id) => id && !minted.includes(id));
+}
+
 export async function deployAgent(opts) {
   const vault = opts.vault;
 
@@ -290,6 +302,27 @@ export async function deployAgent(opts) {
   }
 
   // --- mint the vault access tokens -------------------------------------------
+  //
+  // These are permanent, unexpiring credentials for the whole vault, so their lifetime is the
+  // deployment's, not the process's. Two rules, and both are about what is *live* afterwards:
+  //
+  //   - a run that fails after minting revokes what it minted, so a broken deploy leaves no
+  //     credential behind — least of all an untracked one, since the ids are only written to
+  //     .env.agent.<vault> at the very end;
+  //   - a run that succeeds revokes the pair it replaced, and only once the new deployment has
+  //     answered /health. Revoking earlier would blind a working agent to save a failed one.
+  const minted = [];
+  const tokenIdOf = (token) => token.tokenId ?? token.id ?? "";
+
+  const revoke = async (id) => {
+    const res = await fetch(`${SYNC_URL.replace(/\/$/, "")}/api/tokens/${id}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+    });
+    // 404 is success by any definition that matters: the credential is not live.
+    return res.status === 204 || res.status === 200 || res.status === 404;
+  };
+
   const mint = async (name, scopes) => {
     const res = await fetch(`${SYNC_URL.replace(/\/$/, "")}/api/tokens`, {
       method: "POST",
@@ -297,108 +330,136 @@ export async function deployAgent(opts) {
       body: JSON.stringify({ name, scopes }),
     });
     if (res.status !== 201) throw new Error(`minting "${name}" failed: ${res.status} ${await res.text()}`);
-    return res.json();
+    const token = await res.json();
+    minted.push(tokenIdOf(token));
+    return token;
   };
 
-  log("minting a read-only vault token...");
-  const readToken = await mint(`${scriptName}-read`, ["read"]);
+  // Everything from the first mint to a healthy /health is one unit: if any of it throws, the
+  // credentials this run created are revoked before the error is re-raised. Without that, a
+  // deploy that fails at upload leaves a live vault token whose id was never written anywhere.
+  let readToken;
   let writeToken = null;
-  if (opts.writable) {
-    // A SECOND token, not a widened one: read and write stay independently revocable, so a
-    // capture credential can be withdrawn without blinding the agent.
-    log("minting a separate sync-scoped token for writes...");
-    writeToken = await mint(`${scriptName}-write`, ["sync"]);
+  let bearer;
+  let url;
+  try {
+    log("minting a read-only vault token...");
+    readToken = await mint(`${scriptName}-read`, ["read"]);
+    // (declared above, so the catch below can revoke it)
+    if (opts.writable) {
+      // A SECOND token, not a widened one: read and write stay independently revocable, so a
+      // capture credential can be withdrawn without blinding the agent.
+      log("minting a separate sync-scoped token for writes...");
+      writeToken = await mint(`${scriptName}-write`, ["sync"]);
+    }
+
+    bearer =
+      opts.rotateBearer || !agentEnv.MCP_BEARER ? randomBytes(32).toString("hex") : agentEnv.MCP_BEARER;
+
+    // --- bundle ------------------------------------------------------------------
+    log("bundling agent...");
+    // esbuild's JS API through its resolved module path, never the `.bin` shim: that shim is a
+    // `.cmd` on Windows and unspawnable without a shell. Same rule the sync deploy follows.
+    const esbuild = await import(pathToFileURL(localBin(AGENT_DIR, "esbuild/lib/main.js")).href);
+    const bundle = await esbuild.build({
+      entryPoints: [path.join(AGENT_DIR, "src/index.ts")],
+      bundle: true,
+      format: "esm",
+      target: "es2022",
+      platform: "neutral",
+      minify: true,
+      write: false,
+      conditions: ["workerd", "worker", "browser"],
+      // Runtime-provided, never bundled: `cloudflare:workers` is where the DurableObject base
+      // class comes from and it exists only inside workerd.
+      external: ["cloudflare:*"],
+    });
+    const bundled = bundle.outputFiles[0].text;
+    log(`bundle: ${(Buffer.byteLength(bundled) / 1024).toFixed(1)} KiB`);
+
+    // --- upload -------------------------------------------------------------------
+    const metadataBase = {
+      main_module: "worker.js",
+      compatibility_date: "2026-08-03",
+      compatibility_flags: ["nodejs_compat"],
+      observability: { enabled: true, head_sampling_rate: 0.01 },
+      bindings: [
+        { type: "durable_object_namespace", name: "AGENT", class_name: "AgentState" },
+        { type: "secret_text", name: "VAULT_MASTER_KEY", text: masterKey },
+        { type: "secret_text", name: "SYNC_URL", text: SYNC_URL },
+        { type: "secret_text", name: "SYNC_TOKEN", text: readToken.accessToken ?? readToken.token },
+        { type: "secret_text", name: "MCP_BEARER", text: bearer },
+        { type: "plain_text", name: "AGENT_DEVICE", text: `agent (${scriptName})` },
+        // Every date the agent renders, and every day boundary a range resolves to.
+        { type: "plain_text", name: "AGENT_TZ", text: timezone },
+        // What the hard-skip set is computed from. A vault with a renamed Obsidian config folder
+        // must say so, or its historical credentials are neither hidden nor write-protected.
+        ...(process.env.VAULT_CONFIG_DIR
+          ? [{ type: "plain_text", name: "VAULT_CONFIG_DIR", text: process.env.VAULT_CONFIG_DIR }]
+          : []),
+        ...(writeToken === null
+          ? []
+          : [
+              {
+                type: "secret_text",
+                name: "SYNC_WRITE_TOKEN",
+                text: writeToken.accessToken ?? writeToken.token,
+              },
+            ]),
+      ],
+    };
+
+    const uploadScript = async (withMigrations) => {
+      const metadata = withMigrations
+        ? { ...metadataBase, migrations: { new_tag: "v1", new_sqlite_classes: ["AgentState"] } }
+        : metadataBase;
+      const form = new FormData();
+      form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+      form.append("worker.js", new Blob([bundled], { type: "application/javascript+module" }), "worker.js");
+      return cf(`/workers/scripts/${scriptName}`, { method: "PUT", body: form });
+    };
+
+    log("uploading script...");
+    let up = await uploadScript(true);
+    if (up.status !== 200 && JSON.stringify(up.body ?? "").includes("migration")) {
+      log("migration tag already applied, retrying without migrations...");
+      up = await uploadScript(false);
+    }
+    if (up.status !== 200) fail("upload", up);
+    log("script uploaded");
+
+    const sub = await cf(`/workers/subdomain`);
+    const subdomain = sub.body?.result?.subdomain;
+    if (!subdomain) fail("subdomain", sub);
+
+    const enable = await cf(`/workers/scripts/${scriptName}/subdomain`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: true, previews_enabled: false }),
+    });
+    if (enable.status !== 200) fail("enable-subdomain", enable);
+
+    url = `https://${scriptName}.${subdomain}.workers.dev`;
+    log(`smoke testing ${url}/health ...`);
+    await waitForHealth({ workerUrl: url });
+  } catch (error) {
+    // Rollback, and loud about its own failure: an id that could not be revoked is the one
+    // thing here an operator must act on by hand, and it is unrecoverable from any file.
+    const stuck = [];
+    for (const id of minted) {
+      if (id === "") continue;
+      const gone = await revoke(id).catch(() => false);
+      if (!gone) stuck.push(id);
+    }
+    if (minted.length > 0) {
+      log(
+        stuck.length === 0
+          ? `deploy failed — revoked the ${minted.length} token(s) this run created`
+          : `deploy failed — COULD NOT REVOKE: ${stuck.join(", ")} — revoke by hand`
+      );
+    }
+    throw error;
   }
-
-  const bearer =
-    opts.rotateBearer || !agentEnv.MCP_BEARER ? randomBytes(32).toString("hex") : agentEnv.MCP_BEARER;
-
-  // --- bundle ------------------------------------------------------------------
-  log("bundling agent...");
-  // esbuild's JS API through its resolved module path, never the `.bin` shim: that shim is a
-  // `.cmd` on Windows and unspawnable without a shell. Same rule the sync deploy follows.
-  const esbuild = await import(pathToFileURL(localBin(AGENT_DIR, "esbuild/lib/main.js")).href);
-  const bundle = await esbuild.build({
-    entryPoints: [path.join(AGENT_DIR, "src/index.ts")],
-    bundle: true,
-    format: "esm",
-    target: "es2022",
-    platform: "neutral",
-    minify: true,
-    write: false,
-    conditions: ["workerd", "worker", "browser"],
-    // Runtime-provided, never bundled: `cloudflare:workers` is where the DurableObject base
-    // class comes from and it exists only inside workerd.
-    external: ["cloudflare:*"],
-  });
-  const bundled = bundle.outputFiles[0].text;
-  log(`bundle: ${(Buffer.byteLength(bundled) / 1024).toFixed(1)} KiB`);
-
-  // --- upload -------------------------------------------------------------------
-  const metadataBase = {
-    main_module: "worker.js",
-    compatibility_date: "2026-08-03",
-    compatibility_flags: ["nodejs_compat"],
-    observability: { enabled: true, head_sampling_rate: 0.01 },
-    bindings: [
-      { type: "durable_object_namespace", name: "AGENT", class_name: "AgentState" },
-      { type: "secret_text", name: "VAULT_MASTER_KEY", text: masterKey },
-      { type: "secret_text", name: "SYNC_URL", text: SYNC_URL },
-      { type: "secret_text", name: "SYNC_TOKEN", text: readToken.accessToken ?? readToken.token },
-      { type: "secret_text", name: "MCP_BEARER", text: bearer },
-      { type: "plain_text", name: "AGENT_DEVICE", text: `agent (${scriptName})` },
-      // Every date the agent renders, and every day boundary a range resolves to.
-      { type: "plain_text", name: "AGENT_TZ", text: timezone },
-      // What the hard-skip set is computed from. A vault with a renamed Obsidian config folder
-      // must say so, or its historical credentials are neither hidden nor write-protected.
-      ...(process.env.VAULT_CONFIG_DIR
-        ? [{ type: "plain_text", name: "VAULT_CONFIG_DIR", text: process.env.VAULT_CONFIG_DIR }]
-        : []),
-      ...(writeToken === null
-        ? []
-        : [
-            {
-              type: "secret_text",
-              name: "SYNC_WRITE_TOKEN",
-              text: writeToken.accessToken ?? writeToken.token,
-            },
-          ]),
-    ],
-  };
-
-  const uploadScript = async (withMigrations) => {
-    const metadata = withMigrations
-      ? { ...metadataBase, migrations: { new_tag: "v1", new_sqlite_classes: ["AgentState"] } }
-      : metadataBase;
-    const form = new FormData();
-    form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-    form.append("worker.js", new Blob([bundled], { type: "application/javascript+module" }), "worker.js");
-    return cf(`/workers/scripts/${scriptName}`, { method: "PUT", body: form });
-  };
-
-  log("uploading script...");
-  let up = await uploadScript(true);
-  if (up.status !== 200 && JSON.stringify(up.body ?? "").includes("migration")) {
-    log("migration tag already applied, retrying without migrations...");
-    up = await uploadScript(false);
-  }
-  if (up.status !== 200) fail("upload", up);
-  log("script uploaded");
-
-  const sub = await cf(`/workers/subdomain`);
-  const subdomain = sub.body?.result?.subdomain;
-  if (!subdomain) fail("subdomain", sub);
-
-  const enable = await cf(`/workers/scripts/${scriptName}/subdomain`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ enabled: true, previews_enabled: false }),
-  });
-  if (enable.status !== 200) fail("enable-subdomain", enable);
-
-  const url = `https://${scriptName}.${subdomain}.workers.dev`;
-  log(`smoke testing ${url}/health ...`);
-  await waitForHealth({ workerUrl: url });
 
   upsertEnvFile(ROOT, {
     AGENT_URL: url,
@@ -408,11 +469,30 @@ export async function deployAgent(opts) {
     AGENT_SCRIPT: scriptName,
     MCP_BEARER: bearer,
     VAULT_NAME: vault,
-    READ_TOKEN_ID: readToken.tokenId ?? readToken.id ?? "",
-    WRITE_TOKEN_ID: writeToken === null ? "" : (writeToken.tokenId ?? writeToken.id ?? ""),
+    READ_TOKEN_ID: tokenIdOf(readToken),
+    WRITE_TOKEN_ID: writeToken === null ? "" : tokenIdOf(writeToken),
   }, agentEnvName);
 
-  return { url, agentEnvName, writable: opts.writable, scriptName, vault, keySource };
+  // --- retire the pair this deployment replaced --------------------------------
+  //
+  // Last, and deliberately: the new ids are already on disk, so a failure here costs a manual
+  // revocation rather than an agent nobody can find the credentials for. Before /health passed
+  // this would have been sabotage — the old token is what a working agent is still using.
+  const superseded = supersededTokenIds(agentEnv, minted);
+  const orphaned = [];
+  for (const id of superseded) {
+    const gone = await revoke(id).catch(() => false);
+    if (!gone) orphaned.push(id);
+  }
+  if (superseded.length > 0) {
+    log(
+      orphaned.length === 0
+        ? `revoked ${superseded.length} superseded vault token(s)`
+        : `COULD NOT REVOKE superseded token(s): ${orphaned.join(", ")} — revoke by hand`
+    );
+  }
+
+  return { url, agentEnvName, writable: opts.writable, scriptName, vault, keySource, orphaned };
 }
 
 const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

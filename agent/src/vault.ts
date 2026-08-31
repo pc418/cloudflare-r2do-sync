@@ -42,6 +42,24 @@ export const fetchHttp: HttpClient = async (url, req) => {
 export class VaultError extends Error {}
 
 /**
+ * The largest note this connector will materialise, in bytes.
+ *
+ * Not a product limit — a memory one. A note is buffered as ciphertext, decrypted, decoded to
+ * UTF-16 and split into lines, so the peak is several times the file, against a 128 MB isolate
+ * shared with everything else in flight. The sync service itself accepts blobs far larger.
+ *
+ * 2 MiB is generous for the surface it serves: one `read` can return at most 120,000 characters
+ * and 2,000 lines, so this is about how far a caller can *page*, not what it can see at once.
+ * Four times `MAX_FILE_BYTES`, the search scan's own per-file gate.
+ */
+export const MAX_READ_BYTES = 2 * 1024 * 1024;
+
+const mb = (bytes: number): string => `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+
+const tooLarge = (bytes: number): VaultError =>
+  new VaultError(`this note is ${mb(bytes)}; notes above ${mb(MAX_READ_BYTES)} are not served here`);
+
+/**
  * Reads one glob list out of the shared policy, failing closed.
  *
  * Absent is a real answer — an unset field means no rule. A field that is *present but not
@@ -279,13 +297,31 @@ export class VaultView {
     return this.#cached;
   }
 
-  /** The plaintext bytes of one entry. */
+  /**
+   * The plaintext bytes of one entry, refused above `MAX_READ_BYTES`.
+   *
+   * The cap is here rather than in `read`'s tool handler because every path that materialises a
+   * note comes through this one method — the tool, `AGENTS.md`, the search scan, the index
+   * build, and the read-modify-write behind `append`/`edit`. A bound on one caller is a bound
+   * on one caller.
+   *
+   * Checked **before** the fetch against the manifest's own `size`, which a v3 manifest
+   * authenticates, and **again** against the bytes that actually arrived — the second check is
+   * what a manifest understating its entry cannot get past. What it cannot undo is the memory
+   * already spent buffering an oversized *body*: `HttpClient` hands back a whole
+   * `ArrayBuffer`, so bounding that would mean a ranged or streamed read through the seam the
+   * plugin shares. The residual is a hostile *server*, which is not the threat this cap is
+   * about; the entry sizes are the vault's own.
+   */
   async read(entry: FileEntry): Promise<Uint8Array> {
+    if (entry.size > MAX_READ_BYTES) throw tooLarge(entry.size);
     const stored = await this.#api.getBlob(blobKey(entry));
     // `c` present means the vault is encrypted and `stored` is ciphertext. Its key is derived
     // from the expected plaintext hash, so a substituted blob fails the GCM tag rather than
     // returning content that is merely wrong.
-    return entry.c === undefined ? stored : this.#crypto.decryptBlob(entry.h, stored);
+    const plain = entry.c === undefined ? stored : await this.#crypto.decryptBlob(entry.h, stored);
+    if (plain.byteLength > MAX_READ_BYTES) throw tooLarge(plain.byteLength);
+    return plain;
   }
 
   /**

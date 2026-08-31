@@ -96,6 +96,57 @@ export const MAX_INSTRUCTION_CHARS = 8_000;
  */
 const MAX_RESULT_CHARS = 120_000;
 
+/**
+ * The largest request this endpoint will read, in bytes.
+ *
+ * `request.json()` buffers whatever arrives, and Cloudflare accepts bodies far larger than an
+ * isolate can hold — so an authenticated caller, or a client with a runaway argument, could
+ * terminate the Worker instead of receiving an error it can act on. 1 MiB is roughly eight
+ * times the largest result this server will *emit*, so nothing a tool call legitimately carries
+ * comes near it.
+ */
+export const MAX_REQUEST_BYTES = 1024 * 1024;
+
+/**
+ * The body as text, or `null` if it exceeds the cap.
+ *
+ * Streamed and counted rather than measured by `Content-Length`, because a chunked body carries
+ * no such header and a stated one is not evidence of what will arrive. The read is abandoned at
+ * the first chunk that crosses the line, so an oversized body is never fully held.
+ */
+async function readBounded(request: Request): Promise<string | null> {
+  const declared = Number(request.headers.get("content-length"));
+  // NaN when absent or unparsable, and NaN fails every comparison — which is the right
+  // outcome: an unstated length is decided by the streamed count below, not by this line.
+  if (declared > MAX_REQUEST_BYTES) return null;
+  if (request.body === null) return "";
+
+  // workers-types declares `Request.body` as `ReadableStream<any>`, so the chunks arrive
+  // untyped. The runtime hands back `Uint8Array` here; naming that is what keeps the byte
+  // arithmetic below honest rather than `any` arithmetic that lints clean by accident.
+  const reader = (request.body as ReadableStream<Uint8Array>).getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_REQUEST_BYTES) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+
+  const joined = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
+
 export async function handleMcp(request: Request, handlers: McpHandlers): Promise<Response> {
   // Both are optional in the spec, and the spec itself sanctions refusing them: this server
   // offers no server-initiated stream and holds no session to tear down.
@@ -103,9 +154,19 @@ export async function handleMcp(request: Request, handlers: McpHandlers): Promis
     return new Response("method not allowed", { status: 405, headers: { allow: "POST" } });
   }
 
+  const body = await readBounded(request);
+  if (body === null) {
+    return fail(
+      null,
+      INVALID_REQUEST,
+      `request body is larger than ${MAX_REQUEST_BYTES} bytes`,
+      413
+    );
+  }
+
   let message: unknown;
   try {
-    message = await request.json();
+    message = JSON.parse(body);
   } catch {
     return fail(null, PARSE_ERROR, "request body is not JSON", 400);
   }

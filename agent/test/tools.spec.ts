@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { SyncApi } from "../../plugin/src/api";
 import { callTool, lastWeekday, TOOLS, type ToolContext } from "../src/tools";
-import { fetchHttp, VaultView } from "../src/vault";
+import { fetchHttp, MAX_READ_BYTES, VaultView } from "../src/vault";
 import { PLUGIN_DIR } from "../../plugin/src/paths";
 import { INDEX_CHUNK, SearchIndex } from "../src/index-store";
 import {
@@ -1123,5 +1123,54 @@ describe("recent reports what matched, not what fitted", () => {
     expect(whole).toContain("3 note(s) modified in the last 7 day(s):");
     expect(whole).not.toContain("showing");
     expect(whole).not.toContain("more; raise");
+  });
+});
+
+describe("a note larger than the cap is refused before it is fetched", () => {
+  // F3 of the 2026-08-31 security review: `read` downloaded, decrypted, decoded and split the
+  // whole blob before any bound applied, so a note the sync service happily stores could
+  // exhaust the isolate even though the printed result is clamped.
+  const big = "x".repeat(MAX_READ_BYTES + 1024);
+
+  async function withNote(text: string) {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, { "Big.md": text, "Small.md": "small\n" });
+    const api = new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const view = new VaultView({ api, crypto });
+    const ctx: ToolContext = { view, writable: false, enqueue: async () => ({ head: "", summary: "" }) };
+    return { vault, view, ctx };
+  }
+
+  it("refuses without spending a single blob fetch", async () => {
+    const { vault, ctx } = await withNote(big);
+    await expect(callTool("read", { path: "Big.md" }, ctx)).rejects.toThrow(
+      /this note is 2\.0 MB; notes above 2\.0 MB are not served here/
+    );
+    // The whole point: the refusal costs nothing. A cap applied after the download would have
+    // already held the bytes it was meant to keep out.
+    expect(vault.requests.filter((r) => r.includes("/api/blobs/"))).toEqual([]);
+  });
+
+  it("still serves everything under the cap", async () => {
+    const { ctx } = await withNote("under\n");
+    expect(await callTool("read", { path: "Small.md" }, ctx)).toContain("small");
+  });
+
+  // The declared size is authenticated on a v3 manifest, but the bytes are what actually cost
+  // memory, so both are checked. A manifest understating its entry gets no further.
+  it("checks the bytes that arrive, not only the size the manifest claims", async () => {
+    const { view } = await withNote(big);
+    const { files } = await view.snapshot();
+    const understated = { ...files["Big.md"], size: 12 };
+    await expect(view.read(understated)).rejects.toThrow(/notes above 2\.0 MB are not served here/);
+  });
+
+  // One oversized note must not take the whole search down with it — the scan already treats an
+  // unreadable blob as a coverage gap, and this is one.
+  it("degrades a search rather than failing it", async () => {
+    const { ctx } = await withNote(big);
+    const out = await callTool("search", { query: "small" }, ctx);
+    expect(out).toContain("Small.md");
   });
 });
