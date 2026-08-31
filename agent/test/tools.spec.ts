@@ -173,14 +173,14 @@ describe("read tools", () => {
 
   it("says plainly when a search found nothing", async () => {
     const { ctx } = await context();
-    expect(await callTool("search", { query: "kombucha" }, ctx)).toContain("No matches");
+    expect(await callTool("search", { query: "kombucha" }, ctx)).toContain("No match in");
   });
 
   it("matches a regular expression only when asked, and stays case-insensitive", async () => {
     const { ctx } = await context();
     // A pattern that is meaningless as a substring: proof the mode is doing the work.
     const pattern = "gyokuro.*[0-9]+C";
-    expect(await callTool("search", { query: pattern }, ctx)).toContain("No matches");
+    expect(await callTool("search", { query: pattern }, ctx)).toContain("No match in");
     const out = await callTool("search", { query: pattern, regex: true }, ctx);
     expect(out).toContain("Projects/Tea.md:3");
   });
@@ -241,7 +241,7 @@ describe("read tools", () => {
   it("restricts a search to a folder", async () => {
     const { ctx } = await context();
     const out = await callTool("search", { query: "roadmap", folder: "Daily" }, ctx);
-    expect(out).toContain("No matches");
+    expect(out).toContain("No match in");
   });
 
   it("lists recent notes from metadata alone", async () => {
@@ -276,7 +276,7 @@ describe("credential-bearing paths are never exposed", () => {
     expect(listed).toContain("1 path(s) this vault never syncs are not listed");
 
     const searched = await callTool("search", { query: "SECRET-TOKEN" }, ctx);
-    expect(searched).toContain("No matches");
+    expect(searched).toContain("No match in");
 
     await expect(
       callTool("read", { path: ".obsidian/plugins/cloudflare-r2do-sync/data.json" }, ctx)
@@ -598,7 +598,7 @@ describe("the shared sync policy governs the agent too", () => {
     const listed = await callTool("list", {}, ctx);
     expect(listed).not.toContain("Credentials/keys.md");
     expect(listed).toContain("path(s) this vault never syncs are not listed");
-    expect(await callTool("search", { query: "hunter2" }, ctx)).toContain("No matches");
+    expect(await callTool("search", { query: "hunter2" }, ctx)).toContain("No match in");
     await expect(callTool("read", { path: "Credentials/keys.md" }, ctx)).rejects.toThrow(/no note at/);
   });
 
@@ -674,7 +674,7 @@ describe("the shared sync policy governs the agent too", () => {
     expect(vault.head).toBe(head); // nothing was committed
 
     expect(await callTool("list", {}, ctx)).not.toContain("Secrets/k.md");
-    expect(await callTool("search", { query: "TOPSECRET" }, ctx)).toContain("No matches");
+    expect(await callTool("search", { query: "TOPSECRET" }, ctx)).toContain("No match in");
     await expect(callTool("append", { path: "Secrets/k.md", text: "x" }, ctx)).rejects.toThrow(
       /outside what this vault syncs/
     );
@@ -792,13 +792,13 @@ describe("budgets and configuration", () => {
       }
     );
     // The index really was current — otherwise this test proves nothing about bypassing it.
-    // "every note" is the coverage claim only the index can make; the scan reports a count.
-    expect(indexed).toContain("searched every note");
+    // "all N searched" is the coverage claim only the index can make; the scan reports N/M.
+    expect(indexed).toMatch(/\(all \d+ searched/);
     expect(viaRegex).toContain("Tea.md:3");
-    expect(viaRegex).not.toContain("searched every note");
+    expect(viaRegex).not.toMatch(/\(all \d+ searched/);
     // The match is on line 3; "# Tea" is line 1, so it appears only once context is asked for.
     expect(indexed).not.toContain("# Tea");
-    expect(wide).toContain("searched every note");
+    expect(wide).toMatch(/\(all \d+ searched/);
     expect(wide).toContain("# Tea");
   });
 
@@ -860,7 +860,7 @@ describe("budgets and configuration", () => {
 
     const listed = await callTool("list", {}, ctx);
     expect(listed).not.toContain("data.json");
-    expect(await callTool("search", { query: "SECRET" }, ctx)).toContain("No matches");
+    expect(await callTool("search", { query: "SECRET" }, ctx)).toContain("No match in");
     await expect(
       callTool("append", { path: ".config/plugins/cloudflare-rdo-sync/data.json", text: "x" }, ctx)
     ).rejects.toThrow(/credential|never syncs|not a path|outside what/);

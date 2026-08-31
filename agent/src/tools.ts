@@ -196,7 +196,7 @@ export const TOOLS: ToolDescriptor[] = [
           type: "string",
           enum: ["path", "modified", "size"],
           description:
-            "Order (default \"path\"). Each key has one direction, as `ls` does it: path A-Z, modified newest first, size largest first. max_results keeps the top N of this order, not the first N by path.",
+            "Order (default \"path\"). Each key has one direction, as `ls` does it: path A-Z, modified newest first, size largest first. Keeps sorted first-N.",
         },
         modified_after: str(
           "Only notes modified at or after this ISO 8601 time, inclusive. A date alone is UTC midnight."
@@ -451,12 +451,10 @@ export async function callTool(
       if (result.hits.length === 0) {
         const where =
           result.source === "index"
-            ? `No matches in any of the ${result.scanned} note(s) — every note was searched.`
-            : `No matches in ${result.scanned} of ${result.candidates} note(s).${
-                result.more
-                  ? " Not every note was searched — narrow it with folder or glob, and treat this as no answer rather than no match."
-                  : ""
-              }`;
+            ? `No match in all ${result.scanned} searched.`
+            : `No match in ${result.scanned}/${result.candidates} searched${
+                result.more ? ", budget hit — no answer, not no match" : ""
+              }.`;
         return where;
       }
       const body = result.hits
@@ -464,10 +462,10 @@ export async function callTool(
         .join("\n\n");
       const note =
         result.source === "index"
-          ? `\n\n(searched every note${result.more ? "; more matches exist than were returned — raise max_results" : ""})`
+          ? `\n\n(all ${result.scanned} searched${result.more ? "; more matches than returned — raise max_results" : ""})`
           : result.more
-            ? `\n\n(searched ${result.scanned} of ${result.candidates} notes — there may be more; narrow with folder or glob)`
-            : `\n\n(searched ${result.scanned} notes)`;
+            ? `\n\n(${result.scanned}/${result.candidates} searched, budget hit)`
+            : `\n\n(${result.scanned} searched)`;
       return `${result.hits.length} match(es):\n\n${body}${note}`;
     }
 
