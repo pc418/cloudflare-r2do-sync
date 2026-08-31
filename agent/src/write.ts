@@ -85,28 +85,37 @@ function assertMaterializable(
   files: Record<string, FileEntry>,
   visible: Record<string, FileEntry>
 ): void {
-  const keys = new Set(Object.keys(files));
+  // Folded, because a snapshot has to materialize on the devices that will pull it, and the
+  // default filesystems on macOS and Windows are case-insensitive. A note `Projects` and a
+  // note `projects/Roadmap.md` are two distinct keys here and one impossible directory there.
+  const fold = (p: string): string => p.normalize("NFC").toLowerCase();
+  const byFolded = new Map<string, string>();
+  for (const key of Object.keys(files)) byFolded.set(fold(key), key);
+
   for (const path of touched) {
-    if (!keys.has(path)) continue; // introduced and then removed again by a later op
+    if (!Object.hasOwn(files, path)) continue; // introduced, then removed again by a later op
+    const folded = fold(path);
+
     // An ancestor of this path that is itself a note: `Notes` exists, and we wrote `Notes/a.md`.
-    for (let i = path.indexOf("/"); i !== -1; i = path.indexOf("/", i + 1)) {
-      const ancestor = path.slice(0, i);
-      if (keys.has(ancestor)) {
+    for (let i = folded.indexOf("/"); i !== -1; i = folded.indexOf("/", i + 1)) {
+      const ancestor = byFolded.get(folded.slice(0, i));
+      if (ancestor !== undefined) {
         throw new VaultError(
           `"${ancestor}" is a note, so "${path}" cannot live inside it. Pick another path.`
         );
       }
     }
+
     // Or this path is itself a folder someone still has files in.
-    const child = Object.keys(files).find((k) => k.startsWith(`${path}/`));
-    if (child !== undefined) {
+    for (const [otherFolded, other] of byFolded) {
+      if (!otherFolded.startsWith(`${folded}/`)) continue;
       // Naming the child is the helpful message, but `files` carries excluded entries the
       // agent may not read — and an exclude glob like `Credentials/**` does not match the bare
       // folder, so this refusal is reachable with a hidden child behind it. An error is a read
       // channel: name the child only when the agent could have listed it anyway.
       throw new VaultError(
-        Object.hasOwn(visible, child)
-          ? `"${path}" is a folder in this vault (it holds "${child}"), so it cannot also be a note. Pick another path.`
+        Object.hasOwn(visible, other)
+          ? `"${path}" is a folder in this vault (it holds "${other}"), so it cannot also be a note. Pick another path.`
           : `"${path}" is a folder in this vault, so it cannot also be a note. Pick another path.`
       );
     }
@@ -161,11 +170,14 @@ export class VaultWriter {
       // devices deliberately do not scan, so committing it would report success for a note that
       // never reaches anyone's disk.
       //
-      // Re-read **inside the loop**, against this attempt's snapshot. Hoisted above it, a batch
-      // that lost its first CAS while the settings document changed would keep applying a
-      // predicate the vault has since replaced — and go on to delete a path the vault had just
-      // excluded, which is exactly the content the exclude was added to protect.
-      const inScope = await this.#view.scope();
+      // The snapshot's OWN predicate, not a second `scope()` call. Two reads of the settings
+      // document are two policies: hoisted above the loop, a batch that lost its first CAS
+      // while the policy changed kept applying a predicate the vault had replaced; read
+      // separately inside the loop, a path hidden when `files` was built but permitted an
+      // instant later passed the gate while absent from the visible map — which reads as "this
+      // note does not exist" and replaced the carried content with nothing. One policy per
+      // attempt, and it is the one that built the map. It also saves a subrequest.
+      const inScope = snapshot.inScope;
       for (const path of ops.flatMap(opPaths)) {
         if (!inScope(path)) {
           throw new VaultError(

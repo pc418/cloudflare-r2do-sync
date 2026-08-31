@@ -97,3 +97,52 @@ describe("policy changing under a CAS retry", () => {
     expect(Object.keys(after.all)).toContain("Secret.md");
   });
 });
+
+const doc = (rev: number, plain: Record<string, unknown>) => ({
+  v: 1 as const, updatedAt: 1_754_000_000_000 + rev, device: "laptop", rev, plain,
+});
+
+describe("policy moving between the snapshot and the scope gate", () => {
+  it("never treats a carried-but-hidden note as absent and replaces it", async () => {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, { "Secret.md": "the original content\n" });
+    vault.settings = doc(1, { excludes: "Secret.md" });
+
+    // Flip the policy to ALLOW the path on the second settings read — i.e. between the
+    // snapshot that built `seen` and the scope() call that gates the write.
+    let reads = 0;
+    vault.before = async (path) => {
+      if (path === "/api/settings") {
+        reads++;
+        if (reads >= 2) vault.settings = doc(2, { excludes: "" });
+      }
+    };
+
+    const client = () => new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const view = new VaultView({ api: client(), writeApi: client(), crypto });
+    const writer = new VaultWriter({ view, device: "agent" });
+
+    await writer.apply([{ kind: "append", path: "Secret.md", text: "appended\n" }]).catch(() => null);
+
+    const after = await view.snapshot({ fresh: true });
+    const text = new TextDecoder().decode(await view.read(after.all["Secret.md"]));
+    // Either the write was refused, or it appended. It must never have replaced the note.
+    expect(text).toContain("the original content");
+  });
+});
+
+describe("case-only note/folder clash", () => {
+  it("refuses a path whose folder is an existing note in another case", async () => {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, { "Projects": "i am a note, not a folder\n" });
+    const client = () => new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const view = new VaultView({ api: client(), writeApi: client(), crypto });
+    const writer = new VaultWriter({ view, device: "agent" });
+
+    await expect(
+      writer.apply([{ kind: "write", path: "projects/Roadmap.md", content: "x\n" }])
+    ).rejects.toThrow();
+  });
+});

@@ -67,6 +67,16 @@ export interface Snapshot {
    * the search index's freshness check: `files` depends on the policy as much as on the head.
    */
   policy: string;
+  /**
+   * The exact predicate that produced `files`, carried so a caller gates on the same policy
+   * this snapshot was filtered with.
+   *
+   * A second `scope()` call is a second read of the settings document, and the vault can
+   * change between the two: a path hidden when `files` was built but permitted a moment later
+   * passes the gate while sitting absent from the visible map — which reads as "this note does
+   * not exist" and replaces carried content with nothing. One policy per attempt, or none.
+   */
+  inScope: (path: string) => boolean;
   /** In-scope paths: what the tools may see. */
   files: Record<string, FileEntry>;
   /**
@@ -265,7 +275,7 @@ export class VaultView {
       else hidden++;
     }
 
-    this.#cached = { head, policy: policy.fingerprint, files, all, hidden };
+    this.#cached = { head, policy: policy.fingerprint, inScope, files, all, hidden };
     return this.#cached;
   }
 
