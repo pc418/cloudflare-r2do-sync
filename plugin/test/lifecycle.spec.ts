@@ -410,6 +410,7 @@ describe("first-sync consent", () => {
     expect(Modal.shown).toHaveLength(1);
     expect(requestUrlMock.calls).toHaveLength(0);
   });
+
 });
 
 // --- setup application -----------------------------------------------------------------------
@@ -1951,9 +1952,13 @@ describe("applySetup called programmatically", () => {
     await plugin.onload();
     requestUrlMock.calls.length = 0;
 
-    // The shape the form produces: apply, then a sync in the same turn, with no click between.
-    await plugin.applySetup(PAYLOAD);
-    await plugin.syncNow();
+    // Genuinely concurrent, which the first version of this test was not: awaiting the join
+    // before syncing serialises the two and would pass even if the flags were only settled at
+    // the very end of `applySetup`. Here the sync is started while the join is still in
+    // flight, which is the shape a programmatic caller can actually produce.
+    const join = plugin.applySetup(PAYLOAD);
+    const sync = plugin.syncNow();
+    await Promise.all([join, sync]);
     await flush();
 
     // Whatever ran, it ran against the joined vault — never the previous credentials.

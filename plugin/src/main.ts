@@ -1285,7 +1285,7 @@ export default class LogSyncPlugin extends Plugin {
     return { proceed: true, pullOnly };
   }
 
-  async syncNow(): Promise<void> {
+  async syncNow(opts: { fromRewrite?: boolean } = {}): Promise<void> {
     if (!this.#scheduler) {
       new Notice("R2DO Sync: set the server URL and access token in settings first");
       return;
@@ -1295,7 +1295,12 @@ export default class LogSyncPlugin extends Plugin {
     // the scheduler's lane, so a pass started here would plan against files that are already
     // changing. Said in the vault's own terms — the alternative was internal state names on a
     // path a user reaches by pressing a button.
-    if (this.#vaultRewrite !== null) {
+    // `fromRewrite` is the rewrite publishing its own result — force pull calls this from
+    // *inside* `#withVaultRewrite` precisely to publish what it just wrote. Refusing that call
+    // is worse than the race the guard exists for: the window says "Publishing the result…"
+    // and nothing is published, leaving parked copies unshared until some unrelated later
+    // sync. Only a pass nobody asked for during a rewrite is refused.
+    if (this.#vaultRewrite !== null && opts.fromRewrite !== true) {
       new Notice(
         "R2DO Sync: this vault is being rewritten. Wait for that to finish, then sync again.",
         10_000
@@ -1600,7 +1605,7 @@ export default class LogSyncPlugin extends Plugin {
                 "Publishing the result…",
               8000
             );
-            await this.syncNow();
+            await this.syncNow({ fromRewrite: true });
           });
         } catch (e) {
           notice.hide();
@@ -1829,6 +1834,10 @@ export default class LogSyncPlugin extends Plugin {
       state: this.#state,
       shared: this.#sharedSettings,
       mismatch: this.#keyMismatch,
+      // `saveSettings` recomputes this from the URL and, when it changes, clears the state and
+      // re-arms the consent itself. Restoring the fields without it would leave the device
+      // believing it had moved endpoint.
+      stateServerUrl: this.#stateServerUrl,
     };
     try {
       await this.#applySetupFields(payload, opts);
@@ -1838,6 +1847,7 @@ export default class LogSyncPlugin extends Plugin {
       this.#state = before.state;
       this.#sharedSettings = before.shared;
       this.#keyMismatch = before.mismatch;
+      this.#stateServerUrl = before.stateServerUrl;
       // Best effort, and it is allowed to fail: the in-memory device is already back, and a
       // second failure here must not replace the original reason with a save error.
       try {
@@ -1931,7 +1941,12 @@ export default class LogSyncPlugin extends Plugin {
    * Stages an explicit encryption/key target. Encrypted targets first pass through the
    * backup gate; established vaults then transform the remote snapshot with one CAS.
    */
-  requestEncryptionTarget(mode: EncryptionMode, key: string, vaultSalt: string): void {
+  requestEncryptionTarget(
+    mode: EncryptionMode,
+    key: string,
+    vaultSalt: string,
+    opts: { minted?: boolean } = {}
+  ): void {
     const trimmedKey = key.trim();
     if (mode === "encrypted") {
       try {
@@ -1953,7 +1968,11 @@ export default class LogSyncPlugin extends Plugin {
       // order, because there the key must not become this device's until the CAS migration
       // that rewrites the remote actually completes — persisting first would point the device
       // at a vault its snapshots are not encrypted for.
-      const firstKey = !this.hasSyncedSnapshot && this.settings.masterKey.trim() === "";
+      // Stated by the caller, never inferred from device state. "No snapshot and no local
+      // key" also describes a device joining an encrypted vault whose head happens to be
+      // empty — and persisting a *replacement* key before its migration succeeds would adopt
+      // this device onto a different key the moment the backup window is closed.
+      const firstKey = opts.minted === true && this.settings.masterKey.trim() === "";
       if (firstKey) {
         this.#backupModalOpen = true;
         void this.#applyEncryptionTarget({ mode, key: trimmedKey, backedUp: false, vaultSalt })
@@ -4939,10 +4958,15 @@ export class LogSyncSettingTab extends PluginSettingTab {
     // Everything that can refuse happens here, before a single setting is written.
     let payload: SetupPayload;
     let minted: boolean;
+    let enteredKey: string;
     try {
+      // Captured once, before the await. `proveMasterKey` decrypts, and the field stays
+      // editable while it does — re-reading `draft.key` afterwards would persist a value that
+      // never opened the manifest, which is the exact failure the proof exists to prevent.
+      enteredKey = draft.key.trim();
       if (probe.kind === "encrypted") {
         if (probe.manifest === null) throw new Error("no snapshot to check the key against");
-        await proveMasterKey(probe.manifest, draft.key.trim());
+        await proveMasterKey(probe.manifest, enteredKey);
       }
       // The mint for an empty vault happens here, after the server said the vault is empty —
       // a choice made on a screen that said so, never a silent side effect of typing a URL.
@@ -4952,7 +4976,7 @@ export class LogSyncSettingTab extends PluginSettingTab {
         token: probe.token,
         name,
         kind: probe.kind,
-        key: minted ? generateMasterKey() : draft.key.trim(),
+        key: minted ? generateMasterKey() : enteredKey,
         publishedSalt: probe.vaultSalt,
         provisionalSalt: this.plugin.settings.vaultSalt || generateVaultSalt(),
       });
@@ -5172,8 +5196,8 @@ export class LogSyncSettingTab extends PluginSettingTab {
         "recommended; a passphrase-derived key is available when memory recovery matters.",
     });
 
-    const requestEncryptedTarget = (key: string, vaultSalt: string) => {
-      const run = () => this.plugin.requestEncryptionTarget("encrypted", key, vaultSalt);
+    const requestEncryptedTarget = (key: string, vaultSalt: string, minted = false) => {
+      const run = () => this.plugin.requestEncryptionTarget("encrypted", key, vaultSalt, { minted });
       const changesActive =
         this.plugin.hasSyncedSnapshot &&
         (!this.plugin.encryptionEnabled || key.trim() !== this.plugin.settings.masterKey.trim());
@@ -5254,9 +5278,12 @@ export class LogSyncSettingTab extends PluginSettingTab {
       })
       .addButton((b) =>
         markDestructive(b.setButtonText("Generate")).onClick(() => {
+          // The one call site that creates a key from nothing, and so the only one entitled to
+          // the persist-then-prompt order.
           requestEncryptedTarget(
             generateMasterKey(),
-            this.plugin.settings.vaultSalt || generateVaultSalt()
+            this.plugin.settings.vaultSalt || generateVaultSalt(),
+            true
           );
         })
       )
