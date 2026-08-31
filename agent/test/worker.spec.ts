@@ -18,7 +18,9 @@ describe("the agent Worker's edge", () => {
     const res = await SELF.fetch("https://agent.test/health");
     expect(res.status).toBe(200);
     const body = await res.json<{ ok: boolean; service: string }>();
-    expect(body).toEqual({ ok: true, service: "obsidian-vault-agent" });
+    // Bare, on purpose: this endpoint is unauthenticated, and naming the service confirmed
+    // to anyone who found the hostname that it fronts a vault master key.
+    expect(body).toEqual({ ok: true });
     expect(JSON.stringify(body)).not.toContain(BEARER);
   });
 

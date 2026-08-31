@@ -34,10 +34,15 @@ export default {
   async fetch(request: Request, env: AgentEnv): Promise<Response> {
     const url = new URL(request.url);
 
-    // Unauthenticated, and deliberately says nothing about the vault: it exists so a deploy
-    // can be smoke-tested the same way the sync Worker's is.
+    // Unauthenticated, and deliberately says nothing at all: it exists so a deploy can be
+    // smoke-tested the same way the sync Worker's is, and nothing more.
+    //
+    // It used to answer `service: "obsidian-vault-agent"`, which confirmed for anyone who
+    // found the hostname that they had found the endpoint fronting a vault master key. The
+    // smoke test only ever read `ok`, so the string bought nothing and told a scanner
+    // everything. The script name carries a random suffix for the same reason.
     if (url.pathname === "/health") {
-      return Response.json({ ok: true, service: "obsidian-vault-agent" });
+      return Response.json({ ok: true });
     }
 
     if (url.pathname !== "/mcp" && url.pathname !== "/admin/index") {

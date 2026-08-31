@@ -94,3 +94,56 @@ test("importing deploy-agent.mjs does not deploy anything", async () => {
   assert.doesNotMatch(source, /^main\(\)\.catch/m);
   assert.match(source, /const invokedDirectly = process\.argv\[1\]/);
 });
+
+test("a new agent deployment gets an unguessable script name", async () => {
+  // The account subdomain is public — every setup link names it — so a fixed <vault>-agent is
+  // one guess away for anyone who has seen a sync URL, and that hostname fronts the master key.
+  const { randomAgentScriptName } = await import("./deploy-agent.mjs");
+  const name = randomAgentScriptName("my-vault");
+  assert.match(name, /^my-vault-agent-[a-z2-7]{8}$/);
+  // Legal as a Worker name: lowercase alphanumerics and hyphens only.
+  assert.match(name, /^[a-z0-9-]+$/);
+  // The readable prefix is kept on purpose: obscurity buys nothing against someone who can
+  // list the account's Workers, and "which Worker holds a master key" must stay answerable.
+  assert.ok(name.startsWith("my-vault-agent-"));
+});
+
+test("the random suffix actually varies, and uses the full 40 bits", async () => {
+  const { randomAgentScriptName } = await import("./deploy-agent.mjs");
+  const seen = new Set();
+  for (let i = 0; i < 200; i++) seen.add(randomAgentScriptName("v"));
+  assert.ok(seen.size > 190, `expected near-unique names, got ${seen.size}/200`);
+
+  // 5 bytes in, 8 base32 characters out, with no byte silently dropped: an off-by-one in the
+  // bit loop would still "look random" while throwing away entropy.
+  const all = randomAgentScriptName("v", () => Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff]));
+  assert.equal(all, "v-agent-77777777");
+  const none = randomAgentScriptName("v", () => Buffer.from([0, 0, 0, 0, 0]));
+  assert.equal(none, "v-agent-aaaaaaaa");
+});
+
+test("an existing agent deployment never gets a fresh random name", () => {
+  // A redeploy that renamed itself would upload a SECOND Worker beside the live one and leave
+  // the old script running, still holding the master key, with nothing pointing at it.
+  const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
+  // Recorded name wins over generation, and a pre-suffix deployment falls back to its legacy
+  // name rather than generating one.
+  assert.match(source, /agentEnv\.AGENT_SCRIPT \?\?/);
+  assert.match(source, /agentEnv\.AGENT_URL \? `\$\{vault\}-agent` : randomAgentScriptName\(vault\)/);
+  // And the chosen name is persisted, or the next run would generate again.
+  assert.match(source, /AGENT_SCRIPT: scriptName/);
+
+  // The env file has to be read before the name is chosen, or the recorded name cannot win.
+  const read = source.indexOf("const agentEnv = existsSync(");
+  const choose = source.indexOf("const scriptName =");
+  assert.ok(read > 0 && choose > 0, "expected both");
+  assert.ok(read < choose, "the recorded name must be read before the name is chosen");
+});
+
+test("the agent health endpoint does not identify itself", () => {
+  // Unauthenticated. Naming the service confirmed to anyone who found the hostname that they
+  // had found the endpoint fronting a vault master key; the smoke test only reads `ok`.
+  const source = readFileSync(fileURLToPath(new URL("../agent/src/index.ts", import.meta.url)), "utf8");
+  assert.match(source, /pathname === "\/health"/);
+  assert.doesNotMatch(source, /Response\.json\(\{ ok: true, service:/);
+});

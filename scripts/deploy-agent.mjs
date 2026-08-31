@@ -22,12 +22,50 @@ import { loadEnvFile, localBin, upsertEnvFile, waitForHealth } from "./setup-lib
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const AGENT_DIR = path.join(ROOT, "agent");
 
+/** Lowercase RFC-4648 base32. 5 bytes → exactly 8 characters, all legal in a Worker name. */
+const B32 = "abcdefghijklmnopqrstuvwxyz234567";
+
+/**
+ * A default agent script name that cannot be guessed from the vault's.
+ *
+ * The account subdomain is effectively public — every setup link and the sync URL itself name
+ * it — so a fixed `<vault>-agent` is one guess away for anyone who has seen a sync URL, and
+ * this is the endpoint fronting the vault master key. workers.dev sits behind a wildcard
+ * certificate, so script names do not leak through Certificate Transparency either; the
+ * hostname really is the only thing to guess.
+ *
+ * The **prefix stays** deliberately. Obscurity does nothing against an adversary who can
+ * enumerate the account's Workers, because that adversary already owns the account — so the
+ * readable prefix costs nothing against the real threat, while "which Worker holds a master
+ * key" stays answerable at a glance in the dashboard.
+ *
+ * This is a layer on top of `MCP_BEARER`, never a replacement for it. The sync Worker keeps a
+ * guessable name on purpose: it holds no key and fronts its own auth.
+ */
+export function randomAgentScriptName(vault, randomBytesImpl = randomBytes) {
+  const bytes = randomBytesImpl(5);
+  let bits = 0;
+  let value = 0;
+  let out = "";
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += B32[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  return `${vault}-agent-${out}`;
+}
+
 const USAGE = `usage: node scripts/deploy-agent.mjs --vault <name> [--writable] [--rotate-bearer]
 
   --vault <name>     the vault this agent reads, deployed with setup.mjs --vault <name>
   --writable         also mint a sync-scoped token, enabling append/edit/write
   --rotate-bearer    issue a new MCP bearer even if one is already recorded
-  --name <script>    agent Worker name (default: <vault>-agent)
+  --name <script>    agent Worker name
+                     (default: <vault>-agent-<8 random chars>, generated once and recorded
+                      in .env.agent.<vault>; an existing deployment keeps its name)
 
 The agent is a SEPARATE Worker holding the vault master key. Deploying it against a vault
 whose own credentials are not in .env.<vault> is refused.`;
@@ -83,14 +121,29 @@ Register this workers.dev URL exactly — a redirect to another host drops the h
 Auth settings are immutable once the connector exists; rotating the bearer
 (--rotate-bearer) means removing and re-adding it.
 
-Health check: curl ${url}/health  →  {"ok":true,...}
+Health check: curl ${url}/health  →  {"ok":true}
 An unauthenticated GET ${url}/mcp answers 401, not 405: the bearer is checked before
 the method, so 401 there is the correct answer to an anonymous probe, not a broken deploy.`;
 }
 
 export async function deployAgent(opts) {
   const vault = opts.vault;
-  const scriptName = opts.name ?? `${vault}-agent`;
+
+  // Read before the name is chosen: the name is generated once and then persisted, the way
+  // MCP_BEARER is, so every redeploy lands on the same script rather than scattering a new
+  // random Worker across the account each time.
+  const agentEnvName = `.env.agent.${vault}`;
+  const agentEnv = existsSync(path.join(ROOT, agentEnvName)) ? loadEnvFile(ROOT, agentEnvName) : {};
+
+  // Order matters. An explicit --name wins; then the recorded name; then, for a deployment
+  // made before names were randomised, the legacy `<vault>-agent` implied by a recorded URL —
+  // without that fallback a redeploy of an existing agent would generate a fresh name and
+  // stand up a SECOND Worker beside the live one, leaving the old one running with the key.
+  // Only a genuinely new deployment gets a random suffix.
+  const scriptName =
+    opts.name ??
+    agentEnv.AGENT_SCRIPT ??
+    (agentEnv.AGENT_URL ? `${vault}-agent` : randomAgentScriptName(vault));
 
   // --- credentials -----------------------------------------------------------
   const base = loadEnvFile(ROOT);
@@ -147,8 +200,6 @@ export async function deployAgent(opts) {
   // --- refuse to upload over an unrelated Worker ------------------------------
   // The upload is a PUT: against a name somebody else owns it would replace that Worker's
   // code and bindings. A recorded URL from a previous deploy is proof this name is ours.
-  const agentEnvName = `.env.agent.${vault}`;
-  const agentEnv = existsSync(path.join(ROOT, agentEnvName)) ? loadEnvFile(ROOT, agentEnvName) : {};
   if (!agentEnv.AGENT_URL) {
     const existing = await cf(`/workers/scripts/${scriptName}/settings`);
     if (existing.status === 200) {
@@ -271,6 +322,10 @@ export async function deployAgent(opts) {
 
   upsertEnvFile(ROOT, {
     AGENT_URL: url,
+    // Recorded so redeploys reuse it. Renaming later is not an edit: it is a second Worker,
+    // with its own empty Durable Object and a new connector URL, and the old script has to be
+    // deleted by hand.
+    AGENT_SCRIPT: scriptName,
     MCP_BEARER: bearer,
     VAULT_NAME: vault,
     READ_TOKEN_ID: readToken.tokenId ?? readToken.id ?? "",

@@ -375,14 +375,15 @@ if (invokedDirectly) {
     // The agent reads its vault's identity from `.env.<name>` alone, which production does not
     // have: production is `.env`. That is not a gap to paper over. Standing an agent over
     // production means handing the production master key to a Worker secret, and the ordered
-    // precondition for that — getting a credentials folder out of the synced set — is an owner action
-    // that is still open. So this refuses rather than inventing a path to it.
+    // precondition for that — getting the vault's credential-bearing folders out of the synced
+    // set — is an owner action that is still open. So this refuses rather than inventing a
+    // path to it.
     if (withAgent && deploymentName === null) {
       throw new Error(
         "--agent needs --vault <name>: the agent reads .env.<name>, and production keeps its\n" +
           "identity in .env. Deploying an agent over production would put the production master\n" +
-          "key into a Worker secret, whose precondition (a credentials folder out of the synced set) is an\n" +
-          "open owner action. Nothing was deployed."
+          "key into a Worker secret, and the precondition for that — getting credential-bearing\n" +
+          "folders out of the synced set — is an open owner action. Nothing was deployed."
       );
     }
 

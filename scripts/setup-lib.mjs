@@ -569,7 +569,10 @@ export function renderRestDeployCheck({
     ...(withAgent
       ? [
           "",
-          `  PLUS AN AGENT WORKER: ${scriptName}-agent  (--agent)`,
+          "  PLUS AN AGENT WORKER  (--agent)",
+          `  Named ${scriptName}-agent-<8 random chars> on a first deploy, and recorded —
+  the suffix is there because this hostname fronts the master key and the account
+  subdomain is public. An existing agent keeps the name it already has.`,
           "  It is handed this vault's MASTER KEY as a Worker secret — the one secret the sync",
           "  Worker never sees — and serves what it decrypts to whoever holds its MCP bearer.",
           agentWritable

@@ -298,7 +298,7 @@ describe("the shared sync policy governs the agent too", () => {
     return { vault, view, writer, ctx };
   }
 
-  // The vault's excludes are what keep a credentials folder — real credentials — off synced devices.
+  // The vault's excludes are what keep a credentials folder — real secrets — off synced devices.
   // Excluded paths are CARRIED in snapshots, so without this the agent reads them straight out
   // of the path map and hands them to whatever the model was asked to summarise.
   it("hides user-excluded paths from list, read and search", async () => {

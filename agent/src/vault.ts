@@ -148,7 +148,7 @@ export class VaultView {
    * The vault's own scope rules, from the shared settings document.
    *
    * This is not decoration. `alwaysSkip` covers plugin state and config; it says nothing about
-   * the *user's* excludes, and this vault's excludes are what keep a credentials folder — real API keys
+   * the *user's* excludes, and this vault's excludes are what keep a credentials folder — real keys
    * and credentials — out of what devices sync. Excluded paths are carried in snapshots
    * forever, so without this the agent would read them out of the path map and hand them to
    * whatever the model was asked to summarise.
