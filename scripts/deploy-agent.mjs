@@ -121,6 +121,10 @@ Register this workers.dev URL exactly — a redirect to another host drops the h
 Auth settings are immutable once the connector exists; rotating the bearer
 (--rotate-bearer) means removing and re-adding it.
 
+Standing instructions: put a note called AGENT.md at the vault root and the agent serves it
+as context at the start of every conversation. It is read through this vault's own exclude
+policy, and it is advice to the model, never configuration.
+
 Health check: curl ${url}/health  →  {"ok":true}
 An unauthenticated GET ${url}/mcp answers 401, not 405: the bearer is checked before
 the method, so 401 there is the correct answer to an anonymous probe, not a broken deploy.`;

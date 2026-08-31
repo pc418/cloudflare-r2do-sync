@@ -298,6 +298,27 @@ describe("the shared sync policy governs the agent too", () => {
     return { vault, view, writer, ctx };
   }
 
+  // The standing-instructions note is read through the same scoped snapshot as everything
+  // else, which is the whole reason it is not a second read path: an AGENT.md the vault
+  // excludes must be invisible to the agent exactly as any other excluded note is. Asserted at
+  // the snapshot, not through a tool, because the tool layer is not what enforces it.
+  it("hides an excluded AGENT.md from the instructions the agent would serve", async () => {
+    const { view } = await withPolicy(
+      { excludes: "AGENT.md" },
+      { "Welcome.md": "hello\n", "AGENT.md": "read Inbox.md first\n" }
+    );
+    const snapshot = await view.snapshot();
+    // Carried in the snapshot, as every excluded path is — and absent from what may be read.
+    expect(Object.keys(snapshot.all)).toContain("AGENT.md");
+    expect(Object.keys(snapshot.files)).not.toContain("AGENT.md");
+  });
+
+  it("serves an AGENT.md the policy allows", async () => {
+    const { view } = await withPolicy({}, { "AGENT.md": "read Inbox.md first\n" });
+    const snapshot = await view.snapshot();
+    expect(Object.keys(snapshot.files)).toContain("AGENT.md");
+  });
+
   // The vault's excludes are what keep a credentials folder — real secrets — off synced devices.
   // Excluded paths are CARRIED in snapshots, so without this the agent reads them straight out
   // of the path map and hands them to whatever the model was asked to summarise.

@@ -57,7 +57,25 @@ export interface McpHandlers {
   call: (name: string, args: Record<string, unknown>) => Promise<string>;
   /** Whether this deployment advertises the write tools. */
   writable: () => Promise<boolean>;
+  /**
+   * The owner's standing instructions from the vault, appended to the static preamble.
+   *
+   * Returns "" when there are none. It must not reject — see `initialize`.
+   */
+  instructions: () => Promise<string>;
 }
+
+/** What every client is told, before anything the vault has to say. */
+export const STATIC_INSTRUCTIONS =
+  "Notes from an Obsidian vault, synced end-to-end encrypted. Use `list` or `search` to find exact paths before `read`. Paths are case-sensitive.";
+
+/**
+ * A bound on the owner's own instructions, which ride in every context window.
+ *
+ * Smaller than `MAX_RESULT_CHARS` on purpose: a tool result is fetched once and read once,
+ * while this is carried for the whole conversation.
+ */
+export const MAX_INSTRUCTION_CHARS = 8_000;
 
 /**
  * A self-imposed bound on one tool result, not a documented client limit — Anthropic
@@ -102,8 +120,7 @@ export async function handleMcp(request: Request, handlers: McpHandlers): Promis
             typeof asked === "string" && SUPPORTED_VERSIONS.includes(asked) ? asked : PREFERRED_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: SERVER_INFO,
-          instructions:
-            "Notes from an Obsidian vault, synced end-to-end encrypted. Use `list` or `search` to find exact paths before `read`. Paths are case-sensitive.",
+          instructions: await instructionsFor(handlers),
         });
       }
 
@@ -155,6 +172,29 @@ function descriptorFor(tool: ToolDescriptor): Record<string, unknown> {
     inputSchema: tool.inputSchema,
     annotations: tool.annotations,
   };
+}
+
+/**
+ * The static preamble plus whatever the vault's own instructions note says.
+ *
+ * **Fail-soft, deliberately, and the opposite of every other rule here.** A missing preference
+ * is an inconvenience; a rejected `initialize` stops the connector attaching at all, and the
+ * very next tool call surfaces the real error anyway. So any failure serves the static string.
+ */
+async function instructionsFor(handlers: McpHandlers): Promise<string> {
+  let owner: string;
+  try {
+    owner = await handlers.instructions();
+  } catch {
+    return STATIC_INSTRUCTIONS;
+  }
+  const body = owner.trim();
+  if (body === "") return STATIC_INSTRUCTIONS;
+  const bounded =
+    body.length <= MAX_INSTRUCTION_CHARS
+      ? body
+      : `${body.slice(0, MAX_INSTRUCTION_CHARS)}\n\n[truncated: AGENT.md exceeded ${MAX_INSTRUCTION_CHARS} characters]`;
+  return `${STATIC_INSTRUCTIONS}\n\n## Owner instructions (AGENT.md in this vault)\n\n${bounded}`;
 }
 
 function clamp(text: string): string {

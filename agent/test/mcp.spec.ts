@@ -1,9 +1,16 @@
 import { describe, it, expect } from "vitest";
-import { handleMcp, PREFERRED_VERSION, SUPPORTED_VERSIONS } from "../src/mcp";
+import {
+  handleMcp,
+  MAX_INSTRUCTION_CHARS,
+  PREFERRED_VERSION,
+  STATIC_INSTRUCTIONS,
+  SUPPORTED_VERSIONS,
+  type McpHandlers,
+} from "../src/mcp";
 
 const rpc = async (
   body: unknown,
-  handlers: Partial<{ call: (n: string, a: Record<string, unknown>) => Promise<string>; writable: () => Promise<boolean> }> = {},
+  handlers: Partial<McpHandlers> = {},
   init: RequestInit = {}
 ): Promise<Response> =>
   handleMcp(
@@ -15,6 +22,7 @@ const rpc = async (
     {
       call: handlers.call ?? (async () => "ok"),
       writable: handlers.writable ?? (async () => false),
+      instructions: handlers.instructions ?? (async () => ""),
     }
   );
 
@@ -71,6 +79,7 @@ describe("transport", () => {
       const res = await handleMcp(new Request("https://agent.test/mcp", { method }), {
         call: async () => "",
         writable: async () => false,
+        instructions: async () => "",
       });
       expect(res.status).toBe(405);
       expect(res.headers.get("allow")).toBe("POST");
@@ -173,5 +182,53 @@ describe("tools/list", () => {
     });
     const body = await res.json<{ result: { isError: boolean } }>();
     expect(body.result.isError).toBe(true);
+  });
+});
+
+describe("owner instructions from the vault", () => {
+  const initialize = async (handlers: Partial<McpHandlers>): Promise<string> => {
+    const res = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, handlers);
+    const body = (await res.json()) as { result: { instructions: string } };
+    return body.result.instructions;
+  };
+
+  it("serves the static string alone when the vault has no AGENT.md", async () => {
+    // Byte-identical to what every client got before this feature existed.
+    expect(await initialize({ instructions: async () => "" })).toBe(STATIC_INSTRUCTIONS);
+  });
+
+  it("appends the note's body under a heading that says where it came from", async () => {
+    const text = await initialize({
+      instructions: async () => "Daily notes live in Daily/YYYY-MM-DD.md. Read Inbox.md first.",
+    });
+    expect(text.startsWith(STATIC_INSTRUCTIONS)).toBe(true);
+    expect(text).toContain("## Owner instructions (AGENT.md in this vault)");
+    expect(text).toContain("Daily notes live in Daily/YYYY-MM-DD.md");
+  });
+
+  it("treats a whitespace-only note as no instructions", async () => {
+    expect(await initialize({ instructions: async () => "   \n\n  " })).toBe(STATIC_INSTRUCTIONS);
+  });
+
+  it("clamps a pathological note rather than flooding every context window", async () => {
+    const text = await initialize({
+      instructions: async () => "x".repeat(MAX_INSTRUCTION_CHARS + 500),
+    });
+    expect(text).toContain("[truncated: AGENT.md exceeded");
+    expect(text.length).toBeLessThan(MAX_INSTRUCTION_CHARS + STATIC_INSTRUCTIONS.length + 300);
+    expect(text).not.toContain("x".repeat(MAX_INSTRUCTION_CHARS + 1));
+  });
+
+  it("still answers initialize when the vault cannot be read", async () => {
+    // Fail-soft is the contract here, and the opposite of every other rule in this agent. A
+    // missing preference is an inconvenience; a rejected initialize stops the connector
+    // attaching at all, and the next tool call surfaces the real error anyway. Pinned so
+    // nobody "fixes" it closed.
+    const res = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, {
+      instructions: () => Promise.reject(new Error("vault unreachable")),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { result: { instructions: string } };
+    expect(body.result.instructions).toBe(STATIC_INSTRUCTIONS);
   });
 });

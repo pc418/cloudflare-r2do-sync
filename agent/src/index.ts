@@ -76,6 +76,7 @@ export default {
     return handleMcp(request, {
       call: (name, args) => state.call(name, args),
       writable: () => state.writable(),
+      instructions: () => state.instructions(),
     });
   },
 };

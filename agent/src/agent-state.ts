@@ -26,6 +26,19 @@ import type { AgentEnv } from "./env";
  */
 export const WRITE_DEBOUNCE_MS = 2000;
 
+/**
+ * The note carrying the owner's standing instructions for this agent.
+ *
+ * A note rather than a deploy-time binding, because it is *preference*, not policy: the owner
+ * edits it in Obsidian on any device, it syncs, history versions it, and on a writable
+ * deployment the agent can update its own instructions with an ordinary `edit` — no redeploy,
+ * ever. Security policy takes the opposite route and stays in bindings.
+ *
+ * The name is fixed. A configurable filename would be a knob with one caller, which is exactly
+ * the speculative flag the simplicity rule bans.
+ */
+export const INSTRUCTIONS_NOTE = "AGENT.md";
+
 export class AgentState extends DurableObject<AgentEnv> {
   #view: VaultView | null = null;
   #writer: VaultWriter | null = null;
@@ -87,6 +100,28 @@ export class AgentState extends DurableObject<AgentEnv> {
 
   async indexStatus(): Promise<IndexStatus> {
     return this.#searchIndex().status();
+  }
+
+  /**
+   * The owner's standing instructions, or "" when the vault has none.
+   *
+   * Read through the **scoped** snapshot, so the shared exclude policy applies to it exactly
+   * as it does to every other note: a hidden `AGENT.md` is simply absent, and the agent never
+   * gains a second, unfiltered way to read a path.
+   *
+   * It is bytes handed to the model, never parsed as configuration — it cannot un-hide a path,
+   * widen scope or change a tool. Enforcement stays in the policy; prose stays advisory.
+   */
+  async instructions(): Promise<string> {
+    const { view } = await this.#ready();
+    const { files } = await view.snapshot();
+    const entry = files[INSTRUCTIONS_NOTE];
+    if (entry === undefined) return "";
+    const bytes = await view.read(entry);
+    // Binary here means somebody put something odd at that path; serving mojibake as standing
+    // instructions is worse than having none.
+    if (bytes.includes(0)) return "";
+    return new TextDecoder().decode(bytes);
   }
 
   /** Which tools this deployment advertises. A read-only agent never mentions the write ones. */

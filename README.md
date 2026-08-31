@@ -230,6 +230,22 @@ directory) are filtered out of reads too — this process holds the master key, 
 carry that content. Writes go through the same commit path as any device: a scoped mini-pass
 that absorbs the head, carries every other entry byte-for-byte, and commits under CAS.
 
+**Teaching it your vault.** A note called **`AGENT.md`** at the vault root becomes the agent's
+standing instructions — "daily notes live in `Daily/YYYY-MM-DD.md`", "read `Inbox.md` first",
+"when I say *log X*, append X under `## Log` in today's note". It is served to the model when a
+conversation starts, so you can ask for things in fewer words.
+
+It is an ordinary note, which is the point: edit it in Obsidian on any device and it syncs, and
+history versions it like anything else. On a writable deployment the agent can edit it too, so
+"remember that my daily note lives under Daily/" is one tool call away, with no redeploy. New
+text takes effect in the *next* conversation.
+
+Two limits worth knowing. It is read through the same policy as every other note, so an
+`AGENT.md` your vault excludes is invisible to the agent. And it is advice to the model, never
+configuration: it cannot un-hide a path, widen what the agent may read, or change what a tool
+does. Anyone holding a write token could rewrite it — the same boundary that already lets them
+forge any note — so if you ever want that channel frozen, exclude `AGENT.md`.
+
 Health check: `curl <AGENT_URL>/health`. An unauthenticated `GET /mcp` answers **401**, not
 405 — the bearer is checked before the method, so that is the correct answer to an anonymous
 probe rather than a broken deployment.
