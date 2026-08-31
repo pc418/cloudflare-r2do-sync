@@ -1,12 +1,22 @@
 # R2DO Sync
 
-Two-way Obsidian vault sync on **your own** Cloudflare account — no third-party service, no
-subscription, end-to-end encrypted with a master key that never leaves your devices. The
-free plan is enough for a text vault.
+Sync your vault to your own Cloudflare account — end-to-end encrypted, versioned snapshots,
+with an optional MCP server that lets Claude or any AI assistant read and write your notes.
 
-Optionally, it also lets **Claude, Codex or any other MCP client read and write your notes**
-without Obsidian running anywhere. That part is off unless you ask for it — see
-[Connect an AI assistant](#connect-an-ai-assistant).
+[![CI](https://github.com/pc418/cloudflare-r2do-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/pc418/cloudflare-r2do-sync/actions/workflows/ci.yml)
+[![latest release](https://img.shields.io/github/v/release/pc418/cloudflare-r2do-sync?sort=semver&label=release)](https://github.com/pc418/cloudflare-r2do-sync/releases/latest)
+[![downloads](https://img.shields.io/github/downloads-pre/pc418/cloudflare-r2do-sync/latest/main.js?sort=semver&label=downloads)](https://github.com/pc418/cloudflare-r2do-sync/releases)
+[![license](https://img.shields.io/github/license/pc418/cloudflare-r2do-sync?label=license)](LICENSE)
+
+No third-party service and no subscription: a Worker, an R2 bucket and a Durable Object you
+deploy in minutes, and the free plan is enough for a text vault. The master key never leaves
+your devices, so the server holds ciphertext and an opaque path map — never a filename.
+
+The MCP half is off unless you ask for it, and is a **separate Worker with its own credential**
+— see [Connect an AI assistant](#connect-an-ai-assistant), including what it costs you in
+privacy.
+
+> Not affiliated with Obsidian, and not the [official sync service](https://obsidian.md/sync).
 
 ## What you need
 
