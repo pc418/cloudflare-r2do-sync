@@ -711,10 +711,14 @@ export function renderSetupSummary({
  * the half that was printed anyway. So everything goes in one 0600 text file, and the console
  * keeps only what identifies the run.
  *
- * **Its presence is also the rotation signal.** While this file exists the handover has not
- * been collected, so a redeploy must keep every credential the file names or the file starts
- * lying. Once it is gone — stored somewhere safe and removed, as the file itself instructs —
- * the next deploy issues fresh credentials and writes a fresh file.
+ * **Its presence is also the rotation signal — for credentials a deploy is free to replace.**
+ * While this file exists the handover has not been collected, so a redeploy keeps what the
+ * file names or the file starts lying. Once it is gone the next deploy issues fresh ones.
+ *
+ * The MCP bearer is **excluded from that rule** and rotates only on `--rotate-bearer`:
+ * connector auth settings are immutable once created, so rotating it costs the operator a
+ * manual removal and re-add. Tying that to the ordinary habit of tidying up a secrets file
+ * would punish the habit.
  */
 export function handoffPath(root = ROOT, deploymentName = null) {
   const name = deploymentName === null ? "DEPLOY-CREDENTIALS.txt" : `DEPLOY-CREDENTIALS.${deploymentName}.txt`;
@@ -760,11 +764,13 @@ export function writeHandoff(root, deploymentName, sections) {
     "It is created 0600 and gitignored, but it is still plaintext on disk, and it holds",
     "credentials to a service that decrypts your notes.",
     "",
-    "While this file exists, a redeploy KEEPS every credential named in it — otherwise the",
-    "file would quietly stop being true. Once you delete it, the next deploy issues fresh",
-    "credentials and writes a new one. A rotated MCP bearer means",
-    "removing and re-adding the connector, because connector auth settings cannot be edited",
-    "after they are created.",
+    "While this file exists, a redeploy KEEPS the credentials named in it — otherwise the file",
+    "would quietly stop being true. Once you delete it, the next deploy issues fresh ones and",
+    "writes a new file.",
+    "",
+    "The MCP bearer is the exception: it is never rotated by a deploy, only by",
+    "--rotate-bearer. Connector auth settings cannot be edited after they are created, so a",
+    "new bearer means removing and re-adding the connector.",
     "",
   ].join("\n");
   writeFileSync(file, `${body}\n`, { mode: 0o600 });

@@ -87,8 +87,9 @@ test("the console names the handover file and never a credential", async () => {
   // A fingerprint identifies the run; it must not be mistaken for something pasteable.
   assert.match(text, /a hash/);
   assert.doesNotMatch(text, /Authorization/);
-  // And it says what deleting the file does, because that is now a rotation decision.
-  assert.match(text, /redeploy keeps the bearer/);
+  // And it says the one thing an operator would otherwise guess wrong about.
+  assert.match(text, /bearer survives every redeploy/);
+  assert.match(text, /--rotate-bearer/);
 });
 
 test("the handover section carries everything the connector form needs", async () => {
@@ -257,27 +258,46 @@ test("the timezone is uploaded as a binding the agent can read", () => {
   assert.ok(source.indexOf("const timezone = resolveDeployZone(") < source.indexOf('name: "AGENT_TZ"'));
 });
 
-test("a redeploy retires the token pair it replaced, and nothing else", async () => {
+test("a redeploy keeps the vault tokens unless a rotation was asked for", async () => {
   const { supersededTokenIds } = await import("./deploy-agent.mjs");
-  // The ordinary redeploy: both recorded ids go, once the new ones are live.
+  const recorded = { READ_TOKEN_ID: "old-r", WRITE_TOKEN_ID: "old-w" };
+
+  // Nothing minted: nothing was replaced, so nothing is retired. Revoking here would take the
+  // running agent's own credential away.
+  assert.deepEqual(supersededTokenIds(recorded, [], { writable: true, minted: false }), []);
+
+  // --rotate-tokens: both recorded ids go, once the new ones are live.
   assert.deepEqual(
-    supersededTokenIds({ READ_TOKEN_ID: "old-r", WRITE_TOKEN_ID: "old-w" }, ["new-r", "new-w"]),
+    supersededTokenIds(recorded, ["new-r", "new-w"], { writable: true, minted: true }),
     ["old-r", "old-w"]
   );
+
+  // A read-only redeploy withdraws the write capability even when nothing was minted — the
+  // secret is deleted from the Worker, so the token behind it must not stay live.
+  assert.deepEqual(supersededTokenIds(recorded, [], { writable: false, minted: false }), ["old-w"]);
+
   // A first deploy has nothing to retire.
-  assert.deepEqual(supersededTokenIds({}, ["new-r"]), []);
-  assert.deepEqual(supersededTokenIds({ READ_TOKEN_ID: "", WRITE_TOKEN_ID: "" }, ["new-r"]), []);
-  // A read-only redeploy over a writable one withdraws the write token: that IS the change.
+  assert.deepEqual(supersededTokenIds({}, ["new-r"], { writable: true, minted: true }), []);
+  // And it never revokes a credential this very run minted.
   assert.deepEqual(
-    supersededTokenIds({ READ_TOKEN_ID: "old-r", WRITE_TOKEN_ID: "old-w" }, ["new-r"]),
-    ["old-r", "old-w"]
-  );
-  // And it never revokes a credential this very run minted — that would be a deployment
-  // destroying its own agent.
-  assert.deepEqual(
-    supersededTokenIds({ READ_TOKEN_ID: "same", WRITE_TOKEN_ID: "old-w" }, ["same", "new-w"]),
+    supersededTokenIds({ READ_TOKEN_ID: "same", WRITE_TOKEN_ID: "old-w" }, ["same", "new-w"], {
+      writable: true,
+      minted: true,
+    }),
     ["old-w"]
   );
+});
+
+test("minting is the exception, and a read-only redeploy really removes write", () => {
+  const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
+  // Mint only on request, on a first deploy, or when write is newly needed.
+  assert.match(source, /const mintTokens = opts\.rotateTokens === true \|\| !agentEnv\.READ_TOKEN_ID \|\| needsWrite;/);
+  // Kept tokens are kept by OMITTING the binding: Cloudflare never deletes a secret on a
+  // deployment, and the deploy has no copy of the value to re-send.
+  assert.match(source, /readToken === undefined\s*\?\s*\[\]/);
+  // Which is exactly why the downgrade has to be an explicit delete, not an omission.
+  assert.match(source, /secrets\/SYNC_WRITE_TOKEN/);
+  assert.match(source, /fail\("drop-write-secret", dropped\)/);
 });
 
 test("a failed agent deploy leaves no vault credential behind", () => {
@@ -290,7 +310,7 @@ test("a failed agent deploy leaves no vault credential behind", () => {
   assert.match(source, /for \(const id of minted\)/);
   // The guarded region starts at the first mint and ends no earlier than the health check.
   const guard = source.indexOf("  try {");
-  assert.ok(guard < source.indexOf('log("minting a read-only vault token'), "mint must be inside the try");
+  assert.ok(guard < source.indexOf("readToken = await mint("), "the mint must be inside the try");
   assert.ok(source.indexOf("await waitForHealth(") < source.indexOf("  } catch (error) {"), "health check must be inside the try");
 });
 
@@ -299,7 +319,7 @@ test("superseded tokens are revoked only after the new deployment is recorded an
   // Revoking before /health would blind a working agent to save a failed deploy; revoking
   // before the env file is written would risk losing the ids of the credentials now in use.
   const health = source.indexOf("await waitForHealth(");
-  const record = source.indexOf("READ_TOKEN_ID: tokenIdOf(readToken)");
+  const record = source.indexOf("READ_TOKEN_ID: readToken === undefined");
   const retire = source.indexOf("const superseded = supersededTokenIds(");
   assert.ok(health < record, "env file is written after the smoke test");
   assert.ok(record < retire, "superseded tokens are retired after the new ids are on disk");
@@ -341,7 +361,10 @@ test("the handover file is 0600 and says what to do with itself", async () => {
   // Instructions, not just data: store it, then delete it, and what deleting it causes.
   assert.match(text, /password manager/);
   assert.match(text, new RegExp(`rm ${path.basename(file)}`));
-  assert.match(text, /a redeploy KEEPS every credential named in it/);
+  assert.match(text, /a redeploy KEEPS the credentials named in it/);
+  // The bearer is carved out of that rule, and the file has to say so: an operator who tidies
+  // up and then redeploys must not discover the connector broke.
+  assert.match(text, /never rotated by a deploy, only by/);
   assert.match(text, /removing and re-adding the connector/);
   rmSync(dir, { recursive: true });
 });
@@ -354,4 +377,17 @@ test("a fingerprint identifies a run without leaking the credential", async () =
   assert.notEqual(a, fingerprint("c".repeat(64)));
   // Eight hex characters of SHA-256: enough to tell two deploys apart, useless for recovery.
   assert.ok(!"b".repeat(64).includes(a));
+});
+
+test("a deploy never rotates the MCP bearer on its own", async () => {
+  const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
+  // Connector auth settings are immutable once created, so rotating costs the operator a
+  // manual removal and re-add. Only an explicit ask does it; the handover file's presence,
+  // which governs the admin token, must not reach this decision.
+  assert.match(source, /const rotate = opts\.rotateBearer === true \|\| issuing;/);
+  assert.doesNotMatch(source, /rotate = .*handoffPending/);
+  // And the agent script must not consult the handover file for anything at all.
+  assert.doesNotMatch(source, /handoffPending/);
+  // Nothing recorded to reuse is issuance, not rotation, and is worded as such.
+  assert.match(source, /none was recorded for this deployment/);
 });

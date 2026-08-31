@@ -20,7 +20,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   fingerprint,
   handoffPath,
-  handoffPending,
   loadEnvFile,
   localBin,
   upsertEnvFile,
@@ -72,6 +71,9 @@ const USAGE = `usage: node scripts/deploy-agent.mjs --vault <name> [--writable] 
   --vault <name>     the vault this agent reads, deployed with setup.mjs --vault <name>
   --writable         also mint a sync-scoped token, enabling append/edit/write
   --rotate-bearer    issue a new MCP bearer even if one is already recorded
+                     (the connector must then be removed and re-added)
+  --rotate-tokens    issue a new vault access token pair and revoke the one it replaces
+                     (invisible to any client; nothing needs reconfiguring)
   --name <script>    agent Worker name
                      (default: <vault>-agent-<8 random chars>, generated once and recorded
                       in .env.agent.<vault>; an existing deployment keeps its name)
@@ -80,7 +82,7 @@ The agent is a SEPARATE Worker holding the vault master key. Deploying it agains
 whose own credentials are not in .env.<vault> is refused.`;
 
 function parseArgs(argv) {
-  const opts = { vault: null, writable: false, rotateBearer: false, name: null };
+  const opts = { vault: null, writable: false, rotateBearer: false, rotateTokens: false, name: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const next = () => {
@@ -92,6 +94,7 @@ function parseArgs(argv) {
     else if (arg === "--name") opts.name = next();
     else if (arg === "--writable") opts.writable = true;
     else if (arg === "--rotate-bearer") opts.rotateBearer = true;
+    else if (arg === "--rotate-tokens") opts.rotateTokens = true;
     else if (arg === "--help" || arg === "-h") {
       console.log(USAGE);
       process.exit(0);
@@ -149,8 +152,9 @@ export function mcpHandoffSection({ url, bearer, writable, vaultUrl }) {
     "   1. The header value is sent verbatim — it must include \"Bearer \".",
     "   2. The URL must end in /mcp, never /sse — Anthropic reads /sse as the legacy transport.",
     "   3. Register this workers.dev URL exactly; a redirect to another host drops the header.",
-    "   4. Connector auth settings are immutable once created, so a rotated bearer means",
-    "      removing and re-adding the connector.",
+    "   4. Connector auth settings are immutable once created, so this bearer is never",
+    "      rotated by a deploy. Only --rotate-bearer changes it, and then the connector has",
+    "      to be removed and re-added.",
     "",
     `  Check it   curl ${url}/health          -> {"ok":true}`,
     `             An unauthenticated GET ${url}/mcp answers 401, not 405.`,
@@ -175,8 +179,8 @@ token ids and script name recorded in ${agentEnvName} (gitignored)
   CONNECTOR SETTINGS, INCLUDING THE BEARER:  ${handoffFile}
 
 That file holds everything you paste into Claude, in one place, created 0600 and gitignored.
-Store the values somewhere safe and delete it. While it exists, a redeploy keeps the bearer;
-once it is gone, the next deploy issues a new one and the connector has to be re-added.
+Store the values somewhere safe and delete it. The bearer survives every redeploy — only
+--rotate-bearer changes it, and that means re-adding the connector.
 `;
 }
 
@@ -221,8 +225,16 @@ export function resolveDeployZone(named, machine = Intl.DateTimeFormat().resolve
  * that revokes its own live credentials. A read-only redeploy over a writable one retires the
  * write token too — that is the capability actually being withdrawn.
  */
-export function supersededTokenIds(agentEnv, minted) {
-  return [agentEnv.READ_TOKEN_ID, agentEnv.WRITE_TOKEN_ID].filter((id) => id && !minted.includes(id));
+export function supersededTokenIds(agentEnv, minted, opts = {}) {
+  const replaced = opts.minted === true;
+  const ids = [];
+  // A kept token is not superseded — nothing replaced it, and revoking it would take the
+  // running agent's own credential away.
+  if (replaced) ids.push(agentEnv.READ_TOKEN_ID, agentEnv.WRITE_TOKEN_ID);
+  // A read-only redeploy retires the write token whether or not anything was minted: that
+  // capability is being withdrawn, and the secret has already been deleted from the Worker.
+  else if (opts.writable === false) ids.push(agentEnv.WRITE_TOKEN_ID);
+  return ids.filter((id) => id && !minted.includes(id));
 }
 
 export async function deployAgent(opts) {
@@ -363,27 +375,46 @@ export async function deployAgent(opts) {
   let bearer;
   let url;
   try {
-    log("minting a read-only vault token...");
-    readToken = await mint(`${scriptName}-read`, ["read"]);
-    // (declared above, so the catch below can revoke it)
-    if (opts.writable) {
-      // A SECOND token, not a widened one: read and write stay independently revocable, so a
-      // capture credential can be withdrawn without blinding the agent.
-      log("minting a separate sync-scoped token for writes...");
-      writeToken = await mint(`${scriptName}-write`, ["sync"]);
+    // **Minted only when asked, or when there is nothing to keep.** A redeploy used to mint a
+    // fresh pair every time, which is how the dummy reached 51 live full-vault credentials.
+    // Keeping them is possible because Cloudflare never deletes a secret on a deployment: an
+    // upload that omits SYNC_TOKEN leaves the existing one in place, so the deploy does not
+    // need a value it deliberately never kept a copy of.
+    const needsWrite = opts.writable && !agentEnv.WRITE_TOKEN_ID;
+    const mintTokens = opts.rotateTokens === true || !agentEnv.READ_TOKEN_ID || needsWrite;
+    if (mintTokens) {
+      log(
+        opts.rotateTokens
+          ? "minting a new vault token pair (--rotate-tokens); the old pair is revoked once this deploy is healthy"
+          : needsWrite && agentEnv.READ_TOKEN_ID
+            ? "this deployment is becoming writable — minting the vault token pair"
+            : "minting the vault access tokens for this deployment"
+      );
+      readToken = await mint(`${scriptName}-read`, ["read"]);
+      if (opts.writable) {
+        // A SECOND token, not a widened one: read and write stay independently revocable, so a
+        // capture credential can be withdrawn without blinding the agent.
+        writeToken = await mint(`${scriptName}-write`, ["sync"]);
+      }
+    } else {
+      log("vault access tokens: unchanged (--rotate-tokens issues a new pair)");
     }
 
-    // Rotate when asked, when there is nothing recorded to reuse, or when the previous
-    // handover file is gone — which means its values were collected and the operator is no
-    // longer holding a document this deploy could falsify. While that file is still sitting
-    // there, keeping the bearer is what keeps it true.
-    const collected = !handoffPending(ROOT, vault);
-    const rotate = opts.rotateBearer === true || !agentEnv.MCP_BEARER || collected;
+    // **Only when asked.** Deliberately NOT governed by the handover file, unlike the admin
+    // token: connector auth settings are immutable once created, so a rotated bearer means the
+    // operator removing and re-adding the connector by hand. A deploy that did that on its own
+    // would punish the ordinary habit of storing the credentials and deleting the file.
+    // A first deploy, or one whose env file was lost, has nothing to reuse — that is issuance,
+    // not rotation.
+    const issuing = !agentEnv.MCP_BEARER;
+    const rotate = opts.rotateBearer === true || issuing;
     bearer = rotate ? randomBytes(32).toString("hex") : agentEnv.MCP_BEARER;
     log(
-      rotate
-        ? `MCP bearer: new one issued${agentEnv.MCP_BEARER ? " — the connector must be removed and re-added" : ""}`
-        : "MCP bearer: kept (its handover file has not been collected yet)"
+      issuing
+        ? "MCP bearer: issued (none was recorded for this deployment)"
+        : rotate
+          ? "MCP bearer: ROTATED on request — remove and re-add the connector with the new value"
+          : "MCP bearer: unchanged (--rotate-bearer is the only thing that changes it)"
     );
 
     // --- bundle ------------------------------------------------------------------
@@ -417,7 +448,12 @@ export async function deployAgent(opts) {
         { type: "durable_object_namespace", name: "AGENT", class_name: "AgentState" },
         { type: "secret_text", name: "VAULT_MASTER_KEY", text: masterKey },
         { type: "secret_text", name: "SYNC_URL", text: SYNC_URL },
-        { type: "secret_text", name: "SYNC_TOKEN", text: readToken.accessToken ?? readToken.token },
+        // Omitted when this run did not mint: a deployment never deletes a secret, so leaving
+        // it out is how the existing token is kept — the deploy has no copy of its value and
+        // deliberately never had one.
+        ...(readToken === undefined
+          ? []
+          : [{ type: "secret_text", name: "SYNC_TOKEN", text: readToken.accessToken ?? readToken.token }]),
         { type: "secret_text", name: "MCP_BEARER", text: bearer },
         { type: "plain_text", name: "AGENT_DEVICE", text: `agent (${scriptName})` },
         // Every date the agent renders, and every day boundary a range resolves to.
@@ -457,6 +493,20 @@ export async function deployAgent(opts) {
     }
     if (up.status !== 200) fail("upload", up);
     log("script uploaded");
+
+    // A deployment never deletes a secret — which is what lets the tokens be kept, and is
+    // exactly what would make a writable agent stay writable after a read-only redeploy. So
+    // the downgrade has to be performed, not merely not-declared. Loud on failure: the wrong
+    // outcome here is an agent that can still write when the operator asked that it could not.
+    if (!opts.writable) {
+      const dropped = await cf(`/workers/scripts/${scriptName}/secrets/SYNC_WRITE_TOKEN`, {
+        method: "DELETE",
+      });
+      if (dropped.status !== 200 && dropped.status !== 204 && dropped.status !== 404) {
+        fail("drop-write-secret", dropped);
+      }
+      if (dropped.status !== 404) log("write capability removed (SYNC_WRITE_TOKEN deleted)");
+    }
 
     const sub = await cf(`/workers/subdomain`);
     const subdomain = sub.body?.result?.subdomain;
@@ -499,8 +549,13 @@ export async function deployAgent(opts) {
     AGENT_SCRIPT: scriptName,
     MCP_BEARER: bearer,
     VAULT_NAME: vault,
-    READ_TOKEN_ID: tokenIdOf(readToken),
-    WRITE_TOKEN_ID: writeToken === null ? "" : tokenIdOf(writeToken),
+    // The id of whatever is live now: this run's, or the one it chose to keep.
+    READ_TOKEN_ID: readToken === undefined ? (agentEnv.READ_TOKEN_ID ?? "") : tokenIdOf(readToken),
+    WRITE_TOKEN_ID: !opts.writable
+      ? ""
+      : writeToken === null
+        ? (agentEnv.WRITE_TOKEN_ID ?? "")
+        : tokenIdOf(writeToken),
   }, agentEnvName);
 
   // --- retire the pair this deployment replaced --------------------------------
@@ -508,7 +563,7 @@ export async function deployAgent(opts) {
   // Last, and deliberately: the new ids are already on disk, so a failure here costs a manual
   // revocation rather than an agent nobody can find the credentials for. Before /health passed
   // this would have been sabotage — the old token is what a working agent is still using.
-  const superseded = supersededTokenIds(agentEnv, minted);
+  const superseded = supersededTokenIds(agentEnv, minted, { writable: opts.writable, minted: minted.length > 0 });
   const orphaned = [];
   for (const id of superseded) {
     const gone = await revoke(id).catch(() => false);
