@@ -29,9 +29,11 @@
   // within that day, so it guaranteed no history at all and `keepDays` was the whole promise.
   // The two answer different questions — count is the floor a vault keeps once it goes quiet
   // (500 ≈ a week at that peak rate), days is the restore reach while it is active.
-  // Generational retention. Deliberately still the pre-thinning window: this deploy carries
-  // the code, not the new policy, so the daily tier is empty and nothing is old enough to
-  // thin. The flip to "14" / "100" / "90" is its own commit and its own observed sweep.
-  "vars": { "GC_KEEP_DAYS": "90", "GC_KEEP_COUNT": "500", "GC_DAILY_DAYS": "90" },
+  // Generational retention, flipped on 2026-08-31 from the inert 90/500/90 the code shipped
+  // under. Dense window 14 days, then one snapshot a UTC day to 90, then one a week for ever.
+  // This is the policy that actually thins, and the first that deletes history the flat window
+  // kept: a device away longer than 14 days now loses its merge base rather than at 90.
+  // Raising GC_KEEP_DAYS stays the safe direction if that pinches.
+  "vars": { "GC_KEEP_DAYS": "14", "GC_KEEP_COUNT": "100", "GC_DAILY_DAYS": "90" },
   "triggers": { "crons": ["0 4 * * *"] }
 }
