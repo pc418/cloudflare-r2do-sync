@@ -31,5 +31,13 @@ export interface AgentEnv {
    * reads nor protected from writes — the hard-skip set is computed from this name.
    */
   VAULT_CONFIG_DIR?: string;
+  /**
+   * The vault's timezone, an IANA zone name (`America/Los_Angeles`). Set at deploy from the
+   * owner's own machine, because a colo has no idea where the vault lives.
+   *
+   * Absent or unreadable means UTC. Display preference, so it fails soft — the deploy is where
+   * a typo is refused.
+   */
+  AGENT_TZ?: string;
   AGENT: DurableObjectNamespace<AgentState>;
 }

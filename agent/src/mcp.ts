@@ -63,11 +63,22 @@ export interface McpHandlers {
    * Returns "" when there are none. It must not reject — see `initialize`.
    */
   instructions: () => Promise<string>;
+  /** The vault's timezone, an IANA name. Named in the preamble so "today" has an answer. */
+  timezone: string;
 }
 
 /** What every client is told, before anything the vault has to say. */
 export const STATIC_INSTRUCTIONS =
   "Notes from an Obsidian vault, end-to-end encrypted. Some tools: `recent`, `list`, `search`, `read`. Case-sensitive. `delete` and `move` act on single files only. Folders derived by paths.";
+
+/**
+ * The preamble, with the vault's clock named.
+ *
+ * Every date this agent renders and every day boundary it resolves is in this zone, and a
+ * model composing a daily-note path is otherwise guessing what "today" means from a colo's
+ * UTC clock.
+ */
+export const preamble = (timezone: string): string => `${STATIC_INSTRUCTIONS} Vault timezone: ${timezone}.`;
 
 /**
  * A bound on the owner's own instructions, which ride in every context window.
@@ -182,19 +193,20 @@ function descriptorFor(tool: ToolDescriptor): Record<string, unknown> {
  * very next tool call surfaces the real error anyway. So any failure serves the static string.
  */
 async function instructionsFor(handlers: McpHandlers): Promise<string> {
+  const head = preamble(handlers.timezone);
   let owner: string;
   try {
     owner = await handlers.instructions();
   } catch {
-    return STATIC_INSTRUCTIONS;
+    return head;
   }
   const body = owner.trim();
-  if (body === "") return STATIC_INSTRUCTIONS;
+  if (body === "") return head;
   const bounded =
     body.length <= MAX_INSTRUCTION_CHARS
       ? body
       : `${body.slice(0, MAX_INSTRUCTION_CHARS)}\n\n[AGENTS.md is longer than ${MAX_INSTRUCTION_CHARS} characters and was cut here — shorten it so the rest is not lost]`;
-  return `${STATIC_INSTRUCTIONS}\n\n## Owner instructions (AGENTS.md in this vault)\n\n${bounded}`;
+  return `${head}\n\n## Owner instructions (AGENTS.md in this vault)\n\n${bounded}`;
 }
 
 function clamp(text: string): string {

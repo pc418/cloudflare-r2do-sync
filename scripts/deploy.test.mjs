@@ -201,3 +201,39 @@ test("the deploy names which master key it used, and never the key", () => {
   assert.ok(declaredAt > 0 && usedAt > 0, "expected both the declaration and the log");
   assert.ok(declaredAt < usedAt, "keySource must be declared before it is logged");
 });
+
+test("the agent's timezone comes from this machine unless the vault names one", async () => {
+  const { resolveDeployZone } = await import("./deploy-agent.mjs");
+  // The Worker runs in a colo with no idea where the vault lives; the person deploying is
+  // standing in the right timezone by definition.
+  assert.equal(resolveDeployZone(undefined, "Asia/Tokyo"), "Asia/Tokyo");
+  assert.equal(resolveDeployZone("", "Asia/Tokyo"), "Asia/Tokyo");
+  // An explicit AGENT_TZ wins, trimmed.
+  assert.equal(resolveDeployZone("  Europe/Berlin  ", "Asia/Tokyo"), "Europe/Berlin");
+});
+
+test("the agent deploy refuses a timezone name it cannot resolve", async () => {
+  const { resolveDeployZone } = await import("./deploy-agent.mjs");
+  // Refused here, while a human is watching. The agent itself falls back to UTC rather than
+  // failing to start, so an unnoticed typo would be a wrong date on every row for months.
+  assert.throws(() => resolveDeployZone("America/Atlantis"), /not a timezone name/);
+  // A fixed offset is the tempting wrong answer: it cannot follow a DST transition.
+  assert.throws(() => resolveDeployZone("GMT+7"), /not a timezone name/);
+  // And the trap worth a rule of its own: ICU RESOLVES the old abbreviations, and resolves
+  // "EST" to America/Panama — a zone that never observes DST. Accepting it would put the
+  // vault an hour out for eight months of the year, silently.
+  assert.throws(() => resolveDeployZone("EST"), /abbreviation, not a zone.*America\/Panama/s);
+  assert.throws(() => resolveDeployZone("PST"), /abbreviation, not a zone/);
+  // UTC is the one bare name that means what it says.
+  assert.equal(resolveDeployZone("UTC"), "UTC");
+});
+
+test("the timezone is uploaded as a binding the agent can read", () => {
+  const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
+  // plain_text, not secret_text: a zone name is not a credential, and a plain binding is
+  // readable in the dashboard when a date looks wrong.
+  assert.match(source, /\{ type: "plain_text", name: "AGENT_TZ", text: timezone \}/);
+  // Resolved before the upload metadata is built, so an unknown name aborts having changed
+  // nothing at all.
+  assert.ok(source.indexOf("const timezone = resolveDeployZone(") < source.indexOf('name: "AGENT_TZ"'));
+});

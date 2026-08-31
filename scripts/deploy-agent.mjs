@@ -160,6 +160,39 @@ New text takes effect in the NEXT conversation. It is read through this vault's 
 policy, and it is advice to the model, never configuration.`;
 }
 
+/**
+ * The zone the agent renders dates in, and resolves "1 August" and "last tuesday" against.
+ *
+ * Read from THIS machine when the vault does not name one, because the Worker runs in a colo
+ * that has no idea where the vault lives — and the owner deploying is standing in the right
+ * timezone by definition.
+ *
+ * A zone NAME, never an offset: `Intl` then applies the right offset per instant, so DST is
+ * automatic and nothing in the agent knows a transition rule. An unknown name is refused here,
+ * while a human is watching — the agent itself falls back to UTC rather than failing to start.
+ */
+export function resolveDeployZone(named, machine = Intl.DateTimeFormat().resolvedOptions().timeZone) {
+  const zone = (named ?? "").trim() || machine || "UTC";
+  const advice =
+    'Use an IANA "Region/City" name such as "America/Los_Angeles" or "Asia/Tokyo".\n' +
+    "A fixed offset cannot follow a DST transition; a zone name applies the right one per date.";
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: zone });
+  } catch {
+    throw new Error(`AGENT_TZ "${zone}" is not a timezone name this machine knows.\n${advice}`);
+  }
+  // ICU accepts the old abbreviations and resolves them somewhere surprising: "EST" is
+  // America/PANAMA, which never observes DST, so a vault set to it would silently be an hour
+  // out for eight months of the year. Refuse them rather than resolve them quietly.
+  if (zone !== "UTC" && !zone.includes("/")) {
+    const resolved = new Intl.DateTimeFormat("en", { timeZone: zone }).resolvedOptions().timeZone;
+    throw new Error(
+      `AGENT_TZ "${zone}" is an abbreviation, not a zone — this machine reads it as "${resolved}".\n${advice}`
+    );
+  }
+  return zone;
+}
+
 export async function deployAgent(opts) {
   const vault = opts.vault;
 
@@ -210,6 +243,10 @@ export async function deployAgent(opts) {
     );
   }
 
+  // Refused here rather than at the colo: a typo is a five-second fix while somebody is
+  // watching, and an invisible silent fallback to UTC is a wrong date on every row for months.
+  const timezone = resolveDeployZone(process.env.AGENT_TZ ?? vaultEnv.AGENT_TZ);
+
   const API = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}`;
   const cf = async (pathname, init = {}) => {
     const res = await fetch(`${API}${pathname}`, {
@@ -236,6 +273,7 @@ export async function deployAgent(opts) {
   // perfectly and then decrypts nothing — a failure found much later, and confusing when it
   // arrives. Naming the source makes it checkable here, for free.
   log(`master key from ${keySource} (uploaded as a Worker secret; never printed)`);
+  log(`timezone ${timezone}${process.env.AGENT_TZ ?? vaultEnv.AGENT_TZ ? "" : " (read from this machine)"}`);
 
   // --- refuse to upload over an unrelated Worker ------------------------------
   // The upload is a PUT: against a name somebody else owns it would replace that Worker's
@@ -309,6 +347,8 @@ export async function deployAgent(opts) {
       { type: "secret_text", name: "SYNC_TOKEN", text: readToken.accessToken ?? readToken.token },
       { type: "secret_text", name: "MCP_BEARER", text: bearer },
       { type: "plain_text", name: "AGENT_DEVICE", text: `agent (${scriptName})` },
+      // Every date the agent renders, and every day boundary a range resolves to.
+      { type: "plain_text", name: "AGENT_TZ", text: timezone },
       // What the hard-skip set is computed from. A vault with a renamed Obsidian config folder
       // must say so, or its historical credentials are neither hidden nor write-protected.
       ...(process.env.VAULT_CONFIG_DIR

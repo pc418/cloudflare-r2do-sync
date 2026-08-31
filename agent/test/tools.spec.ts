@@ -961,7 +961,8 @@ describe("list: sort and date range", () => {
       )
     ).toEqual(["c.md"]);
 
-    // A date alone is UTC midnight, and August tiles onto September with nothing lost.
+    // A date alone is vault-local midnight — UTC in this fixture — and August tiles onto
+    // September with nothing lost.
     const august = paths(
       await callTool("list", { modified_after: "2026-08-01", modified_before: "2026-09-01" }, ctx)
     );
@@ -1028,5 +1029,99 @@ describe("last <weekday> date bounds", () => {
     await expect(callTool("list", { modified_after: "last octopus" }, ctx)).rejects.toThrow(
       /not a date I can read.*last tuesday/s
     );
+  });
+});
+
+describe("the vault's timezone", () => {
+  // 05:00 UTC on the 31st is still the 30th in California, which is exactly the disagreement
+  // a colo's UTC clock produces on a vault whose owner is asleep.
+  const LATE = Date.parse("2026-08-31T05:00:00Z");
+  const LA = "America/Los_Angeles";
+
+  async function zoned(tz: string | undefined, mtimes: Record<string, number>) {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, Object.fromEntries(Object.keys(mtimes).map((p) => [p, "x\n"])), { mtimes });
+    const api = new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const view = new VaultView({ api, crypto });
+    const ctx: ToolContext = { view, writable: false, enqueue: async () => ({ head: "", summary: "" }), tz };
+    return ctx;
+  }
+
+  it("renders list and recent on the vault's own wall clock", async () => {
+    const notes = { "late.md": LATE };
+    expect(await callTool("list", {}, await zoned(LA, notes))).toContain("2026-08-30");
+    expect(await callTool("list", {}, await zoned("UTC", notes))).toContain("2026-08-31");
+    // No binding is the same as UTC: display preference fails soft, it does not fail closed.
+    expect(await callTool("list", {}, await zoned(undefined, notes))).toContain("2026-08-31");
+
+    // `recent`'s window is a rolling now−N×24h and does not move; only the stamp is rendered.
+    const fresh = { "late.md": Date.now() - 3_600_000 };
+    expect(await callTool("recent", {}, await zoned("Asia/Tokyo", fresh))).toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
+  });
+
+  // The whole point of the binding: "1 August" means the owner's 1 August, not the colo's.
+  it("reads a bare date as that calendar day where the vault lives", async () => {
+    // 07:00Z is local midnight in LA on that date; this note is seven hours short of it.
+    const notes = { "n.md": Date.parse("2026-08-01T05:00:00Z") };
+    expect(await callTool("list", { modified_after: "2026-08-01" }, await zoned(LA, notes))).toContain(
+      "0 note(s)"
+    );
+    expect(await callTool("list", { modified_after: "2026-08-01" }, await zoned("UTC", notes))).toContain(
+      "1 note(s)"
+    );
+    // An explicit offset still means the instant it names, in any zone.
+    expect(
+      await callTool("list", { modified_after: "2026-08-01T00:00:00Z" }, await zoned(LA, notes))
+    ).toContain("1 note(s)");
+  });
+
+  it("resolves `last <weekday>` to local midnight, over a DST transition", () => {
+    // Monday 9 March 2026 in LA, the day after the spring-forward. "last tuesday" is 3 March,
+    // which is still PST — an implementation subtracting 24-hour blocks lands an hour out.
+    const monday = Date.parse("2026-03-09T17:00:00Z");
+    expect(lastWeekday("last tuesday", monday, LA)).toBe(Date.parse("2026-03-03T08:00:00Z"));
+    expect(lastWeekday("last tuesday", monday, "UTC")).toBe(Date.parse("2026-03-03T00:00:00Z"));
+  });
+
+  // 17:00 UTC Monday is still Sunday evening in Honolulu, so the two clocks disagree about
+  // which weekday "last" is counting back from.
+  it("reads today's weekday on the vault's clock, not the colo's", () => {
+    const monday = Date.parse("2026-08-31T05:00:00Z");
+    expect(lastWeekday("last friday", monday, "UTC")).toBe(Date.parse("2026-08-28T00:00:00Z"));
+    // In LA it is still Sunday the 30th, so the previous Friday is the 28th at PDT midnight.
+    expect(lastWeekday("last friday", monday, LA)).toBe(Date.parse("2026-08-28T07:00:00Z"));
+    // And "last sunday" differs by a whole week between the two readings.
+    expect(lastWeekday("last sunday", monday, "UTC")).toBe(Date.parse("2026-08-30T00:00:00Z"));
+    expect(lastWeekday("last sunday", monday, LA)).toBe(Date.parse("2026-08-23T07:00:00Z"));
+  });
+});
+
+describe("recent reports what matched, not what fitted", () => {
+  // Found live: `recent` counted the list AFTER truncating it, so a vault with 18 recent notes
+  // and max_results: 2 answered "2 note(s) modified in the last 90 day(s)" — a listing lying
+  // about its own coverage, to a reader with no other source of truth.
+  it("names the full count and says a cut happened", async () => {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    const now = Date.now();
+    const notes = { "a.md": now - 1000, "b.md": now - 2000, "c.md": now - 3000 };
+    await seed(vault, crypto, Object.fromEntries(Object.keys(notes).map((p) => [p, "x\n"])), {
+      mtimes: notes,
+    });
+    const api = new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const view = new VaultView({ api, crypto });
+    const ctx: ToolContext = { view, writable: false, enqueue: async () => ({ head: "", summary: "" }) };
+
+    const cut = await callTool("recent", { max_results: 2 }, ctx);
+    expect(cut).toContain("3 note(s) modified in the last 7 day(s), showing 2");
+    expect(cut).toContain("... 1 more; raise max_results");
+    expect(cut.split("\n").filter((l) => l.endsWith(".md"))).toHaveLength(2);
+
+    // Uncut, it stays the plain sentence it always was — no "showing", no trailing line.
+    const whole = await callTool("recent", {}, ctx);
+    expect(whole).toContain("3 note(s) modified in the last 7 day(s):");
+    expect(whole).not.toContain("showing");
+    expect(whole).not.toContain("more; raise");
   });
 });

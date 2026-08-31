@@ -3,6 +3,7 @@ import {
   handleMcp,
   MAX_INSTRUCTION_CHARS,
   PREFERRED_VERSION,
+  preamble,
   STATIC_INSTRUCTIONS,
   SUPPORTED_VERSIONS,
   type McpHandlers,
@@ -23,6 +24,7 @@ const rpc = async (
       call: handlers.call ?? (async () => "ok"),
       writable: handlers.writable ?? (async () => false),
       instructions: handlers.instructions ?? (async () => ""),
+      timezone: handlers.timezone ?? "UTC",
     }
   );
 
@@ -80,6 +82,7 @@ describe("transport", () => {
         call: async () => "",
         writable: async () => false,
         instructions: async () => "",
+        timezone: "UTC",
       });
       expect(res.status).toBe(405);
       expect(res.headers.get("allow")).toBe("POST");
@@ -196,7 +199,7 @@ describe("owner instructions from the vault", () => {
 
   it("serves the static string alone when the vault has no AGENTS.md", async () => {
     // Byte-identical to what every client got before this feature existed.
-    expect(await initialize({ instructions: async () => "" })).toBe(STATIC_INSTRUCTIONS);
+    expect(await initialize({ instructions: async () => "" })).toBe(preamble("UTC"));
   });
 
   it("appends the note's body under a heading that says where it came from", async () => {
@@ -208,8 +211,17 @@ describe("owner instructions from the vault", () => {
     expect(text).toContain("Daily notes live in Daily/YYYY-MM-DD.md");
   });
 
+  // Claude Desktop drops instructions entirely, so this is not the only place the zone must
+  // be reachable — but it is the only place it can be *named*, since tool descriptions are
+  // built once at module load and cannot interpolate a binding.
+  it("names the vault's timezone, so a model composing a daily note knows what today is", async () => {
+    const text = await initialize({ instructions: async () => "", timezone: "America/Los_Angeles" });
+    expect(text).toContain("Vault timezone: America/Los_Angeles.");
+    expect(text.startsWith(STATIC_INSTRUCTIONS)).toBe(true);
+  });
+
   it("treats a whitespace-only note as no instructions", async () => {
-    expect(await initialize({ instructions: async () => "   \n\n  " })).toBe(STATIC_INSTRUCTIONS);
+    expect(await initialize({ instructions: async () => "   \n\n  " })).toBe(preamble("UTC"));
   });
 
   it("clamps a pathological note rather than flooding every context window", async () => {
@@ -233,6 +245,6 @@ describe("owner instructions from the vault", () => {
     });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { result: { instructions: string } };
-    expect(body.result.instructions).toBe(STATIC_INSTRUCTIONS);
+    expect(body.result.instructions).toBe(preamble("UTC"));
   });
 });

@@ -17,6 +17,7 @@ import { globToRegExp } from "../../plugin/src/paths";
 import type { FileEntry } from "../../plugin/src/types";
 import type { SearchIndex } from "./index-store";
 import { BLOB_BUDGET, CONTEXT_DEFAULT, CONTEXT_MAX, search } from "./search";
+import { daysBefore, formatDay, formatMinute, civilIn, localMidnight, instantOf, UTC, weekdayOf } from "./tz";
 import { VaultError, type VaultView } from "./vault";
 import type { WriteOp } from "./write";
 
@@ -32,6 +33,13 @@ export interface ToolContext {
    * copy of anything.
    */
   index?: SearchIndex;
+  /**
+   * The vault's timezone, an IANA name. Every rendered date and every day boundary uses it.
+   *
+   * Optional because absent means UTC — the same fail-soft the binding has, so a fixture that
+   * does not care about zones reads exactly as it did before this existed.
+   */
+  tz?: string;
 }
 
 /**
@@ -199,10 +207,10 @@ export const TOOLS: ToolDescriptor[] = [
             "Order (default \"path\"). Path A-Z, modified newest first, size largest first. Keeps sorted first-N.",
         },
         modified_after: str(
-          "At or after. ISO 8601 or \"last tuesday\". UTC midnight."
+          "At or after. ISO 8601 or \"last tuesday\". Vault-local midnight."
         ),
         modified_before: str(
-          "Strictly before, exclusive. ISO 8601 or \"last tuesday\". UTC midnight."
+          "Strictly before, exclusive. ISO 8601 or \"last tuesday\". Vault-local."
         ),
         folder: str("Folder to list, subfolders included, e.g. \"Daily\"."),
         glob: str("Optional path glob, e.g. \"**/*.md\". ANDed with folder when both are given."),
@@ -378,7 +386,8 @@ function entryOf(files: Record<string, FileEntry>, path: string): FileEntry {
 const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
 
 /**
- * `last tuesday` → that day's UTC midnight, or null if the text is not that shape.
+ * `last tuesday` → that day's midnight in the vault's zone, or null if the text is not that
+ * shape.
  *
  * Weekday grammar only. A model frequently does not know today's date, so asking it to compute
  * `2026-08-25` invites an answer it cannot check; naming the weekday moves the arithmetic to
@@ -387,28 +396,50 @@ const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "frida
  * ambiguous about a boundary.
  *
  * **Never today**: on a Tuesday, `last tuesday` is seven days back, not this morning.
+ *
+ * Which weekday it *is* is read in the zone too, not in UTC — for most of the day those are
+ * different answers, and the one the owner means is the one on their own wall.
  */
-export function lastWeekday(text: string, now: number): number | null {
+export function lastWeekday(text: string, now: number, zone: string = UTC): number | null {
   const m = /^last\s+(\w+)$/.exec(text.trim().toLowerCase());
   if (m === null) return null;
   const target = WEEKDAYS.indexOf(m[1]);
   if (target === -1) return null;
-  const d = new Date(now);
-  const back = ((d.getUTCDay() - target + 6) % 7) + 1;
-  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - back * 86_400_000;
+  const today = civilIn(zone, now);
+  const back = ((weekdayOf(today.year, today.month, today.day) - target + 6) % 7) + 1;
+  // Step by calendar days and *then* resolve to an instant. Subtracting 24h from a timestamp
+  // lands an hour out either side of a DST transition; a date has no such problem.
+  const day = daysBefore(today.year, today.month, today.day, back);
+  return localMidnight(zone, day.year, day.month, day.day);
 }
 
+/** A date or datetime carrying no offset of its own — the shapes that mean *local*. */
+const NAIVE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/;
+
 /**
- * An ISO 8601 bound from the arguments, or null.
+ * A bound from the arguments, or null.
  *
- * `Date.parse` reads a bare `2026-08-01` as UTC midnight, which is the rule the field
- * description states rather than leaving the caller to discover a timezone.
+ * Three readings, in order: `last <weekday>`; a bare date or naive datetime, which means that
+ * time on the vault's own clock; anything else, which `Date.parse` handles and which therefore
+ * keeps whatever offset it stated. So `2026-08-01` is that calendar day where the owner is,
+ * while `2026-08-01T12:00:00Z` is the instant it names, everywhere.
  */
-function when(args: Record<string, unknown>, key: string): number | null {
+function when(args: Record<string, unknown>, key: string, zone: string): number | null {
   const raw = optional(args, key);
   if (raw === undefined) return null;
-  const weekday = lastWeekday(raw, Date.now());
+  const weekday = lastWeekday(raw, Date.now(), zone);
   if (weekday !== null) return weekday;
+  const naive = NAIVE.exec(raw.trim());
+  if (naive !== null) {
+    return instantOf(zone, {
+      year: Number(naive[1]),
+      month: Number(naive[2]),
+      day: Number(naive[3]),
+      hour: naive[4] === undefined ? 0 : Number(naive[4]),
+      minute: naive[5] === undefined ? 0 : Number(naive[5]),
+      second: naive[6] === undefined ? 0 : Number(naive[6]),
+    });
+  }
   const at = Date.parse(raw);
   if (Number.isNaN(at)) {
     throw new VaultError(
@@ -532,8 +563,9 @@ export async function callTool(
       }
       // Half-open [after, before): `after` inclusive, `before` exclusive, so consecutive
       // ranges tile with no overlap and no gap.
-      const after = when(args, "modified_after");
-      const before = when(args, "modified_before");
+      const zone = ctx.tz ?? UTC;
+      const after = when(args, "modified_after", zone);
+      const before = when(args, "modified_before", zone);
       const matched = Object.keys(files)
         .filter((p) => (folder === undefined || folder === "" ? true : p.startsWith(`${folder}/`)))
         .filter((p) => (re === null ? true : re.test(p)))
@@ -544,7 +576,7 @@ export async function callTool(
       // arbitrary slice that happened to be alphabetically first.
       const shown = matched.slice(0, max);
       const rows = shown
-        .map((p) => `${p}  (${files[p].size} B, ${new Date(files[p].mtime).toISOString().slice(0, 10)})`)
+        .map((p) => `${p}  (${files[p].size} B, ${formatDay(zone, files[p].mtime)})`)
         .join("\n");
       return [
         `${matched.length} note(s)${matched.length > shown.length ? `, showing ${shown.length}` : ""}`,
@@ -560,16 +592,26 @@ export async function callTool(
       const { files } = await ctx.view.snapshot();
       const days = Math.max(1, asInt(args, "days", 7));
       const max = Math.max(1, Math.min(asInt(args, "max_results", 100), 1000));
+      // A rolling now-N*24h window, deliberately: "the last 7 days" is a duration, not seven
+      // calendar days. Only the stamps below are rendered on the vault's clock.
       const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-      const recent = Object.keys(files)
+      const matched = Object.keys(files)
         .filter((p) => files[p].mtime >= cutoff)
-        .sort((a, b) => files[b].mtime - files[a].mtime)
-        .slice(0, max);
-      if (recent.length === 0) return `No notes modified in the last ${days} day(s).`;
-      const rows = recent
-        .map((p) => `${new Date(files[p].mtime).toISOString().slice(0, 16).replace("T", " ")}  ${p}`)
+        .sort((a, b) => files[b].mtime - files[a].mtime);
+      if (matched.length === 0) return `No notes modified in the last ${days} day(s).`;
+      // The count is of what MATCHED, never of what fitted. Reporting the truncated length as
+      // the total is a listing lying about its own coverage, to a reader with no other source.
+      const shown = matched.slice(0, max);
+      const rows = shown
+        .map((p) => `${formatMinute(ctx.tz ?? UTC, files[p].mtime)}  ${p}`)
         .join("\n");
-      return `${recent.length} note(s) modified in the last ${days} day(s):\n${rows}`;
+      return [
+        `${matched.length} note(s) modified in the last ${days} day(s)${matched.length > shown.length ? `, showing ${shown.length}` : ""}:`,
+        rows,
+        matched.length > shown.length ? `... ${matched.length - shown.length} more; raise max_results` : "",
+      ]
+        .filter((line) => line !== "")
+        .join("\n");
     }
 
     case "append":

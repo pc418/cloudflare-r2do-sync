@@ -7,6 +7,7 @@
  * commit serialisation.
  */
 import { handleMcp } from "./mcp";
+import { resolveZone } from "./tz";
 import type { AgentEnv } from "./env";
 
 export { AgentState } from "./agent-state";
@@ -77,6 +78,7 @@ export default {
       call: (name, args) => state.call(name, args),
       writable: () => state.writable(),
       instructions: () => state.instructions(),
+      timezone: resolveZone(env.AGENT_TZ),
     });
   },
 };

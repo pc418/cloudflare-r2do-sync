@@ -13,6 +13,7 @@ import { SyncApi } from "../../plugin/src/api";
 import { VaultCrypto } from "../../plugin/src/crypto";
 import { SearchIndex, type IndexStatus } from "./index-store";
 import { callTool, type ToolContext } from "./tools";
+import { resolveZone } from "./tz";
 import { fetchHttp, VaultView } from "./vault";
 import { VaultWriter, type WriteOp, type WriteOutcome } from "./write";
 import type { AgentEnv } from "./env";
@@ -87,6 +88,7 @@ export class AgentState extends DurableObject<AgentEnv> {
       writable: view.writable,
       enqueue: (op) => this.#enqueue(op),
       index: this.#searchIndex(),
+      tz: resolveZone(this.env.AGENT_TZ),
     };
     return callTool(name, args, ctx);
   }
