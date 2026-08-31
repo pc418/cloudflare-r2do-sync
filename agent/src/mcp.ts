@@ -193,13 +193,13 @@ async function instructionsFor(handlers: McpHandlers): Promise<string> {
   const bounded =
     body.length <= MAX_INSTRUCTION_CHARS
       ? body
-      : `${body.slice(0, MAX_INSTRUCTION_CHARS)}\n\n[truncated: AGENTS.md exceeded ${MAX_INSTRUCTION_CHARS} characters]`;
+      : `${body.slice(0, MAX_INSTRUCTION_CHARS)}\n\n[AGENTS.md is longer than ${MAX_INSTRUCTION_CHARS} characters and was cut here — shorten it so the rest is not lost]`;
   return `${STATIC_INSTRUCTIONS}\n\n## Owner instructions (AGENTS.md in this vault)\n\n${bounded}`;
 }
 
 function clamp(text: string): string {
   if (text.length <= MAX_RESULT_CHARS) return text;
-  return `${text.slice(0, MAX_RESULT_CHARS)}\n\n[truncated: the result exceeded ${MAX_RESULT_CHARS} characters]`;
+  return `${text.slice(0, MAX_RESULT_CHARS)}\n\n[cut short here — ask for less: a narrower folder or glob, fewer lines, or a smaller max_results]`;
 }
 
 function messageOf(error: unknown): string {

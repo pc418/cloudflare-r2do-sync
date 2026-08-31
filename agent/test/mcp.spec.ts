@@ -216,7 +216,9 @@ describe("owner instructions from the vault", () => {
     const text = await initialize({
       instructions: async () => "x".repeat(MAX_INSTRUCTION_CHARS + 500),
     });
-    expect(text).toContain("[truncated: AGENTS.md exceeded");
+    // The notice has to say what to DO, not just that a limit exists — the agent can edit
+    // AGENTS.md itself on a writable deployment, so "shorten it" is an action it can take.
+    expect(text).toContain("was cut here — shorten it");
     expect(text.length).toBeLessThan(MAX_INSTRUCTION_CHARS + STATIC_INSTRUCTIONS.length + 300);
     expect(text).not.toContain("x".repeat(MAX_INSTRUCTION_CHARS + 1));
   });
