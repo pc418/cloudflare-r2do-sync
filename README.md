@@ -247,9 +247,15 @@ does. Anyone holding a write token could rewrite it — the same boundary that a
 forge any note — so if you ever want that channel frozen, exclude `AGENT.md`.
 
 Whether a given client shows the model those instructions is the client's business, not the
-server's. If the agent seems not to know your conventions, ask it in the chat what its
-instructions for this vault say: an empty answer means the client dropped them, and the
-conventions are still worth stating once in the conversation.
+server's, and at least one — Claude Code's deferred tool loading — drops them entirely. So the
+`list` and `search` tools also mention `AGENT.md` in their own descriptions, which no client
+can discard and still call a tool: on such a surface the agent learns the note exists the first
+time it looks around your vault, and reads it. One round trip later than a client that keeps
+the instructions, and otherwise the same.
+
+If the agent still seems not to know your conventions, ask it in the chat what its instructions
+for this vault say. An empty answer means that client dropped them; "read `AGENT.md`
+first" is then a one-line fix for that conversation.
 
 Health check: `curl <AGENT_URL>/health`. An unauthenticated `GET /mcp` answers **401**, not
 405 — the bearer is checked before the method, so that is the correct answer to an anonymous

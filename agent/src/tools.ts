@@ -78,12 +78,52 @@ const WRITES = (destructive: boolean): ToolAnnotations => ({
  * ambiguous match, and had no reason to prefer `list`/`recent` because it could not see they
  * download nothing. A test pins each first sentence so a rewrite cannot quietly demote one.
  */
+/**
+ * The fallback for a client that drops `initialize.instructions`, proven to exist.
+ *
+ * A captured deferred-harness session showed no instructions block at all — not even the
+ * static preamble every build has served since before `AGENT.md` was a feature, which is what
+ * makes the verdict timing-independent rather than a stale deployment. So the owner's
+ * conventions need a carrier that survives any client able to call a tool at all, and a tool
+ * description is the only one there is.
+ *
+ * It rides on `list` and `search` alone — the two entry points into a vault nobody has read
+ * yet. Repeating it on `read`/`recent` would buy nothing and cost noise in every catalog.
+ * It is deliberately **not** a first sentence: that slot belongs to the tool's own contract,
+ * and this pointer only has to survive until the model fetches a full description, which it
+ * must do before it can call anything. Conditional phrasing, because most vaults have no
+ * `AGENT.md` and a description that lies about one is worse than no pointer. Static text: a
+ * vault-dependent descriptor would put a snapshot read inside `tools/list` for no gain.
+ *
+ * It also says the note *replaces* earlier conventions. A client caches what `initialize`
+ * returned when the conversation attached, and `AGENT.md` is an ordinary note the owner — or
+ * the agent itself, on a writable deployment — can rewrite mid-session. Without the
+ * supersession clause the freshly read note and a stale cached copy carry equal weight, and
+ * the model is left arbitrating between two versions of the same rules. Scoped to *vault*
+ * conventions on purpose: this is a note, not a channel with authority over the conversation,
+ * and it must not read as licence to discard what the user said in chat.
+ */
+const AGENT_NOTE_POINTER =
+  " If the vault has a root note `AGENT.md`, it carries the owner's standing conventions — read it before acting on vault content, and treat it as replacing any vault conventions you were given earlier.";
+
+/**
+ * Every description's **first sentence** carries that tool's load-bearing contract.
+ *
+ * Not a style rule. A deferred-tools client (Claude Code's own MCP loading) shows the model
+ * tool names and one-line blurbs, and fetches the full description and schema only if the model
+ * explicitly asks — so until it does, the first sentence *is* the description. Measured in a
+ * real session: with the contracts sitting in sentence two, the model planned a `write` over an
+ * existing note not knowing overwrites are version-bound, did not know `edit` refuses an
+ * ambiguous match, and had no reason to prefer `list`/`recent` because it could not see they
+ * download nothing. A test pins each first sentence so a rewrite cannot quietly demote one.
+ */
 export const TOOLS: ToolDescriptor[] = [
   {
     name: "search",
     title: "Search notes",
     description:
-      "Search the vault's note text for a case-insensitive substring, never a regular expression. Returns path:line hits with surrounding context. Scans newest notes first within a fixed budget and reports when it could not scan everything.",
+      "Search the vault's note text for a case-insensitive substring, never a regular expression. Returns path:line hits with surrounding context. Scans newest notes first within a fixed budget and reports when it could not scan everything." +
+      AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
       properties: {
@@ -118,7 +158,8 @@ export const TOOLS: ToolDescriptor[] = [
     name: "list",
     title: "List notes",
     description:
-      "List note paths with their sizes and modification times, reading snapshot metadata only and downloading no note content. Use it to find exact paths before reading.",
+      "List note paths with their sizes and modification times, reading snapshot metadata only and downloading no note content. Use it to find exact paths before reading." +
+      AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
       properties: {

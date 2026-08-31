@@ -89,6 +89,25 @@ describe("tool surface", () => {
         .toBeLessThanOrEqual(200);
     }
   });
+
+  // A captured deferred-harness session dropped `initialize.instructions` entirely, including
+  // the static preamble every build has served since before AGENT.md existed. A tool
+  // description is the only carrier such a client cannot discard, so the pointer lives here —
+  // on the two entry points into an unread vault, and never in the slot the catalog truncates
+  // to, which belongs to each tool's own contract.
+  it("points at AGENT.md from the entry-point read tools, below their first sentence", () => {
+    const carriers = TOOLS.filter((t) => t.description.includes("`AGENT.md`"));
+    expect(carriers.map((t) => t.name)).toEqual(["search", "list"]);
+    for (const tool of carriers) {
+      expect(firstSentence(tool.description)).not.toContain("AGENT.md");
+      expect(tool.description).toMatch(/If the vault has a root note `AGENT\.md`/);
+      // Supersession, without which a mid-session rewrite leaves the model arbitrating between
+      // the note it just read and the copy its client cached at `initialize`.
+      expect(tool.description).toMatch(/replacing any vault conventions you were given earlier/);
+      // Scoped to vault conventions: a synced note must not read as authority over the chat.
+      expect(tool.description).not.toMatch(/ignore|disregard|previous instructions/i);
+    }
+  });
 });
 
 /** Up to the first sentence-ending period followed by whitespace, or the whole string. */
