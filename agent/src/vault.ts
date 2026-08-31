@@ -41,6 +41,8 @@ export const fetchHttp: HttpClient = async (url, req) => {
 /** A failure worth reporting to the model in words, rather than a stack trace. */
 export class VaultError extends Error {}
 
+const nfc = (text: string): string => text.normalize("NFC");
+
 /**
  * The largest note this connector will materialise, in bytes.
  *
@@ -186,8 +188,13 @@ export class VaultView {
     this.#writeApi = opts.writeApi ?? null;
     this.#crypto = opts.crypto;
     this.#configDir = opts.configDir ?? ".obsidian";
-    const globs = denyGlobs(opts.deny);
-    this.#denied = makeExcluder(globs);
+    // NFC on both sides. A path arrives as whatever device wrote it — macOS filesystems hand
+    // back decomposed forms — while the glob is typed on a deploy machine, and two spellings of
+    // the same folder name that compare unequal would be a deny list that silently matches
+    // nothing. The write path already normalises for the same reason.
+    const globs = denyGlobs(opts.deny).map(nfc);
+    const match = makeExcluder(globs);
+    this.#denied = (path) => match(nfc(path));
     this.#denyMark = globs.join("\u0000");
   }
 

@@ -101,10 +101,16 @@ function parseArgs(argv) {
     else if (arg === "--rotate-bearer") opts.rotateBearer = true;
     else if (arg === "--rotate-tokens") opts.rotateTokens = true;
     // Not `next()`: an empty value is meaningful here — `--deny ""` is how a deny list is
-    // cleared, and refusing it would make the setting one-way.
+    // cleared, and refusing it would make the setting one-way. Everything else `next()`
+    // refuses is still refused, because `--deny --writable` would otherwise swallow the flag
+    // AND store a glob matching nothing: a read-only agent that denies nothing, reported as
+    // one valid rule.
     else if (arg === "--deny") {
-      if (i + 1 >= argv.length) throw new Error('--deny needs a value (use --deny "" to clear)');
-      opts.deny = argv[++i];
+      const value = argv[++i];
+      if (value === undefined || (value !== "" && value.startsWith("--"))) {
+        throw new Error(`--deny needs a glob list, or "" to clear`);
+      }
+      opts.deny = value;
     }
     else if (arg === "--help" || arg === "-h") {
       console.log(USAGE);
@@ -215,6 +221,33 @@ export function parseDenyGlobs(value) {
     .filter((line) => line.length > 0);
 }
 
+/**
+ * The deny list this deploy will carry: the one passed, or the one already recorded.
+ *
+ * Kept across redeploys the way the bearer is — a list that silently emptied itself on the next
+ * deploy would be worse than never having had one — so only an explicit `--deny ""` clears it.
+ *
+ * **Validated before trimming, and fail-closed.** `--deny "$UNSET_VAR"` arrives as whitespace,
+ * which trims to the empty string and would otherwise be indistinguishable from a deliberate
+ * clear: the operator believes the agent is denying something and it is denying nothing. Only
+ * the exact empty string is a clear; anything else that lists no globs throws.
+ *
+ * `undefined` is the library caller (`deploy.mjs --agent`), which passes no deny option at all
+ * and must mean "whatever is recorded", not a crash.
+ */
+export function resolveDeny(passed, recorded) {
+  const explicit = passed ?? null;
+  const raw = explicit === null ? (recorded ?? "") : explicit;
+  const globs = parseDenyGlobs(raw);
+  if (globs.length === 0 && raw !== "") {
+    throw new Error(
+      `--deny ${JSON.stringify(raw)} lists no paths. Quote the globs, or pass --deny "" to clear.`
+    );
+  }
+  // Normalised, so what is uploaded, recorded and re-read next time are one canonical form.
+  return globs.join(", ");
+}
+
 export function resolveDeployZone(named, machine = Intl.DateTimeFormat().resolvedOptions().timeZone) {
   const zone = (named ?? "").trim() || machine || "UTC";
   const advice =
@@ -315,14 +348,7 @@ async function deployAgentLocked(opts) {
   // watching, and an invisible silent fallback to UTC is a wrong date on every row for months.
   const timezone = resolveDeployZone(process.env.AGENT_TZ ?? vaultEnv.AGENT_TZ);
 
-  // Kept across redeploys the way the bearer is: a deny list that silently emptied itself on
-  // the next deploy would be worse than never having had one. `--deny ""` is how you clear it,
-  // explicitly. Parsed here so a shell that ate the quotes fails on this machine rather than
-  // producing a Worker that denies nothing and says nothing.
-  const deny = (opts.deny === null ? (agentEnv.AGENT_DENY ?? "") : opts.deny).trim();
-  if (deny !== "" && parseDenyGlobs(deny).length === 0) {
-    throw new Error(`--deny ${JSON.stringify(opts.deny)} lists no paths. Quote it, or pass --deny "" to clear.`);
-  }
+  const deny = resolveDeny(opts.deny, agentEnv.AGENT_DENY);
 
   const API = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}`;
   const cf = async (pathname, init = {}) => {

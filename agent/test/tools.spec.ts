@@ -1276,3 +1276,29 @@ describe("AGENT_DENY: paths this connector has no permission on", () => {
     }
   });
 });
+
+describe("AGENT_DENY matches across Unicode spellings", () => {
+  // The folder this feature exists for has a non-ASCII name, and a path arrives as whatever
+  // device wrote it — macOS hands back decomposed forms. Two spellings that compare unequal
+  // would be a deny list that silently matches nothing, which is the fail-open this must not
+  // have. NFD "é" is e + U+0301.
+  const NFD = "Clés/aws.md";
+  const NFC = "Clés/aws.md";
+
+  it("denies a decomposed path with a composed glob, and the reverse", async () => {
+    for (const [glob, stored] of [
+      ["Clés/**", NFD],
+      ["Clés/**", NFC],
+    ]) {
+      const vault = fakeVault();
+      const crypto = await testCrypto();
+      await seed(vault, crypto, { "ok.md": "fine\n", [stored]: "secret\n" });
+      const api = new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+      const view = new VaultView({ api, crypto, deny: glob });
+      const snap = await view.snapshot();
+      expect(Object.keys(snap.files), `${JSON.stringify(glob)} vs ${JSON.stringify(stored)}`).toEqual(["ok.md"]);
+      // Still carried, so a later commit cannot drop it.
+      expect(Object.keys(snap.all)).toHaveLength(2);
+    }
+  });
+});

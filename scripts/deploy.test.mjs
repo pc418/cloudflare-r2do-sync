@@ -471,10 +471,30 @@ test("the deny list is parsed the same way on both sides, and is clearable", asy
   const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
   // Kept across redeploys, like the bearer: silently emptying it would be worse than never
   // having set it.
-  assert.match(source, /opts\.deny === null \? \(agentEnv\.AGENT_DENY \?\? ""\) : opts\.deny/);
-  // Clearing has to be expressible, so --deny reads its value directly rather than through
-  // next(), which rejects an empty string.
-  assert.match(source, /--deny needs a value \(use --deny "" to clear\)/);
+  assert.match(source, /const deny = resolveDeny\(opts\.deny, agentEnv\.AGENT_DENY\);/);
   // plain_text, not secret_text: it is policy and must stay readable while auditing.
   assert.match(source, /\{ type: "plain_text", name: "AGENT_DENY", text: deny \}/);
+});
+
+test("resolveDeny fails closed and survives the library caller", async () => {
+  const { resolveDeny } = await import("./deploy-agent.mjs");
+  // deploy.mjs --agent passes no deny option at all. Reading that as anything but "keep what
+  // is recorded" crashed the combined deploy AFTER the vault leg had already succeeded.
+  assert.equal(resolveDeny(undefined, "A/**, B/**"), "A/**, B/**");
+  assert.equal(resolveDeny(undefined, undefined), "");
+  // Only the exact empty string clears. Whitespace is what an unset shell variable expands to,
+  // and treating it as a clear would silently widen the agent to the whole vault.
+  assert.equal(resolveDeny("", "A/**"), "");
+  assert.throws(() => resolveDeny("   ", "A/**"), /lists no paths/);
+  assert.throws(() => resolveDeny(",,", undefined), /lists no paths/);
+  // Normalised to one canonical form, so upload, record and re-read all agree.
+  assert.equal(resolveDeny("A/**\nB/**", undefined), "A/**, B/**");
+});
+
+test("--deny will not swallow the next option as its value", async () => {
+  const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
+  // `--deny --writable` would otherwise consume the flag AND store a glob matching nothing:
+  // a read-only agent that denies nothing, reported as one valid rule.
+  assert.match(source, /value !== "" && value\.startsWith\("--"\)/);
+  assert.match(source, /--deny needs a glob list, or "" to clear/);
 });
