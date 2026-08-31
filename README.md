@@ -367,8 +367,7 @@ snapshot. The exported **Sync log** keeps all 26, because that is the id the ser
   losing the account, bucket, or key. Keep an independent export: `scripts/restore.mjs`
   decrypts a snapshot without the plugin.
 - **Your data stays your responsibility.** There is no operator who can read your notes back
-  or restore them for you. Provided as-is under the PolyForm Small Business 1.0.0 license,
-  without warranty.
+  or restore them for you. Provided as-is under the AGPL-3.0-or-later, without warranty.
 
 ## Tokens
 
@@ -529,10 +528,11 @@ A release is cut by pushing a tag equal to the `manifest.json` version:
 
 ## License
 
-[PolyForm Small Business 1.0.0](https://polyformproject.org/licenses/small-business/1.0.0) —
-see [LICENSE](LICENSE). Personal use is unrestricted; use *for the benefit of a company* is
-permitted only for small businesses as the license defines them. Source-available, not OSI
-open source.
+[GNU Affero General Public License v3.0 or later](https://www.gnu.org/licenses/agpl-3.0.html) —
+see [LICENSE](LICENSE). Free to use, modify and share; if you run a modified version as a
+network service, its users are entitled to that version's source. Since everything here runs on
+your own Cloudflare account rather than as a service you offer to others, ordinary personal use
+carries no such obligation.
 
 ## Support
 
