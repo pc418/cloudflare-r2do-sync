@@ -9,7 +9,7 @@
 import { SyncApi, ApiError, type HttpClient } from "../../plugin/src/api";
 import { VaultCrypto, manifestAad, settingsAad } from "../../plugin/src/crypto";
 import { sha256Hex } from "../../plugin/src/hash";
-import { makeScopeFilter, parseGlobs } from "../../plugin/src/paths";
+import { makeExcluder, makeScopeFilter, parseGlobs } from "../../plugin/src/paths";
 import { isSettingsDoc } from "../../plugin/src/settings-doc";
 import { blobKey, parseFileEntries, type FileEntry, type Manifest } from "../../plugin/src/types";
 
@@ -66,6 +66,23 @@ const tooLarge = (bytes: number): VaultError =>
  * text* is a document this agent does not understand, and quietly reading it as "no excludes"
  * would widen scope to the whole vault at exactly the moment the policy stopped making sense.
  */
+/**
+ * The deploy-time deny globs, or none.
+ *
+ * **Fails closed.** Absent means no rule, which is the documented default. A value that is
+ * *present but yields nothing* is a misconfiguration — a shell that ate the quotes, an empty
+ * variable — and the failure mode of a misread deny list is exposure, so it throws rather than
+ * degrading to "deny nothing" on a deployment whose operator believed it denied something.
+ */
+export function denyGlobs(value: string | undefined | null): string[] {
+  if (value === undefined || value === null) return [];
+  const globs = parseGlobs(value.replace(/,/g, "\n"));
+  if (globs.length === 0) {
+    throw new VaultError("AGENT_DENY is set but lists no paths; unset it, or give it globs");
+  }
+  return globs;
+}
+
 function globList(value: unknown, field: string): string[] {
   // Only `undefined` is absence. An explicit `null` is a value this agent does not understand,
   // and reading it as "no rule" is the same widening as reading an array that way.
@@ -133,6 +150,18 @@ export class VaultView {
   readonly #writeApi: SyncApi | null;
   readonly #crypto: VaultCrypto;
   readonly #configDir: string;
+  /**
+   * Paths this agent has no permission on, from the deploy-time `AGENT_DENY` binding.
+   *
+   * Defence in depth over the vault's own policy, never a replacement: the effective scope is
+   * the intersection and denial always wins. It exists because the shared policy is a *synced
+   * document* — rewritable from any device, including a lost one — and a rule protecting
+   * credentials should not be editable from a phone. It is also a different question from
+   * excluding a folder from sync, which would stop it reaching the owner's own devices.
+   */
+  readonly #denied: (path: string) => boolean;
+  /** Part of the policy fingerprint, so narrowing the list invalidates caches built under it. */
+  readonly #denyMark: string;
   #cached: Snapshot | null = null;
 
   /**
@@ -150,11 +179,21 @@ export class VaultView {
     writeApi?: SyncApi | null;
     crypto: VaultCrypto;
     configDir?: string;
+    /** Glob list, same syntax as the policy's `excludes`. Absent means no rule. */
+    deny?: string;
   }) {
     this.#api = opts.api;
     this.#writeApi = opts.writeApi ?? null;
     this.#crypto = opts.crypto;
     this.#configDir = opts.configDir ?? ".obsidian";
+    const globs = denyGlobs(opts.deny);
+    this.#denied = makeExcluder(globs);
+    this.#denyMark = globs.join("\u0000");
+  }
+
+  /** Whether the agent's own deny list covers this path, regardless of the vault's policy. */
+  denied(path: string): boolean {
+    return this.#denied(path);
   }
 
   get configDir(): string {
@@ -190,6 +229,11 @@ export class VaultView {
     return (await this.#policyNow()).scope;
   }
 
+  /** Intersection, deny winning. One seam, so no tool has to remember to ask. */
+  #withDeny(policyScope: (path: string) => boolean): (path: string) => boolean {
+    return (path) => policyScope(path) && !this.#denied(path);
+  }
+
   /**
    * Reads the shared settings document and returns the current policy.
    *
@@ -212,17 +256,19 @@ export class VaultView {
     }
 
     if (raw === null || raw === undefined) {
-      const fingerprint = `none:${this.#configDir}`;
+      const fingerprint = `none:${this.#configDir}:${this.#denyMark}`;
       if (this.#policy?.fingerprint !== fingerprint) {
         this.#policy = {
           rev: 0,
           fingerprint,
-          scope: makeScopeFilter({
-            excludes: [],
-            onlyPaths: [],
-            syncConfigDir: false,
-            configDir: this.#configDir,
-          }),
+          scope: this.#withDeny(
+            makeScopeFilter({
+              excludes: [],
+              onlyPaths: [],
+              syncConfigDir: false,
+              configDir: this.#configDir,
+            })
+          ),
         };
       }
       return this.#policy;
@@ -230,7 +276,7 @@ export class VaultView {
 
     if (!isSettingsDoc(raw)) throw new VaultError("the shared settings document is malformed");
     const rev = raw.rev ?? 0;
-    const fingerprint = `${rev}:${raw.updatedAt}:${this.#configDir}`;
+    const fingerprint = `${rev}:${raw.updatedAt}:${this.#configDir}:${this.#denyMark}`;
     if (this.#policy?.fingerprint === fingerprint) return this.#policy;
 
     let plain: Record<string, unknown>;
@@ -250,12 +296,14 @@ export class VaultView {
       plain = raw.plain;
     }
 
-    const scope = makeScopeFilter({
-      excludes: globList(plain.excludes, "excludes"),
-      onlyPaths: globList(plain.onlyPaths, "onlyPaths"),
-      syncConfigDir: false,
-      configDir: this.#configDir,
-    });
+    const scope = this.#withDeny(
+      makeScopeFilter({
+        excludes: globList(plain.excludes, "excludes"),
+        onlyPaths: globList(plain.onlyPaths, "onlyPaths"),
+        syncConfigDir: false,
+        configDir: this.#configDir,
+      })
+    );
     this.#policy = { rev, fingerprint, scope };
     return this.#policy;
   }

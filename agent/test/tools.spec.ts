@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { SyncApi } from "../../plugin/src/api";
 import { callTool, lastWeekday, TOOLS, type ToolContext } from "../src/tools";
-import { fetchHttp, MAX_READ_BYTES, VaultView } from "../src/vault";
+import { denyGlobs, fetchHttp, MAX_READ_BYTES, VaultView } from "../src/vault";
 import { PLUGIN_DIR } from "../../plugin/src/paths";
 import { INDEX_CHUNK, SearchIndex } from "../src/index-store";
 import {
@@ -1172,5 +1172,107 @@ describe("a note larger than the cap is refused before it is fetched", () => {
     const { ctx } = await withNote(big);
     const out = await callTool("search", { query: "small" }, ctx);
     expect(out).toContain("Small.md");
+  });
+});
+
+describe("AGENT_DENY: paths this connector has no permission on", () => {
+  // Deploy-time, and deliberately not the same control as the vault's excludes: the shared
+  // policy is a synced document any device can rewrite, and excluding a folder from sync would
+  // also stop it reaching the owner's own devices. Placeholder names only — the real folder
+  // this exists for must never appear in a published file.
+  const NOTES = { "Notes/ok.md": "visible\n", "Vault Keys/aws.md": "AKIA-secret\n", "Vault Keys/deep/b.md": "more\n" };
+  const DENY = "Vault Keys/**";
+
+  async function denied(deny: string | undefined = DENY) {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, NOTES);
+    const api = new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const view = new VaultView({ api, writeApi: api, crypto, deny });
+    const writer = new VaultWriter({ view, device: "agent" });
+    const ctx: ToolContext = {
+      view,
+      writable: view.writable,
+      enqueue: async (op: WriteOp) => {
+        const outcome = await writer.apply([op]);
+        return { head: outcome.head, summary: outcome.applied[0] };
+      },
+    };
+    return { vault, crypto, view, ctx };
+  }
+
+  // Asserted on the snapshot, not only through a tool: a tool that never asked would pass.
+  it("hides denied paths from reads while keeping them in the carried map", async () => {
+    const { view } = await denied();
+    const snap = await view.snapshot();
+    expect(Object.keys(snap.files)).toEqual(["Notes/ok.md"]);
+    // Property 1: `all` is what a commit is rebuilt from and must stay complete.
+    expect(Object.keys(snap.all).sort()).toEqual(["Notes/ok.md", "Vault Keys/aws.md", "Vault Keys/deep/b.md"]);
+    expect(snap.hidden).toBe(2);
+  });
+
+  it("keeps them out of every read tool and the search", async () => {
+    const { ctx } = await denied();
+    expect(await callTool("list", {}, ctx)).not.toContain("Vault Keys");
+    expect(await callTool("search", { query: "AKIA" }, ctx)).toContain("No match");
+    await expect(callTool("read", { path: "Vault Keys/aws.md" }, ctx)).rejects.toThrow(/no note at/);
+  });
+
+  // "This vault does not sync it" and "this connector may not touch it" send the operator to
+  // different places, so they are different messages.
+  it("refuses writes with its own reason, not the vault-policy one", async () => {
+    const { ctx } = await denied();
+    for (const [name, args] of [
+      ["write", { path: "Vault Keys/new.md", content: "x" }],
+      ["append", { path: "Vault Keys/aws.md", text: "x" }],
+      ["delete", { path: "Vault Keys/aws.md" }],
+      ["move", { from: "Notes/ok.md", to: "Vault Keys/moved.md" }],
+      ["move", { from: "Vault Keys/aws.md", to: "Notes/leaked.md" }],
+    ] as const) {
+      await expect(callTool(name, args, ctx), name + JSON.stringify(args)).rejects.toThrow(
+        /has no permission on/
+      );
+    }
+  });
+
+  // THE regression test. Filtering deny out of `all` would make the next write delete every
+  // denied file — the same P1 the first review found for excludes.
+  it("does not delete denied files when it commits an allowed one", async () => {
+    const { vault, crypto, ctx } = await denied();
+    await callTool("write", { path: "Notes/second.md", content: "new\n" }, ctx);
+    // Read the committed manifest back through a view with NO deny list: the entries must be
+    // there, byte for byte.
+    const api = new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const after = await new VaultView({ api, crypto }).snapshot();
+    expect(Object.keys(after.files).sort()).toEqual([
+      "Notes/ok.md",
+      "Notes/second.md",
+      "Vault Keys/aws.md",
+      "Vault Keys/deep/b.md",
+    ]);
+  });
+
+  // Property 2: the cache and the search index key on the policy fingerprint, so a narrowed
+  // list against an unmoved head must not keep serving the wider one.
+  it("invalidates a snapshot cached under a wider list", async () => {
+    const { vault, crypto } = await denied(undefined);
+    const api = new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const wide = new VaultView({ api, crypto });
+    expect(Object.keys((await wide.snapshot()).files)).toHaveLength(3);
+    // Same head, same settings document, narrower deny: a fingerprint keyed only on rev and
+    // configDir would answer from the cache built a moment ago.
+    const narrow = new VaultView({ api, crypto, deny: DENY });
+    expect(Object.keys((await narrow.snapshot()).files)).toEqual(["Notes/ok.md"]);
+  });
+
+  // Property 3: absent is a rule; present-but-empty is a misconfiguration, and the failure
+  // mode of a misread deny list is exposure.
+  it("fails closed on a value that lists nothing", () => {
+    expect(denyGlobs(undefined)).toEqual([]);
+    expect(denyGlobs("A/**, B/**")).toEqual(["A/**", "B/**"]);
+    expect(denyGlobs("A/**\nB/**")).toEqual(["A/**", "B/**"]);
+    for (const bad of ["", "   ", ",", "\n\n"]) {
+      expect(() => denyGlobs(bad), JSON.stringify(bad)).toThrow(/lists no paths/);
+    }
   });
 });

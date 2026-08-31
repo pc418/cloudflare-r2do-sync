@@ -457,3 +457,24 @@ test("two deploys of one vault cannot mint at the same time", async () => {
   assert.equal(await withDeployLock(dir, "v", async () => "free"), "free");
   rmSync(dir, { recursive: true });
 });
+
+test("the deny list is parsed the same way on both sides, and is clearable", async () => {
+  const { parseDenyGlobs } = await import("./deploy-agent.mjs");
+  // Same syntax as the vault's excludes: comma or newline separated, trimmed.
+  assert.deepEqual(parseDenyGlobs("A/**, B/**"), ["A/**", "B/**"]);
+  assert.deepEqual(parseDenyGlobs("A/**\nB/**"), ["A/**", "B/**"]);
+  assert.deepEqual(parseDenyGlobs("  A/**  "), ["A/**"]);
+  // A value that lists nothing is a misconfiguration, not "deny nothing" — a shell that ate
+  // the quotes must not produce a Worker that denies nothing and says nothing.
+  for (const bad of ["", "   ", ",", "\n"]) assert.deepEqual(parseDenyGlobs(bad), []);
+
+  const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
+  // Kept across redeploys, like the bearer: silently emptying it would be worse than never
+  // having set it.
+  assert.match(source, /opts\.deny === null \? \(agentEnv\.AGENT_DENY \?\? ""\) : opts\.deny/);
+  // Clearing has to be expressible, so --deny reads its value directly rather than through
+  // next(), which rejects an empty string.
+  assert.match(source, /--deny needs a value \(use --deny "" to clear\)/);
+  // plain_text, not secret_text: it is policy and must stay readable while auditing.
+  assert.match(source, /\{ type: "plain_text", name: "AGENT_DENY", text: deny \}/);
+});

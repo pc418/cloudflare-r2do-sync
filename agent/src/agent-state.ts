@@ -63,6 +63,7 @@ export class AgentState extends DurableObject<AgentEnv> {
         writeApi: write === undefined || write === "" ? null : client(write),
         crypto,
         configDir,
+        deny: this.env.AGENT_DENY,
       });
       this.#writer = new VaultWriter({
         view: this.#view,

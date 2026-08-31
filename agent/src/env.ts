@@ -39,5 +39,14 @@ export interface AgentEnv {
    * a typo is refused.
    */
   AGENT_TZ?: string;
+  /**
+   * Paths this agent has no permission on: a glob list, same syntax as the vault's excludes.
+   *
+   * Deploy-time and immutable from the vault's point of view — that is the feature. The shared
+   * policy is a synced document any device can rewrite; this cannot be widened by anything the
+   * vault syncs. `plain_text`, not a secret: it is policy, and it should stay readable at
+   * exactly the moment somebody is auditing what the agent can reach.
+   */
+  AGENT_DENY?: string;
   AGENT: DurableObjectNamespace<AgentState>;
 }

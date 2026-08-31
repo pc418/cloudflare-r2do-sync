@@ -75,6 +75,10 @@ const USAGE = `usage: node scripts/deploy-agent.mjs --vault <name> [--writable] 
                      (the connector must then be removed and re-added)
   --rotate-tokens    issue a new vault access token pair and revoke the one it replaces
                      (invisible to any client; nothing needs reconfiguring)
+  --deny <globs>     paths this agent has no permission on, comma or newline separated
+                     (e.g. --deny "Private/**, Keys/**"). Recorded and kept across
+                     redeploys; pass --deny "" to clear it. Denial beats the vault's
+                     own policy and cannot be widened from inside the vault.
   --name <script>    agent Worker name
                      (default: <vault>-agent-<8 random chars>, generated once and recorded
                       in .env.agent.<vault>; an existing deployment keeps its name)
@@ -83,7 +87,7 @@ The agent is a SEPARATE Worker holding the vault master key. Deploying it agains
 whose own credentials are not in .env.<vault> is refused.`;
 
 function parseArgs(argv) {
-  const opts = { vault: null, writable: false, rotateBearer: false, rotateTokens: false, name: null };
+  const opts = { vault: null, writable: false, rotateBearer: false, rotateTokens: false, name: null, deny: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const next = () => {
@@ -96,6 +100,12 @@ function parseArgs(argv) {
     else if (arg === "--writable") opts.writable = true;
     else if (arg === "--rotate-bearer") opts.rotateBearer = true;
     else if (arg === "--rotate-tokens") opts.rotateTokens = true;
+    // Not `next()`: an empty value is meaningful here — `--deny ""` is how a deny list is
+    // cleared, and refusing it would make the setting one-way.
+    else if (arg === "--deny") {
+      if (i + 1 >= argv.length) throw new Error('--deny needs a value (use --deny "" to clear)');
+      opts.deny = argv[++i];
+    }
     else if (arg === "--help" || arg === "-h") {
       console.log(USAGE);
       process.exit(0);
@@ -196,6 +206,15 @@ Store the values somewhere safe and delete it. The bearer survives every redeplo
  * automatic and nothing in the agent knows a transition rule. An unknown name is refused here,
  * while a human is watching — the agent itself falls back to UTC rather than failing to start.
  */
+/** Same parse the agent applies, so a value accepted here is one it will accept there. */
+export function parseDenyGlobs(value) {
+  return value
+    .replace(/,/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
 export function resolveDeployZone(named, machine = Intl.DateTimeFormat().resolvedOptions().timeZone) {
   const zone = (named ?? "").trim() || machine || "UTC";
   const advice =
@@ -296,6 +315,15 @@ async function deployAgentLocked(opts) {
   // watching, and an invisible silent fallback to UTC is a wrong date on every row for months.
   const timezone = resolveDeployZone(process.env.AGENT_TZ ?? vaultEnv.AGENT_TZ);
 
+  // Kept across redeploys the way the bearer is: a deny list that silently emptied itself on
+  // the next deploy would be worse than never having had one. `--deny ""` is how you clear it,
+  // explicitly. Parsed here so a shell that ate the quotes fails on this machine rather than
+  // producing a Worker that denies nothing and says nothing.
+  const deny = (opts.deny === null ? (agentEnv.AGENT_DENY ?? "") : opts.deny).trim();
+  if (deny !== "" && parseDenyGlobs(deny).length === 0) {
+    throw new Error(`--deny ${JSON.stringify(opts.deny)} lists no paths. Quote it, or pass --deny "" to clear.`);
+  }
+
   const API = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}`;
   const cf = async (pathname, init = {}) => {
     const res = await fetch(`${API}${pathname}`, {
@@ -322,6 +350,7 @@ async function deployAgentLocked(opts) {
   // perfectly and then decrypts nothing — a failure found much later, and confusing when it
   // arrives. Naming the source makes it checkable here, for free.
   log(`master key from ${keySource} (uploaded as a Worker secret; never printed)`);
+  log(deny === "" ? "deny list: none — this agent may reach every path the vault syncs" : `deny list: ${parseDenyGlobs(deny).length} glob(s)`);
   log(`timezone ${timezone}${process.env.AGENT_TZ ?? vaultEnv.AGENT_TZ ? "" : " (read from this machine)"}`);
 
   // --- refuse to upload over an unrelated Worker ------------------------------
@@ -475,6 +504,9 @@ async function deployAgentLocked(opts) {
         { type: "plain_text", name: "AGENT_DEVICE", text: `agent (${scriptName})` },
         // Every date the agent renders, and every day boundary a range resolves to.
         { type: "plain_text", name: "AGENT_TZ", text: timezone },
+        // plain_text, not a secret: this is policy, and it must stay readable at exactly the
+        // moment somebody is auditing what the agent can reach.
+        ...(deny === "" ? [] : [{ type: "plain_text", name: "AGENT_DENY", text: deny }]),
         // What the hard-skip set is computed from. A vault with a renamed Obsidian config folder
         // must say so, or its historical credentials are neither hidden nor write-protected.
         ...(process.env.VAULT_CONFIG_DIR
@@ -566,6 +598,7 @@ async function deployAgentLocked(opts) {
     AGENT_SCRIPT: scriptName,
     MCP_BEARER: bearer,
     VAULT_NAME: vault,
+    AGENT_DENY: deny,
     // The id of whatever is live now: this run's, or the one it chose to keep.
     READ_TOKEN_ID: readToken === undefined ? (agentEnv.READ_TOKEN_ID ?? "") : tokenIdOf(readToken),
     WRITE_TOKEN_ID: !opts.writable

@@ -178,6 +178,13 @@ export class VaultWriter {
       // attempt, and it is the one that built the map. It also saves a subrequest.
       const inScope = snapshot.inScope;
       for (const path of ops.flatMap(opPaths)) {
+        // Two different refusals on purpose. "This vault does not sync it" is a policy the
+        // owner can change from any device; "this connector has no permission" is set where
+        // the agent was deployed and cannot be changed from inside the vault at all. Sending
+        // both to the same message would send the reader to the wrong place.
+        if (this.#view.denied(path)) {
+          throw new VaultError(`"${path}" is a path this connector has no permission on`);
+        }
         if (!inScope(path)) {
           throw new VaultError(
             `"${path}" is outside what this vault syncs (its exclude or only-paths policy), so writing it would publish a note no device would download`
