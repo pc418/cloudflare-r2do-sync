@@ -168,7 +168,7 @@ describe("read tools", () => {
     const out = await callTool("search", { query: "gyokuro" }, ctx);
     expect(out).toContain("Projects/Tea.md:3");
     expect(out).toContain("Gyokuro wants 60C water.");
-    expect(out).toContain("scanned");
+    expect(out).toContain("searched");
   });
 
   it("says plainly when a search found nothing", async () => {
@@ -792,12 +792,13 @@ describe("budgets and configuration", () => {
       }
     );
     // The index really was current — otherwise this test proves nothing about bypassing it.
-    expect(indexed).toContain("indexed notes");
+    // "every note" is the coverage claim only the index can make; the scan reports a count.
+    expect(indexed).toContain("searched every note");
     expect(viaRegex).toContain("Tea.md:3");
-    expect(viaRegex).not.toContain("indexed notes");
+    expect(viaRegex).not.toContain("searched every note");
     // The match is on line 3; "# Tea" is line 1, so it appears only once context is asked for.
     expect(indexed).not.toContain("# Tea");
-    expect(wide).toContain("indexed notes");
+    expect(wide).toContain("searched every note");
     expect(wide).toContain("# Tea");
   });
 

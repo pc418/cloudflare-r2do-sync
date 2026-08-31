@@ -162,7 +162,6 @@ export class VaultWriter {
       if (refusal !== null) throw new VaultError(refusal);
     }
 
-    let lastError: unknown = null;
     for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt++) {
       const snapshot = await this.#view.snapshot({ fresh: true });
 
@@ -229,12 +228,13 @@ export class VaultWriter {
         const head = await this.#view.commit(manifest, snapshot.head);
         return { head, applied };
       } catch (error) {
+        // Only a lost CAS is retryable, and its detail is not something the caller can act
+        // on — the message says what happened and what to do instead.
         if (!(error instanceof StaleHeadError)) throw error;
-        lastError = error;
       }
     }
     throw new VaultError(
-      `the vault kept moving under this write (${CAS_ATTEMPTS} attempts). Nothing was committed. ${String(lastError)}`
+      `another device kept changing this vault while the write was in flight (${CAS_ATTEMPTS} attempts). Nothing was saved — try again.`
     );
   }
 

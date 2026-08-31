@@ -255,7 +255,7 @@ export class VaultView {
    */
   async snapshot(opts: { fresh?: boolean } = {}): Promise<Snapshot> {
     const [head, policy] = await Promise.all([this.#api.getHead(), this.#policyNow()]);
-    if (head === null) throw new VaultError("this vault has no snapshots yet");
+    if (head === null) throw new VaultError("this vault is empty — nothing has been synced to it yet");
     // Keyed by the policy too: the visible half of a snapshot is a function of both, and a
     // policy can change while the head stands still.
     if (this.#cached?.head === head && this.#cached.policy === policy.fingerprint && opts.fresh !== true) {

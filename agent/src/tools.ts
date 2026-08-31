@@ -196,7 +196,7 @@ export const TOOLS: ToolDescriptor[] = [
           type: "string",
           enum: ["path", "modified", "size"],
           description:
-            "Order (default \"path\"). Direction is fixed per key, as `ls` does it: path A-Z, modified newest first, size largest first. Truncation happens after sorting, so a cut listing is a meaningful top-N.",
+            "Order (default \"path\"). Each key has one direction, as `ls` does it: path A-Z, modified newest first, size largest first. max_results keeps the top N of this order, not the first N by path.",
         },
         modified_after: str(
           "Only notes modified at or after this ISO 8601 time, inclusive. A date alone is UTC midnight."
@@ -451,10 +451,10 @@ export async function callTool(
       if (result.hits.length === 0) {
         const where =
           result.source === "index"
-            ? `No matches across all ${result.scanned} indexed note(s).`
-            : `No matches in ${result.scanned} of ${result.candidates} candidate notes.${
+            ? `No matches in any of the ${result.scanned} note(s) — every note was searched.`
+            : `No matches in ${result.scanned} of ${result.candidates} note(s).${
                 result.more
-                  ? " The scan hit its budget before covering the whole vault — narrow it with folder or glob."
+                  ? " Not every note was searched — narrow it with folder or glob, and treat this as no answer rather than no match."
                   : ""
               }`;
         return where;
@@ -464,10 +464,10 @@ export async function callTool(
         .join("\n\n");
       const note =
         result.source === "index"
-          ? `\n\n(searched all ${result.scanned} indexed notes${result.more ? "; more matches exist than were returned — raise max_results" : ""})`
+          ? `\n\n(searched every note${result.more ? "; more matches exist than were returned — raise max_results" : ""})`
           : result.more
-            ? `\n\n(scanned ${result.scanned} of ${result.candidates} candidate notes before hitting the budget — there may be more)`
-            : `\n\n(scanned ${result.scanned} notes)`;
+            ? `\n\n(searched ${result.scanned} of ${result.candidates} notes — there may be more; narrow with folder or glob)`
+            : `\n\n(searched ${result.scanned} notes)`;
       return `${result.hits.length} match(es):\n\n${body}${note}`;
     }
 
