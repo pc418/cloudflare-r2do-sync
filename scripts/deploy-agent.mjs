@@ -108,7 +108,11 @@ export function mcpSetupInstructions({ url, agentEnvName, writable }) {
   return `
 agent live at ${url}
 credentials recorded in ${agentEnvName} (gitignored)
-tools: ${writable ? "search, read, list, recent, append, edit, write" : "search, read, list, recent (read-only)"}
+tools: ${writable ? "search, read, list, recent, append, edit, write, delete, move" : "search, read, list, recent (read-only)"}${
+    writable
+      ? "\nwrite, delete and move act like a file system: no confirmation, and your undo is\nsnapshot history within the retention window."
+      : ""
+  }
 
 This Worker holds the vault MASTER KEY and decrypts notes to answer, so whatever it reads
 reaches your model provider as plaintext. The sync Worker's "the server cannot read your
