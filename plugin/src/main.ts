@@ -1816,6 +1816,58 @@ export default class LogSyncPlugin extends Plugin {
 
   /** Applies a scanned setup link. The device identity changes, so cached sync state goes. */
   async applySetup(payload: SetupPayload, opts: { backedUp?: boolean } = {}): Promise<void> {
+    // Captured before the first mutation, and restored as a whole if anything below rejects.
+    //
+    // The rollback lives here rather than in the caller because only this method can reach the
+    // rest of what it resets: settings alone are not the device. Putting back the fields while
+    // leaving `#state`, `#sharedSettings` and `#keyMismatch` cleared would restore a device
+    // that has forgotten its merge base — recoverable, but not "the way it was", and a caller
+    // saying so would be making a claim it could not keep.
+    const before = {
+      settings: { ...this.settings },
+      pending: this.#pendingEncryptionTransition,
+      state: this.#state,
+      shared: this.#sharedSettings,
+      mismatch: this.#keyMismatch,
+    };
+    try {
+      await this.#applySetupFields(payload, opts);
+    } catch (error) {
+      Object.assign(this.settings, before.settings);
+      this.#pendingEncryptionTransition = before.pending;
+      this.#state = before.state;
+      this.#sharedSettings = before.shared;
+      this.#keyMismatch = before.mismatch;
+      // Best effort, and it is allowed to fail: the in-memory device is already back, and a
+      // second failure here must not replace the original reason with a save error.
+      try {
+        await this.saveSettings();
+      } catch {
+        /* reported by the throw below, which carries the reason that actually matters */
+      }
+      throw error;
+    }
+
+    try {
+      const head = await new SyncApi({
+        baseUrl: this.settings.serverUrl,
+        token: this.settings.accessToken,
+        http: obsidianHttp,
+      }).getHead();
+      new Notice(
+        `R2DO Sync configured as "${payload.name}"${payload.mode === "encrypted" ? " (encrypted)" : " (plaintext)"}. Remote head: ${head === null ? "(empty vault)" : shortSnapshot(head)}`,
+        10_000
+      );
+      // A device that was just set up should not sit idle until someone finds the ribbon.
+      // Interactive, so the mass-change guard may ask instead of silently parking.
+      void this.syncNow();
+    } catch (e) {
+      new Notice(`R2DO Sync configured, but the connection test failed: ${message(e)}`, 0);
+    }
+  }
+
+  /** The mutation half of `applySetup`, so its caller can roll the whole thing back. */
+  async #applySetupFields(payload: SetupPayload, opts: { backedUp?: boolean }): Promise<void> {
     this.settings.serverUrl = normalizeServerUrl(payload.url);
     this.settings.accessToken = payload.token;
     this.settings.deviceName = payload.name;
@@ -1841,23 +1893,6 @@ export default class LogSyncPlugin extends Plugin {
     if (this.#settingsPushTimer !== null) {
       window.clearTimeout(this.#settingsPushTimer);
       this.#settingsPushTimer = null;
-    }
-
-    try {
-      const head = await new SyncApi({
-        baseUrl: this.settings.serverUrl,
-        token: this.settings.accessToken,
-        http: obsidianHttp,
-      }).getHead();
-      new Notice(
-        `R2DO Sync configured as "${payload.name}"${payload.mode === "encrypted" ? " (encrypted)" : " (plaintext)"}. Remote head: ${head === null ? "(empty vault)" : shortSnapshot(head)}`,
-        10_000
-      );
-      // A device that was just set up should not sit idle until someone finds the ribbon.
-      // Interactive, so the mass-change guard may ask instead of silently parking.
-      void this.syncNow();
-    } catch (e) {
-      new Notice(`R2DO Sync configured, but the connection test failed: ${message(e)}`, 0);
     }
   }
 
@@ -4927,11 +4962,6 @@ export class LogSyncSettingTab extends PluginSettingTab {
       return;
     }
 
-    // Past this line the claim "nothing has been saved" would be false: `applySetup` writes
-    // every field before it awaits anything, and its save may succeed and a later step still
-    // reject. So the previous settings are captured and put back on failure, and the message
-    // says which of the two actually happened.
-    const before = JSON.parse(JSON.stringify(this.plugin.settings)) as Settings;
     try {
       // A minted key exists nowhere else yet, so it must pass the one-time backup gate before
       // anything is uploaded. A key the user typed is already in their backup.
@@ -4940,17 +4970,9 @@ export class LogSyncSettingTab extends PluginSettingTab {
       this.#resetProbe();
       this.display();
     } catch (e) {
-      let restored = true;
-      try {
-        Object.assign(this.plugin.settings, before);
-        await this.plugin.saveSettings();
-      } catch {
-        restored = false;
-      }
-      this.#probeError = restored
-        ? `Setting this device up failed: ${message(e)} It has been put back the way it was.`
-        : `Setting this device up failed: ${message(e)} This device may now be half-configured ` +
-          "— check the Connection fields before syncing.";
+      // `applySetup` rolls its own mutation back — settings *and* the in-memory state it
+      // resets, which this page cannot reach — so the claim below is one it can keep.
+      this.#probeError = `Setting this device up failed: ${message(e)} This device was left as it was.`;
       this.display();
     }
   }

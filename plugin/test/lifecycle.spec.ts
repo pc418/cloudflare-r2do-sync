@@ -1987,4 +1987,38 @@ describe("applySetup called programmatically", () => {
 
     expect(plugin.settings.firstSyncAcknowledged).toBe(false);
   });
+
+  it("puts the whole device back when the join cannot be saved", async () => {
+    // Settings alone are not the device: applySetup also clears the synced state, the shared
+    // settings and the key-mismatch flag. A rollback that restored only the fields would leave
+    // a device that had forgotten its merge base while reporting it was untouched.
+    const { plugin } = makePlugin(
+      persisted({ settings: { ...CONFIGURED, retryAttempts: 0 }, state: null })
+    );
+    await plugin.onload();
+    await plugin.syncNow();
+    await flush();
+
+    const stateBefore = (plugin as unknown as { syncState: unknown }).syncState;
+    const urlBefore = plugin.settings.serverUrl;
+    const ackBefore = plugin.settings.firstSyncAcknowledged;
+
+    // The save is what fails — the shape the review named, where the write can reject after
+    // every field has already been assigned.
+    const original = plugin.saveSettings.bind(plugin);
+    let failed = false;
+    plugin.saveSettings = () => {
+      failed = true;
+      plugin.saveSettings = original;
+      return Promise.reject(new Error("disk full"));
+    };
+
+    await expect(plugin.applySetup(PAYLOAD)).rejects.toThrow(/disk full/);
+    expect(failed).toBe(true);
+
+    expect(plugin.settings.serverUrl).toBe(urlBefore);
+    expect(plugin.settings.accessToken).toBe(CONFIGURED.accessToken);
+    expect(plugin.settings.firstSyncAcknowledged).toBe(ackBefore);
+    expect((plugin as unknown as { syncState: unknown }).syncState).toBe(stateBefore);
+  });
 });
