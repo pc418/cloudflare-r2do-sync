@@ -110,24 +110,50 @@ agent live at ${url}
 credentials recorded in ${agentEnvName} (gitignored)
 tools: ${writable ? "search, read, list, recent, append, edit, write" : "search, read, list, recent (read-only)"}
 
-Add it in Claude → Settings → Connectors → Add custom connector:
+This Worker holds the vault MASTER KEY and decrypts notes to answer, so whatever it reads
+reaches your model provider as plaintext. The sync Worker's "the server cannot read your
+notes" property does not extend to it. Deleting this script and revoking its token ends it.
+
+--- connect it -------------------------------------------------------------------------
+
+FIRST, check this is possible: in Claude → Settings → Connectors → Add custom connector,
+look for a "Request headers" section. Request headers are a gated beta. If that section is
+absent, your account does not have it, bearer auth is unavailable, and there is currently no
+other supported path — OAuth is not built. Nothing below will work until it appears.
+
   URL     ${url}/mcp
   Auth    None, plus a request header:
             Authorization: Bearer <MCP_BEARER from ${agentEnvName}>
 
-The header value must include the word "Bearer" and the space — Claude sends it verbatim.
-The URL must end in /mcp, never /sse: Anthropic reads /sse as the legacy transport.
-Register this workers.dev URL exactly — a redirect to another host drops the header.
-Auth settings are immutable once the connector exists; rotating the bearer
-(--rotate-bearer) means removing and re-adding it.
+Put the exact header value on your clipboard (it is not printed — this token fronts a
+process holding the master key, and printing it would leave it in your scrollback):
 
-Standing instructions: put a note called AGENT.md at the vault root and the agent serves it
-as context at the start of every conversation. It is read through this vault's own exclude
-policy, and it is advice to the model, never configuration.
+  printf 'Bearer %s' "$(grep '^MCP_BEARER=' ${agentEnvName} | cut -d= -f2-)" | pbcopy
 
-Health check: curl ${url}/health  →  {"ok":true}
-An unauthenticated GET ${url}/mcp answers 401, not 405: the bearer is checked before
-the method, so 401 there is the correct answer to an anonymous probe, not a broken deploy.`;
+Four things that each cost an hour if missed:
+  1. The value is sent verbatim, so it must include the word "Bearer" and the space.
+  2. The URL must end in /mcp, never /sse — Anthropic reads /sse as the legacy transport.
+  3. Register this workers.dev URL exactly; a redirect to another host drops the header.
+  4. Auth settings are immutable once the connector exists, so rotating the bearer
+     (--rotate-bearer) means removing and re-adding the connector.
+
+--- check it ---------------------------------------------------------------------------
+
+  curl ${url}/health          →  {"ok":true}
+  node testvault/agent-mcp-verify.mjs   (50 checks against this live deployment)
+
+An unauthenticated GET ${url}/mcp answers 401, not 405: the bearer is
+checked before the method, so 401 there is the correct answer to an anonymous probe rather
+than a broken deploy.
+
+--- teach it your vault ----------------------------------------------------------------
+
+Put a note called AGENT.md at the vault root — "daily notes live in Daily/YYYY-MM-DD.md",
+"read Inbox.md first", "when I say log X, append X under ## Log in today's note" — and the
+agent serves it as context at the start of every conversation. It is an ordinary note, so
+you can edit it on any device${writable ? ", and this deployment can edit it itself" : ""}.
+New text takes effect in the NEXT conversation. It is read through this vault's own exclude
+policy, and it is advice to the model, never configuration.`;
 }
 
 export async function deployAgent(opts) {

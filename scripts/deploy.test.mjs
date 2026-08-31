@@ -86,6 +86,39 @@ test("MCP setup instructions name the file, never the bearer itself", async () =
   // 401 on an anonymous /mcp probe is correct, and reads as a broken deploy if unexplained.
   assert.match(text, /401, not 405/);
   assert.match(text, /read-only/);
+
+  // The gated beta is the hard stop: without a "Request headers" section in the dialog there
+  // is no supported path at all, and a user who is not told that hunts for a field that does
+  // not exist. It has to come before the values, not after them.
+  const gate = text.indexOf("Request headers");
+  const values = text.indexOf("/mcp");
+  assert.ok(gate > 0, "expected the request-headers beta caveat");
+  assert.ok(gate < values, "the caveat must precede the values it gates");
+  assert.match(text, /OAuth is not built/);
+
+  // A way to get the 64-char token out without it landing in scrollback, and a way to check
+  // the deployment before trusting it.
+  assert.match(text, /pbcopy/);
+  assert.match(text, /agent-mcp-verify\.mjs/);
+
+  // The custody trade. `deploy.mjs --agent` says it on the confirmation screen; someone
+  // running this script directly never sees that screen.
+  assert.match(text, /MASTER KEY/);
+  assert.match(text, /reaches your model provider/);
+
+  // The standing-instructions note, and the one thing about it that surprises people.
+  assert.match(text, /AGENT\.md/);
+  assert.match(text, /NEXT conversation/);
+});
+
+test("the setup text names the writable deployment's extra ability", async () => {
+  const { mcpSetupInstructions } = await import("./deploy-agent.mjs");
+  const ro = mcpSetupInstructions({ url: "https://a.example", agentEnvName: ".env.agent.v", writable: false });
+  const rw = mcpSetupInstructions({ url: "https://a.example", agentEnvName: ".env.agent.v", writable: true });
+  assert.match(rw, /this deployment can edit it itself/);
+  assert.doesNotMatch(ro, /this deployment can edit it itself/);
+  assert.match(rw, /append, edit, write/);
+  assert.doesNotMatch(ro, /append, edit, write/);
 });
 
 test("importing deploy-agent.mjs does not deploy anything", async () => {
