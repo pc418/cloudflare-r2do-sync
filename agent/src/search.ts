@@ -41,14 +41,24 @@ export interface SearchHit {
   line: number;
   text: string;
   /**
-   * The matched line plus `context` lines either side, for orientation without a second
-   * `read` call. At `context: 0` it is the matched line alone.
+   * The matched line, plus `context` lines either side when the caller asked for any. By
+   * default it is the matched line alone.
    */
   context: string[];
 }
 
-/** `grep -C`: lines either side of a match. Two is enough to orient, and was the old fixed value. */
-export const CONTEXT_DEFAULT = 2;
+/**
+ * `grep -C`: lines either side of a match. **Zero by default**, which is grep's own default
+ * and therefore the prior any model brings to a tool shaped like grep.
+ *
+ * The costs are asymmetric, which is what settles it. Too little context costs one cheap
+ * follow-up call the caller can choose to make; too much is spent in every context window with
+ * no recourse at all — measured at ~35 lines of noise around 7 lines of signal on one outline
+ * query, one of those lines an 800-character bullet. An earlier default of 2 matched this
+ * tool's original fixed behaviour, which is a compatibility argument this pre-1.0 surface does
+ * not have to honour.
+ */
+export const CONTEXT_DEFAULT = 0;
 /**
  * Deliberately small. Context is a *preview* — anything wanting more of a note should `read`
  * it, and a generous cap here would let one high-hit query fill the whole result budget with
@@ -155,7 +165,7 @@ export async function search(
     budget?: number;
     /** Compile the query as a regular expression instead of matching it as a substring. */
     regex?: boolean;
-    /** Lines of context either side of each match (default 2, 0 for the match line alone). */
+    /** Lines of context either side of each match (default 0: the matched line alone). */
     context?: number;
   } = {}
 ): Promise<SearchResult> {

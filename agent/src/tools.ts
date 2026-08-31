@@ -116,7 +116,7 @@ export const TOOLS: ToolDescriptor[] = [
             "Treat the query as a regular expression (default false). Slower: regular expressions cannot use the index, so the search always falls back to the budgeted scan.",
         },
         context: int(
-          `Lines of context either side of each match, like grep -C (default ${CONTEXT_DEFAULT}, cap ${CONTEXT_MAX}). Use 0 for matched lines only — the right choice when harvesting paths or matching structure, where context is noise.`
+          `Lines of context either side of each match, like grep -C (default ${CONTEXT_DEFAULT} — matched lines only; cap ${CONTEXT_MAX}). Ask for 1-2 when you need to see what surrounds a hit; leave it alone for structure queries, path-harvesting, or anything with many hits.`
         ),
         folder: str("Restrict to a folder, subfolders included, e.g. \"Projects\"."),
         glob: str("Optional path glob, e.g. \"Daily/**\" or \"**/*.md\". ANDed with folder when both are given."),

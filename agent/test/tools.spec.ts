@@ -193,8 +193,10 @@ describe("read tools", () => {
 
   // The measured case this exists for: an outline query over one note returned ~35 lines of
   // context for 7 lines of signal, one of them an 800-character bullet, with no way to
-  // suppress it. `context: 0` is grep's own answer, so no `paths_only` flag is needed.
-  it("returns matched lines alone at context 0, and widens on request", async () => {
+  // suppress it. Zero is grep's own default, so no `paths_only` flag is needed — and the costs
+  // are asymmetric: too little context is one cheap follow-up call, too much is spent in every
+  // context window with no recourse.
+  it("returns matched lines alone by default, and widens on request", async () => {
     const note = [
       "# Title",
       "prose above one",
@@ -205,20 +207,17 @@ describe("read tools", () => {
     ].join("\n");
     const { ctx } = await context({ notes: { "Outline.md": note } });
 
-    const bare = await callTool(
-      "search",
-      { query: "^#{1,6} ", regex: true, context: 0 },
-      ctx
-    );
+    const bare = await callTool("search", { query: "^#{1,6} ", regex: true }, ctx);
     expect(bare).toContain("Outline.md:1");
     expect(bare).toContain("# Title");
     expect(bare).toContain("## Section");
-    // The whole point: none of the surrounding prose comes back.
+    // The whole point: none of the surrounding prose comes back unasked.
     expect(bare).not.toContain("prose above");
     expect(bare).not.toContain("pure noise");
+    // Explicit 0 and the default are the same thing, not two code paths.
+    expect(await callTool("search", { query: "^#{1,6} ", regex: true, context: 0 }, ctx)).toBe(bare);
 
-    // Default is two either side, unchanged from before the option existed.
-    const wide = await callTool("search", { query: "## Section" }, ctx);
+    const wide = await callTool("search", { query: "## Section", context: 2 }, ctx);
     expect(wide).toContain("prose above two");
   });
 
@@ -698,7 +697,7 @@ describe("budgets and configuration", () => {
     const crypto = await testCrypto();
     await seed(vault, crypto, { "Tea.md": "# Tea\n\nGyokuro wants 60C water.\n" });
 
-    const [indexed, viaRegex, narrow] = await runInDurableObject(
+    const [indexed, viaRegex, wide] = await runInDurableObject(
       env.AGENT.getByName(`r-${Math.random().toString(36).slice(2)}`),
       async (_i: AgentState, state) => {
         const view = new VaultView({
@@ -717,17 +716,18 @@ describe("budgets and configuration", () => {
         const fromRegex = await callTool("search", { query: "gyokuro.*[0-9]+C", regex: true }, ctx);
         // `context` reaches the index too. It is an optional parameter on a separate code
         // path, so a forgotten hand-off would typecheck and silently ignore the caller.
-        const narrow = await callTool("search", { query: "gyokuro", context: 0 }, ctx);
-        return [fromIndex, fromRegex, narrow];
+        const wide = await callTool("search", { query: "gyokuro", context: 2 }, ctx);
+        return [fromIndex, fromRegex, wide];
       }
     );
     // The index really was current — otherwise this test proves nothing about bypassing it.
     expect(indexed).toContain("indexed notes");
-    expect(indexed).toContain("# Tea");
     expect(viaRegex).toContain("Tea.md:3");
     expect(viaRegex).not.toContain("indexed notes");
-    expect(narrow).toContain("indexed notes");
-    expect(narrow).not.toContain("# Tea");
+    // The match is on line 3; "# Tea" is line 1, so it appears only once context is asked for.
+    expect(indexed).not.toContain("# Tea");
+    expect(wide).toContain("indexed notes");
+    expect(wide).toContain("# Tea");
   });
 
   // A failed fetch has still been spent. Budgeting on successes lets a run of unreadable
