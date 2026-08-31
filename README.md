@@ -122,29 +122,62 @@ node scripts/deploy.mjs --vault my-vault --agent --agent-writable
 your main vault's master key cannot reach a Worker by way of a flag on a routine deploy. The
 confirmation screen names the new Worker before anything is created.
 
-When it finishes it prints the two things every client needs:
+When it finishes, everything a client needs is in one file at the repository root:
 
-- a **URL** ending in `/mcp`
-- a **token**, written to gitignored `.env.agent.<vault>`
+```
+DEPLOY-CREDENTIALS.my-vault.txt      (mode 0600, gitignored)
+```
 
-The token is not printed, so that it does not sit in your terminal history. Read it when a
-client asks for it — piping to `pbcopy` (macOS), `wl-copy` or `clip.exe` puts it straight on
-the clipboard:
+It holds the URL ending in `/mcp`, the header name, and the complete header value, ready to
+paste. The terminal shows only the URL and a short fingerprint — enough to tell one deploy
+from another, useless for signing in — so the credential itself never sits in your scroll-back
+or in a transcript.
+
+**Read it, store the values somewhere safe, then delete the file.** It says so itself, and the
+last section explains what deleting it changes.
+
+### Keeping some folders out of its reach
 
 ```bash
-grep '^MCP_BEARER=' .env.agent.my-vault | cut -d= -f2-
+node scripts/deploy-agent.mjs --vault my-vault --deny "Private/**, Keys/**"
 ```
+
+Anything matching is invisible to every tool — it cannot be listed, searched, read, written or
+deleted — and the rule is set where the Worker is deployed, so nothing you sync can widen it.
+That is deliberately a different control from the vault's own excludes, which are a synced
+setting any of your devices can edit, and which also stop the folder reaching your other
+devices. Use `--deny` when you want a folder on all your devices but not in front of a model.
+
+Two honest limits. It governs what the *agent* may decrypt, not what your vault has stored:
+those notes stay in snapshots already taken, exactly as excluded ones do, and only a re-root
+removes them. And a glob that matches nothing denies nothing — check the deploy's `deny list:
+N glob(s)` line, then try to read something under the folder and confirm it refuses.
+
+### Standing one over your default deployment
+
+The default vault is deliberately harder to reach, because its master key is the one worth
+most:
+
+```bash
+node scripts/deploy-agent.mjs --live --deny "Private/**"
+```
+
+`--live` is the only path there, and it **requires `--deny`**. That is not a formality: this
+is the deployment that puts your main vault's key into a Worker secret, and naming what stays
+out of reach is meant to be a decision you make rather than one you skip.
 
 ### Claude (web and desktop)
 
 Settings → **Connectors** → **Add custom connector**:
 
+Every value below is in `DEPLOY-CREDENTIALS.<vault>.txt`, in this order, ready to paste:
+
 | | |
 |---|---|
-| **URL** | the printed URL, ending in `/mcp` |
+| **URL** | the one ending in `/mcp` |
 | **Authentication** | **None** |
 | **Header name** | `Authorization` |
-| **Header value** | `Bearer <token>` |
+| **Header value** | `Bearer …` — copy the whole line, including the word `Bearer` |
 
 Check for a **Request headers** section in that dialog *first*. It is a gated beta, and if
 your account does not have it there is currently no other supported way in — the deploy is
@@ -152,19 +185,22 @@ wasted effort until it appears.
 
 Three things that each cost an hour if missed. The header value is sent exactly as typed, so
 it must include the word `Bearer` and the space. The URL must end in `/mcp`, never `/sse`.
-And **authentication settings cannot be changed once the connector exists** — if you ever
-reissue the token, remove the connector and add it again.
+And **authentication settings cannot be changed once the connector exists** — which is why a
+redeploy never reissues the header value on its own. If you do run `--rotate-bearer`, remove
+the connector and add it again.
 
 ### Claude Code
 
 ```bash
 claude mcp add --transport http obsidian https://<your-agent>.workers.dev/mcp \
-  --header "Authorization: Bearer <token>"
+  --header "Authorization: Bearer <the value from DEPLOY-CREDENTIALS.<vault>.txt>"
 
 claude mcp list          # confirm it connected
 ```
 
-Add `-s user` to make it available in every project rather than just this one.
+Add `-s user` to make it available in every project rather than just this one. Avoid
+`-s project`: that writes the header, credential and all, into a `.mcp.json` in the repository.
+Claude Code loads MCP servers at startup, so restart the session before the tools appear.
 
 ### Codex
 
@@ -233,12 +269,42 @@ still seems not to know your conventions, ask it in the chat what its instructio
 vault say — an empty answer means that client dropped them, and "read `AGENTS.md` first" is a
 one-line fix for that conversation.
 
+### Updating and reissuing credentials
+
+Redeploying is safe and boring. Code and settings are replaced; **nothing is reissued unless
+you ask**, so a client that works keeps working:
+
+```bash
+node scripts/deploy-agent.mjs --vault my-vault --writable     # new code, same credentials
+```
+
+| To change | Pass | What it costs |
+|---|---|---|
+| the header value a client sends | `--rotate-bearer` | connector auth cannot be edited after it is created, so you must remove and re-add the connector |
+| the agent's own vault tokens | `--rotate-tokens` | nothing — no client ever sees these; the pair it replaces is revoked once the new one answers |
+| what it may not touch | `--deny "…"` | takes effect immediately; `--deny ""` clears it |
+| read-only ⇄ read-write | add or drop `--writable` | dropping it deletes the write credential outright, not just the tool list |
+
+A failed deploy revokes anything it created before it stops, and a successful one retires the
+credentials it replaced only after the new deployment answers — so you are never left with a
+live credential nothing names, or a working agent whose credential was withdrawn under it.
+
+One thing follows from the handover file being the handover: **while it exists, a redeploy
+keeps the admin token it names**, because otherwise the file would quietly stop being true.
+Once you have stored the values and deleted it, the next deploy issues a fresh one and writes
+a new file. The MCP header value is the exception and is never reissued on its own — only
+`--rotate-bearer` changes it.
+
 ### Turning it off
 
 Delete the agent Worker in the Cloudflare dashboard, and revoke its tokens with
 `node scripts/access-token.mjs --vault my-vault --list` and `--revoke <id>`. Your vault and
 every device are unaffected — the agent was only ever another device as far as they are
 concerned.
+
+If you want its **search index** gone too, drop it first with an authenticated
+`DELETE <agent-url>/admin/index`. It holds note text in the Worker's own storage, and deleting
+a Worker's code is not the same operation as deleting its stored data.
 
 ## Everyday use
 
