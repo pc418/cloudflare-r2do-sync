@@ -63,9 +63,9 @@ describe("tool surface", () => {
     }
     expect(TOOLS.filter((t) => t.annotations.readOnlyHint).map((t) => t.name)).toEqual([
       "search",
+      "recent",
       "read",
       "list",
-      "recent",
     ]);
   });
 
@@ -82,7 +82,7 @@ describe("tool surface", () => {
       append: /at the very end of a note, creating it if missing/,
       list: /downloads no note content/,
       edit: /fails unless it appears exactly once/,
-      recent: /newest first; downloads nothing/,
+      recent: /notes changed in the last N days, newest first, no downloads/,
       write: /replace an existing one entirely and without warning/,
       move: /path that must not already exist/,
       delete: /Delete one note permanently/,

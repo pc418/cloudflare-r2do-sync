@@ -67,7 +67,7 @@ describe("the agent Worker's edge", () => {
   it("lists only read tools, because this deployment has no write credential", async () => {
     const res = await post({ jsonrpc: "2.0", id: 2, method: "tools/list" });
     const body = await res.json<{ result: { tools: { name: string }[] } }>();
-    expect(body.result.tools.map((t) => t.name)).toEqual(["search", "read", "list", "recent"]);
+    expect(body.result.tools.map((t) => t.name)).toEqual(["search", "recent", "read", "list"]);
   });
 
   it("accepts the initialized notification with 202", async () => {

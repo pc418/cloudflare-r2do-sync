@@ -153,7 +153,7 @@ describe("tools/list", () => {
   it("advertises only the read tools on a read-only deployment", async () => {
     const res = await rpc(req("tools/list"), { writable: async () => false });
     const body = await res.json<{ result: { tools: { name: string; annotations: { readOnlyHint: boolean } }[] } }>();
-    expect(body.result.tools.map((t) => t.name)).toEqual(["search", "read", "list", "recent"]);
+    expect(body.result.tools.map((t) => t.name)).toEqual(["search", "recent", "read", "list"]);
     expect(body.result.tools.every((t) => t.annotations.readOnlyHint)).toBe(true);
   });
 
@@ -162,11 +162,11 @@ describe("tools/list", () => {
     const body = await res.json<{ result: { tools: { name: string; title: string }[] } }>();
     expect(body.result.tools.map((t) => t.name)).toEqual([
       "search",
-      "read",
-      "append",
-      "list",
-      "edit",
       "recent",
+      "read",
+      "list",
+      "append",
+      "edit",
       "write",
       "move",
       "delete",

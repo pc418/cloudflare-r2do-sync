@@ -96,10 +96,17 @@ const AGENT_NOTE_POINTER =
 /**
  * Ordered by how often a tool is reached for, and every contract inside 80 characters.
  *
- * **The order** is `tools/list` order, which some clients honour and the two we have measured
- * (Claude Code, Claude Desktop) both discard in favour of alphabetical. It costs nothing and
- * is right wherever it is read, so it stays — but do not rely on it to put anything in front
- * of a model.
+ * **The order** is orientation first (`search`, `recent`, `read`, `list`), then mutation by
+ * blast radius (`append`, `edit`, `write`, `move`, `delete`). Frequency is not the criterion —
+ * first-glance value is: `recent` answers "what has this person been working on", which is the
+ * question that comes *before* knowing what to search for, while `delete`/`move`/`append` are
+ * reached for only once the model already knows what it is doing.
+ *
+ * It is `tools/list` order, which some clients honour and the two we have measured (Claude
+ * Code, Claude Desktop) both discard in favour of alphabetical. It costs nothing and is right
+ * wherever it is read, so it stays — but **do not rely on it to put anything in front of a
+ * model**. Under an alphabetical sort the only lever left is the description itself, which is
+ * why `recent` leads with why you would reach for it rather than with what it returns.
  *
  * **The 80 characters is the real constraint.** A deferred-tools client lists each tool as one
  * truncated line and fetches the full description only if the model asks — Claude Desktop cuts
@@ -141,6 +148,22 @@ export const TOOLS: ToolDescriptor[] = [
     annotations: READS,
   },
   {
+    name: "recent",
+    title: "Recently modified notes",
+    description:
+      "Catch up: notes changed in the last N days, newest first, no downloads. Reach for this first when you need to know what someone has been working on." +
+      AGENT_NOTE_POINTER,
+    inputSchema: {
+      type: "object",
+      properties: {
+        days: int("How many days back to look (default 7)."),
+        max_results: int("Maximum paths to return (default 100, cap 1000)."),
+      },
+      additionalProperties: false,
+    },
+    annotations: READS,
+  },
+  {
     name: "read",
     title: "Read a note",
     description:
@@ -154,6 +177,23 @@ export const TOOLS: ToolDescriptor[] = [
         limit: int("Lines to return (default 400, cap 2000)."),
       },
       required: ["path"],
+      additionalProperties: false,
+    },
+    annotations: READS,
+  },
+  {
+    name: "list",
+    title: "List notes",
+    description:
+      "List note paths, sizes and times; downloads no note content. Use it to find exact paths before reading." +
+      AGENT_NOTE_POINTER,
+    inputSchema: {
+      type: "object",
+      properties: {
+        folder: str("Folder to list, subfolders included, e.g. \"Daily\"."),
+        glob: str("Optional path glob, e.g. \"**/*.md\". ANDed with folder when both are given."),
+        max_results: int("Maximum paths to return (default 200, cap 1000)."),
+      },
       additionalProperties: false,
     },
     annotations: READS,
@@ -174,23 +214,6 @@ export const TOOLS: ToolDescriptor[] = [
       additionalProperties: false,
     },
     annotations: WRITES(false),
-  },
-  {
-    name: "list",
-    title: "List notes",
-    description:
-      "List note paths, sizes and times; downloads no note content. Use it to find exact paths before reading." +
-      AGENT_NOTE_POINTER,
-    inputSchema: {
-      type: "object",
-      properties: {
-        folder: str("Folder to list, subfolders included, e.g. \"Daily\"."),
-        glob: str("Optional path glob, e.g. \"**/*.md\". ANDed with folder when both are given."),
-        max_results: int("Maximum paths to return (default 200, cap 1000)."),
-      },
-      additionalProperties: false,
-    },
-    annotations: READS,
   },
   {
     name: "edit",
@@ -214,22 +237,6 @@ export const TOOLS: ToolDescriptor[] = [
       additionalProperties: false,
     },
     annotations: WRITES(true),
-  },
-  {
-    name: "recent",
-    title: "Recently modified notes",
-    description:
-      "List notes changed in the last N days, newest first; downloads nothing. Use it to catch up on what changed before reading anything." +
-      AGENT_NOTE_POINTER,
-    inputSchema: {
-      type: "object",
-      properties: {
-        days: int("How many days back to look (default 7)."),
-        max_results: int("Maximum paths to return (default 100, cap 1000)."),
-      },
-      additionalProperties: false,
-    },
-    annotations: READS,
   },
   {
     name: "write",
