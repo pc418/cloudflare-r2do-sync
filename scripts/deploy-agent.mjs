@@ -17,7 +17,16 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { loadEnvFile, localBin, upsertEnvFile, waitForHealth } from "./setup-lib.mjs";
+import {
+  fingerprint,
+  handoffPath,
+  handoffPending,
+  loadEnvFile,
+  localBin,
+  upsertEnvFile,
+  waitForHealth,
+  writeHandoff,
+} from "./setup-lib.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const AGENT_DIR = path.join(ROOT, "agent");
@@ -104,60 +113,71 @@ const log = (m) => {
  * holding the master key, and printing it would put it in terminal scrollback and in any
  * transcript of the deploy; the file it lives in is named instead.
  */
-export function mcpSetupInstructions({ url, agentEnvName, writable }) {
+/**
+ * The MCP connector section of the handover file — the bearer included.
+ *
+ * This is the half that used to be withheld. Naming the env file and leaving the operator to
+ * dig the value out bought nothing: the value still ends up on a clipboard and in a settings
+ * form, and splitting it across two places only made the setup longer to get right. Keeping it
+ * out of *scrollback* is the property worth having, and a 0600 file the operator is told to
+ * delete keeps that while still being one place.
+ */
+export function mcpHandoffSection({ url, bearer, writable, vaultUrl }) {
+  return [
+    "-".repeat(88),
+    "  MCP CONNECTOR",
+    "-".repeat(88),
+    "",
+    "Claude -> Settings -> Connectors -> Add custom connector.",
+    "Request headers are a gated beta: if that section is absent, your account does not have",
+    "it, and there is no other supported path yet — OAuth is not built.",
+    "",
+    `  URL       ${url}/mcp`,
+    "  Auth      None, plus one request header:",
+    "",
+    `  Header name   Authorization`,
+    `  Header value  Bearer ${bearer}`,
+    "",
+    "  Paste the header value EXACTLY as printed, including the word Bearer and the space.",
+    "",
+    `  tools     ${writable ? "search, recent, read, list, append, edit, write, move, delete" : "search, recent, read, list (read-only)"}`,
+    writable
+      ? "            write, delete and move act like a file system: no confirmation, and your\n            undo is snapshot history within the retention window."
+      : "",
+    "",
+    "  Four things that each cost an hour if missed:",
+    "   1. The header value is sent verbatim — it must include \"Bearer \".",
+    "   2. The URL must end in /mcp, never /sse — Anthropic reads /sse as the legacy transport.",
+    "   3. Register this workers.dev URL exactly; a redirect to another host drops the header.",
+    "   4. Connector auth settings are immutable once created, so a rotated bearer means",
+    "      removing and re-adding the connector.",
+    "",
+    `  Check it   curl ${url}/health          -> {"ok":true}`,
+    `             An unauthenticated GET ${url}/mcp answers 401, not 405.`,
+    "",
+    "  This Worker holds the vault MASTER KEY and decrypts notes to answer, so whatever it",
+    `  reads reaches your model provider as plaintext. The sync Worker at ${vaultUrl}`,
+    "  cannot read your notes; this one can. Deleting this script ends that.",
+    "",
+    "  Teach it your vault: put a note called AGENT.md at the vault root and it is served as",
+    "  context at the start of every conversation. It is advice to the model, not configuration.",
+    "",
+  ].filter((line) => line !== null).join("\n");
+}
+
+export function mcpSetupInstructions({ url, agentEnvName, writable, handoffFile, bearerPrint }) {
   return `
 agent live at ${url}
-credentials recorded in ${agentEnvName} (gitignored)
-tools: ${writable ? "search, read, list, recent, append, edit, write, delete, move" : "search, read, list, recent (read-only)"}${
-    writable
-      ? "\nwrite, delete and move act like a file system: no confirmation, and your undo is\nsnapshot history within the retention window."
-      : ""
-  }
+tools: ${writable ? "search, recent, read, list, append, edit, write, move, delete" : "search, recent, read, list (read-only)"}
+bearer fingerprint ${bearerPrint} (a hash — the value itself is in the file below)
+token ids and script name recorded in ${agentEnvName} (gitignored)
 
-This Worker holds the vault MASTER KEY and decrypts notes to answer, so whatever it reads
-reaches your model provider as plaintext. The sync Worker's "the server cannot read your
-notes" property does not extend to it. Deleting this script and revoking its token ends it.
+  CONNECTOR SETTINGS, INCLUDING THE BEARER:  ${handoffFile}
 
---- connect it -------------------------------------------------------------------------
-
-FIRST, check this is possible: in Claude → Settings → Connectors → Add custom connector,
-look for a "Request headers" section. Request headers are a gated beta. If that section is
-absent, your account does not have it, bearer auth is unavailable, and there is currently no
-other supported path — OAuth is not built. Nothing below will work until it appears.
-
-  URL     ${url}/mcp
-  Auth    None, plus a request header:
-            Authorization: Bearer <MCP_BEARER from ${agentEnvName}>
-
-Put the exact header value on your clipboard (it is not printed — this token fronts a
-process holding the master key, and printing it would leave it in your scrollback):
-
-  printf 'Bearer %s' "$(grep '^MCP_BEARER=' ${agentEnvName} | cut -d= -f2-)" | pbcopy
-
-Four things that each cost an hour if missed:
-  1. The value is sent verbatim, so it must include the word "Bearer" and the space.
-  2. The URL must end in /mcp, never /sse — Anthropic reads /sse as the legacy transport.
-  3. Register this workers.dev URL exactly; a redirect to another host drops the header.
-  4. Auth settings are immutable once the connector exists, so rotating the bearer
-     (--rotate-bearer) means removing and re-adding the connector.
-
---- check it ---------------------------------------------------------------------------
-
-  curl ${url}/health          →  {"ok":true}
-  node testvault/agent-mcp-verify.mjs   (50 checks against this live deployment)
-
-An unauthenticated GET ${url}/mcp answers 401, not 405: the bearer is
-checked before the method, so 401 there is the correct answer to an anonymous probe rather
-than a broken deploy.
-
---- teach it your vault ----------------------------------------------------------------
-
-Put a note called AGENT.md at the vault root — "daily notes live in Daily/YYYY-MM-DD.md",
-"read Inbox.md first", "when I say log X, append X under ## Log in today's note" — and the
-agent serves it as context at the start of every conversation. It is an ordinary note, so
-you can edit it on any device${writable ? ", and this deployment can edit it itself" : ""}.
-New text takes effect in the NEXT conversation. It is read through this vault's own exclude
-policy, and it is advice to the model, never configuration.`;
+That file holds everything you paste into Claude, in one place, created 0600 and gitignored.
+Store the values somewhere safe and delete it. While it exists, a redeploy keeps the bearer;
+once it is gone, the next deploy issues a new one and the connector has to be re-added.
+`;
 }
 
 /**
@@ -353,8 +373,18 @@ export async function deployAgent(opts) {
       writeToken = await mint(`${scriptName}-write`, ["sync"]);
     }
 
-    bearer =
-      opts.rotateBearer || !agentEnv.MCP_BEARER ? randomBytes(32).toString("hex") : agentEnv.MCP_BEARER;
+    // Rotate when asked, when there is nothing recorded to reuse, or when the previous
+    // handover file is gone — which means its values were collected and the operator is no
+    // longer holding a document this deploy could falsify. While that file is still sitting
+    // there, keeping the bearer is what keeps it true.
+    const collected = !handoffPending(ROOT, vault);
+    const rotate = opts.rotateBearer === true || !agentEnv.MCP_BEARER || collected;
+    bearer = rotate ? randomBytes(32).toString("hex") : agentEnv.MCP_BEARER;
+    log(
+      rotate
+        ? `MCP bearer: new one issued${agentEnv.MCP_BEARER ? " — the connector must be removed and re-added" : ""}`
+        : "MCP bearer: kept (its handover file has not been collected yet)"
+    );
 
     // --- bundle ------------------------------------------------------------------
     log("bundling agent...");
@@ -492,14 +522,29 @@ export async function deployAgent(opts) {
     );
   }
 
-  return { url, agentEnvName, writable: opts.writable, scriptName, vault, keySource, orphaned };
+  return {
+    url,
+    agentEnvName,
+    writable: opts.writable,
+    scriptName,
+    vault,
+    keySource,
+    orphaned,
+    bearerPrint: fingerprint(bearer),
+    // The section, not the file: `deploy.mjs --agent` writes one document carrying both this
+    // and the vault's, and two files would put the operator back to hunting for halves.
+    handoff: mcpHandoffSection({ url, bearer, writable: opts.writable, vaultUrl: SYNC_URL }),
+  };
 }
 
 const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (invokedDirectly) {
   try {
     const result = await deployAgent(parseArgs(process.argv.slice(2)));
-    log(mcpSetupInstructions(result));
+    // Written here rather than inside deployAgent, so `deploy.mjs --agent` can put this
+    // section and the vault's into one document instead of leaving two behind.
+    const handoffFile = writeHandoff(ROOT, result.vault, [result.handoff]);
+    log(mcpSetupInstructions({ ...result, handoffFile: path.relative(ROOT, handoffFile) }));
   } catch (error) {
     console.error(`\ndeploy-agent failed: ${error.message}`);
     process.exit(1);

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WORKER_OBSERVABILITY } from "./deploy.mjs";
 
@@ -68,21 +70,44 @@ test("the agent deploy runs only after the vault deploy has succeeded", () => {
   assert.ok(agent > deploys, "the agent import must follow the vault deploy");
 });
 
-test("MCP setup instructions name the file, never the bearer itself", async () => {
-  // The bearer is a credential to a process holding the master key. Printing it would put it
-  // in terminal scrollback and in any transcript of the deploy.
+test("the console names the handover file and never a credential", async () => {
+  // The split that matters: scrollback and transcripts get identifiers, the 0600 file gets
+  // the values. Printing half and naming a file for the other half was the old shape, and it
+  // just made the operator paste from two places.
   const { mcpSetupInstructions } = await import("./deploy-agent.mjs");
   const text = mcpSetupInstructions({
     url: "https://a.example.workers.dev",
     agentEnvName: ".env.agent.v",
     writable: false,
+    handoffFile: "DEPLOY-CREDENTIALS.v.txt",
+    bearerPrint: "3f9a1c22",
   });
+  assert.match(text, /DEPLOY-CREDENTIALS\.v\.txt/);
+  assert.match(text, /3f9a1c22/);
+  // A fingerprint identifies the run; it must not be mistaken for something pasteable.
+  assert.match(text, /a hash/);
+  assert.doesNotMatch(text, /Authorization/);
+  // And it says what deleting the file does, because that is now a rotation decision.
+  assert.match(text, /redeploy keeps the bearer/);
+});
+
+test("the handover section carries everything the connector form needs", async () => {
+  const { mcpHandoffSection } = await import("./deploy-agent.mjs");
+  const bearer = "b".repeat(64);
+  const text = mcpHandoffSection({
+    url: "https://a.example.workers.dev",
+    bearer,
+    writable: false,
+    vaultUrl: "https://vault.example.workers.dev",
+  });
+  // The two halves that used to live apart: the endpoint and the value to paste.
   assert.match(text, /https:\/\/a\.example\.workers\.dev\/mcp/);
-  assert.match(text, /Authorization: Bearer <MCP_BEARER from \.env\.agent\.v>/);
-  assert.match(text, /must include the word "Bearer" and the space/);
+  assert.ok(text.includes(`Bearer ${bearer}`), "the header value must be complete and pasteable");
+  assert.match(text, /including the word Bearer and the space/);
   // The traps that each cost an hour, per the connector guide.
   assert.match(text, /never \/sse/);
   assert.match(text, /redirect to another host drops the header/);
+  assert.match(text, /immutable once created/);
   // 401 on an anonymous /mcp probe is correct, and reads as a broken deploy if unexplained.
   assert.match(text, /401, not 405/);
   assert.match(text, /read-only/);
@@ -96,29 +121,23 @@ test("MCP setup instructions name the file, never the bearer itself", async () =
   assert.ok(gate < values, "the caveat must precede the values it gates");
   assert.match(text, /OAuth is not built/);
 
-  // A way to get the 64-char token out without it landing in scrollback, and a way to check
-  // the deployment before trusting it.
-  assert.match(text, /pbcopy/);
-  assert.match(text, /agent-mcp-verify\.mjs/);
-
-  // The custody trade. `deploy.mjs --agent` says it on the confirmation screen; someone
-  // running this script directly never sees that screen.
+  // The custody trade, and the sync Worker named so the contrast is concrete.
   assert.match(text, /MASTER KEY/);
   assert.match(text, /reaches your model provider/);
-
-  // The standing-instructions note, and the one thing about it that surprises people.
+  assert.match(text, /vault\.example\.workers\.dev/);
   assert.match(text, /AGENT\.md/);
-  assert.match(text, /NEXT conversation/);
 });
 
-test("the setup text names the writable deployment's extra ability", async () => {
-  const { mcpSetupInstructions } = await import("./deploy-agent.mjs");
-  const ro = mcpSetupInstructions({ url: "https://a.example", agentEnvName: ".env.agent.v", writable: false });
-  const rw = mcpSetupInstructions({ url: "https://a.example", agentEnvName: ".env.agent.v", writable: true });
-  assert.match(rw, /this deployment can edit it itself/);
-  assert.doesNotMatch(ro, /this deployment can edit it itself/);
+test("the handover section names the writable deployment's extra ability", async () => {
+  const { mcpHandoffSection } = await import("./deploy-agent.mjs");
+  const args = { url: "https://a.example", bearer: "x", vaultUrl: "https://v.example" };
+  const ro = mcpHandoffSection({ ...args, writable: false });
+  const rw = mcpHandoffSection({ ...args, writable: true });
   assert.match(rw, /append, edit, write/);
   assert.doesNotMatch(ro, /append, edit, write/);
+  // The consequence, not just the capability: no confirmation, history is the undo.
+  assert.match(rw, /no confirmation/);
+  assert.doesNotMatch(ro, /no confirmation/);
 });
 
 test("importing deploy-agent.mjs does not deploy anything", async () => {
@@ -286,4 +305,53 @@ test("superseded tokens are revoked only after the new deployment is recorded an
   assert.ok(record < retire, "superseded tokens are retired after the new ids are on disk");
   // A revocation that fails is reported by id, because nothing else can name it afterwards.
   assert.match(source, /COULD NOT REVOKE/);
+});
+
+test("the handover file's presence is what decides rotation", async () => {
+  const { handoffPath, handoffPending, writeHandoff } = await import("./setup-lib.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "handoff-"));
+
+  // Nothing handed over yet: a deploy is free to issue fresh credentials.
+  assert.equal(handoffPending(dir, "v"), false);
+  const file = writeHandoff(dir, "v", ["  SECTION"]);
+  assert.equal(file, handoffPath(dir, "v"));
+  // Now there is an uncollected document naming live credentials. Rotating under it would
+  // leave the operator holding a file that no longer opens anything.
+  assert.equal(handoffPending(dir, "v"), true);
+
+  // Per deployment, not global: a named vault's file says nothing about production's.
+  assert.equal(handoffPending(dir, null), false);
+  assert.notEqual(handoffPath(dir, null), handoffPath(dir, "v"));
+
+  // Collected and removed — the next deploy rotates.
+  rmSync(file);
+  assert.equal(handoffPending(dir, "v"), false);
+  rmSync(dir, { recursive: true });
+});
+
+test("the handover file is 0600 and says what to do with itself", async () => {
+  const { writeHandoff } = await import("./setup-lib.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "handoff-"));
+  const file = writeHandoff(dir, null, ["  VALUES"]);
+  // It is plaintext credentials on disk; the mode is the only thing standing between it and
+  // every other process running as this user.
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  const text = readFileSync(file, "utf8");
+  assert.match(text, /VALUES/);
+  // Instructions, not just data: store it, then delete it, and what deleting it causes.
+  assert.match(text, /password manager/);
+  assert.match(text, new RegExp(`rm ${path.basename(file)}`));
+  assert.match(text, /a redeploy KEEPS every credential named in it/);
+  assert.match(text, /removing and re-adding the connector/);
+  rmSync(dir, { recursive: true });
+});
+
+test("a fingerprint identifies a run without leaking the credential", async () => {
+  const { fingerprint } = await import("./setup-lib.mjs");
+  const a = fingerprint("b".repeat(64));
+  assert.match(a, /^[0-9a-f]{8}$/);
+  assert.equal(a, fingerprint("b".repeat(64)));
+  assert.notEqual(a, fingerprint("c".repeat(64)));
+  // Eight hex characters of SHA-256: enough to tell two deploys apart, useless for recovery.
+  assert.ok(!"b".repeat(64).includes(a));
 });

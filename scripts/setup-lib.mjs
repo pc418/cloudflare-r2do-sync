@@ -3,6 +3,7 @@
 // Everything here is either pure or takes its `fetch` as an argument, so the parts that
 // decide *what* setup does (which credentials, which words the user is told) are unit
 // tested without touching a Cloudflare account.
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -700,4 +701,73 @@ export function renderSetupSummary({
     WIDE,
     "",
   ].join("\n");
+}
+
+/**
+ * The one file a deploy hands its credentials over in.
+ *
+ * Printing half the connector settings and naming a file for the other half is a worse
+ * outcome than either: the operator ends up pasting from two places, and the terminal keeps
+ * the half that was printed anyway. So everything goes in one 0600 text file, and the console
+ * keeps only what identifies the run.
+ *
+ * **Its presence is also the rotation signal.** While this file exists the handover has not
+ * been collected, so a redeploy must keep every credential the file names or the file starts
+ * lying. Once it is gone — stored somewhere safe and removed, as the file itself instructs —
+ * the next deploy issues fresh credentials and writes a fresh file.
+ */
+export function handoffPath(root = ROOT, deploymentName = null) {
+  const name = deploymentName === null ? "DEPLOY-CREDENTIALS.txt" : `DEPLOY-CREDENTIALS.${deploymentName}.txt`;
+  return path.join(root, name);
+}
+
+/** Whether a previous deploy's credentials are still sitting there uncollected. */
+export function handoffPending(root = ROOT, deploymentName = null) {
+  return existsSync(handoffPath(root, deploymentName));
+}
+
+/**
+ * A short, non-secret fingerprint of a credential.
+ *
+ * Printed so a run can be matched to the file it wrote without the value itself reaching
+ * scrollback. Eight hex characters of SHA-256 — enough to tell two deploys apart, useless for
+ * recovering the credential.
+ */
+export function fingerprint(secret) {
+  return createHash("sha256").update(secret).digest("hex").slice(0, 8);
+}
+
+export function writeHandoff(root, deploymentName, sections) {
+  const file = handoffPath(root, deploymentName);
+  const body = [
+    "=".repeat(88),
+    "  DEPLOYMENT CREDENTIALS — everything you need, in one place",
+    `  written ${new Date().toISOString()}`,
+    "=".repeat(88),
+    "",
+    "Read the last section before you close this. This file is the only copy of some of",
+    "these values, and it decides whether the next deploy rotates them.",
+    "",
+    ...sections,
+    "",
+    "-".repeat(88),
+    "  WHAT TO DO WITH THIS FILE",
+    "-".repeat(88),
+    "",
+    "1. Copy every value above into a password manager, or wherever you keep secrets.",
+    "2. Delete this file:  rm " + path.relative(root, file),
+    "",
+    "It is created 0600 and gitignored, but it is still plaintext on disk, and it holds",
+    "credentials to a service that decrypts your notes.",
+    "",
+    "While this file exists, a redeploy KEEPS every credential named in it — otherwise the",
+    "file would quietly stop being true. Once you delete it, the next deploy issues fresh",
+    "credentials and writes a new one. A rotated MCP bearer means",
+    "removing and re-adding the connector, because connector auth settings cannot be edited",
+    "after they are created.",
+    "",
+  ].join("\n");
+  writeFileSync(file, `${body}\n`, { mode: 0o600 });
+  chmodSync(file, 0o600); // `mode:` only applies on creation; the file may already exist
+  return file;
 }

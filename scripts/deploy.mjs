@@ -21,6 +21,9 @@ import {
   parseDeploymentName,
 } from "./worker-config.mjs";
 import {
+  fingerprint,
+  handoffPath,
+  handoffPending,
   localBin,
   renderRestDeployCheck,
   resolveDeploymentEnv,
@@ -28,6 +31,7 @@ import {
   upsertEnvFile,
   verifyAdminToken,
   waitForHealth,
+  writeHandoff,
 } from "./setup-lib.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -42,6 +46,37 @@ export const WORKER_OBSERVABILITY = { enabled: true, head_sampling_rate: 0.01 };
  * a fresh one that replaced it. Rotation is safe — access tokens live in the Durable
  * Object — and it is what guarantees every run can issue tokens afterwards.
  */
+/**
+ * The vault section of the handover file.
+ *
+ * The admin token mints and revokes access tokens for the whole vault, so it belongs with the
+ * bearer rather than only in a dotfile the operator has to know to look in.
+ */
+export function workerHandoffSection({ url, adminToken, adminTokenKept, bucket, retention, envFile }) {
+  return [
+    "-".repeat(88),
+    "  VAULT WORKER",
+    "-".repeat(88),
+    "",
+    `  URL          ${url}`,
+    `  R2 bucket    ${bucket}`,
+    `  Retention    every snapshot for ${retention.GC_KEEP_DAYS} day(s) (at least the newest ${retention.GC_KEEP_COUNT}),`,
+    `               then one a day to ${retention.GC_DAILY_DAYS} day(s), then one a week, kept for ever`,
+    "  GC cron      04:00 UTC daily",
+    "",
+    `  ADMIN_TOKEN  ${adminToken}`,
+    `               ${adminTokenKept ? "unchanged from the previous deploy" : "newly issued by this deploy"}`,
+    "",
+    "  The admin token mints and revokes vault access tokens and triggers GC. It is NOT what a",
+    "  device syncs with — those are access tokens, and they are unaffected by any deploy.",
+    `  It is also written to ./${envFile}, which the scripts read; this copy is for your own`,
+    "  records so you are not depending on a dotfile you might not think to back up.",
+    "",
+    "  Add a device:  node scripts/access-token.mjs",
+    "",
+  ].join("\n");
+}
+
 export async function deployViaRest({
   log = console.log,
   confirm = null,
@@ -280,7 +315,13 @@ export async function deployViaRest({
   const stored = fileEnv.ADMIN_TOKEN?.trim() || null;
   let adminToken = null;
   let adminTokenKept = false;
-  if (hasAdmin && stored) {
+  // An uncollected handover file names this credential, so rotating under it would leave the
+  // operator holding a document that no longer opens anything. Once the file is gone the
+  // handover is done, and a fresh deploy is entitled to a fresh credential.
+  const collected = !handoffPending(ROOT, VAULT);
+  if (collected && hasAdmin) {
+    log("previous credentials were collected — rotating the admin token");
+  } else if (hasAdmin && stored) {
     if (await verifyAdminToken({ workerUrl: url, adminToken: stored })) {
       adminToken = stored;
       adminTokenKept = true;
@@ -301,7 +342,16 @@ export async function deployViaRest({
     if (put.status !== 200 && put.status !== 201) fail("put-secret", put);
   }
 
-  return { url, adminToken, adminTokenKept, bucketClaim: bucket.claim, envFile: ENV_FILE, deploymentName: VAULT };
+  return {
+    url,
+    adminToken,
+    adminTokenKept,
+    bucketClaim: bucket.claim,
+    envFile: ENV_FILE,
+    deploymentName: VAULT,
+    bucketName: BUCKET,
+    retention: VARS,
+  };
 }
 
 /** Prints the target and waits for a yes. No terminal means no unattended provisioning. */
@@ -387,18 +437,19 @@ if (invokedDirectly) {
       );
     }
 
-    const { url, adminToken, adminTokenKept, bucketClaim, envFile } = await deployViaRest({
-      adoptBucket,
-      adoptWorker,
-      migrateRename,
-      deploymentName,
-      withAgent,
-      agentWritable,
-      confirm: assumeYes ? null : askToProceed,
-    });
-    // The admin credential is never shown to a person — it lives in the deployment's env file
-    // so the helper scripts (access-token.mjs, setup.mjs) keep working without anyone copying
-    // secrets. The bucket claim records that this checkout provisioned that storage, so a
+    const { url, adminToken, adminTokenKept, bucketClaim, envFile, bucketName, retention } =
+      await deployViaRest({
+        adoptBucket,
+        adoptWorker,
+        migrateRename,
+        deploymentName,
+        withAgent,
+        agentWritable,
+        confirm: assumeYes ? null : askToProceed,
+      });
+    // The admin credential still goes to the deployment's env file, because the helper scripts
+    // (access-token.mjs, setup.mjs) read it there. It is ALSO written to the handover file
+    // below: a value nobody is told about is a value nobody backs up. The bucket claim records that this checkout provisioned that storage, so a
     // later redeploy is an ordinary reuse rather than an unexplained adoption. A named vault
     // writes to .env.<name>: overwriting .env would replace production's identity with it.
     upsertEnvFile(
@@ -411,7 +462,21 @@ if (invokedDirectly) {
       envFile
     );
     console.log(`admin credential ${adminTokenKept ? "unchanged" : "rotated"} — ./${envFile} updated (WORKER_URL, ADMIN_TOKEN)`);
+    console.log(`admin token fingerprint ${fingerprint(adminToken)} (a hash — the value is in the file named below)`);
     console.log(`\nDEPLOYED: ${url}`);
+
+    // Collected as sections and written once, at the very end. Two files, or a file written
+    // before the agent runs, is how an operator ends up hunting for the other half.
+    const sections = [
+      workerHandoffSection({
+        url,
+        adminToken,
+        adminTokenKept,
+        bucket: bucketName,
+        retention,
+        envFile,
+      }),
+    ];
 
     // Second, and only on request. Imported here rather than at the top so the ordinary deploy
     // never loads the agent's bundler path at all, and so a syntax error in the agent script
@@ -429,16 +494,35 @@ if (invokedDirectly) {
           rotateBearer: false,
           name: null,
         });
-        console.log(mcpSetupInstructions(result));
+        sections.push(result.handoff);
+        console.log(
+          mcpSetupInstructions({
+            ...result,
+            handoffFile: path.relative(ROOT, handoffPath(ROOT, deploymentName)),
+          })
+        );
       } catch (error) {
         console.error(
           `\nthe vault deployed, but its agent did not: ${error instanceof Error ? error.message : error}` +
             `\nThe vault at ${url} is live and unaffected. Re-run just the agent with:` +
             `\n  node scripts/deploy-agent.mjs --vault ${deploymentName}${agentWritable ? " --writable" : ""}`
         );
+        // The vault's own credentials still have to be handed over: it deployed, and its admin
+        // token may have just rotated. Exiting without this file would leave the operator with
+        // a live vault, a changed credential, and nothing telling them where it went.
+        const partial = writeHandoff(ROOT, deploymentName, sections);
+        console.error(`\nThe vault's credentials are in ${path.relative(ROOT, partial)}.`);
         process.exit(1);
       }
     }
+
+    const handoffFile = writeHandoff(ROOT, deploymentName, sections);
+    console.log(
+      `\n  CREDENTIALS AND CONNECTOR SETTINGS:  ${path.relative(ROOT, handoffFile)}` +
+        "\n\nOne file, 0600 and gitignored, with everything you would otherwise have to assemble." +
+        "\nStore the values somewhere safe and delete it. While it exists a redeploy keeps every" +
+        "\ncredential it names; once it is gone, the next deploy issues fresh ones."
+    );
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
     process.exit(1);
