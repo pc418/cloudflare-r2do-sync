@@ -1290,6 +1290,18 @@ export default class LogSyncPlugin extends Plugin {
       new Notice("R2DO Sync: set the server URL and access token in settings first");
       return;
     }
+    // Same shape as the folder cleanup's guard, and for the same reason: a force pull,
+    // restore-all or encryption migration is moving the whole vault right now and runs outside
+    // the scheduler's lane, so a pass started here would plan against files that are already
+    // changing. Said in the vault's own terms — the alternative was internal state names on a
+    // path a user reaches by pressing a button.
+    if (this.#vaultRewrite !== null) {
+      new Notice(
+        "R2DO Sync: this vault is being rewritten. Wait for that to finish, then sync again.",
+        10_000
+      );
+      return;
+    }
     this.#interactive++;
     // Raised only once the consent gate is past — a "syncing…" toast behind a modal asking
     // whether to sync at all describes something that has not been agreed to yet. Held open
@@ -1895,6 +1907,42 @@ export default class LogSyncPlugin extends Plugin {
         return;
       }
       if (this.#backupModalOpen) return;
+
+      // **Creating the FIRST key persists before it prompts**, the same order `rebuild()`
+      // uses. Otherwise the key is only shown: "I saved it" can fail after the user has
+      // carefully written the key down, leaving them holding a backup of a key that never
+      // belonged to any vault, and the next Generate mints a different one. Observed
+      // 2026-08-31 on the agent-dummy vault.
+      //
+      // Scope is deliberately narrow. A key *change* on an established vault keeps the old
+      // order, because there the key must not become this device's until the CAS migration
+      // that rewrites the remote actually completes — persisting first would point the device
+      // at a vault its snapshots are not encrypted for.
+      const firstKey = !this.hasSyncedSnapshot && this.settings.masterKey.trim() === "";
+      if (firstKey) {
+        this.#backupModalOpen = true;
+        void this.#applyEncryptionTarget({ mode, key: trimmedKey, backedUp: false, vaultSalt })
+          .then(() => {
+            // Now it is the device's key, so the window is reporting a fact rather than a
+            // proposal, and acknowledging only lifts the gate.
+            new BackupKeyModal(this.app, {
+              key: trimmedKey,
+              onSaved: async () => {
+                this.settings.masterKeyBackedUp = true;
+                await this.saveSettings();
+              },
+              onClose: () => {
+                this.#backupModalOpen = false;
+              },
+            }).open();
+          })
+          .catch((error: unknown) => {
+            this.#backupModalOpen = false;
+            new Notice(`Cannot create the vault key: ${message(error)}`, 0);
+          });
+        return;
+      }
+
       this.#backupModalOpen = true;
       new BackupKeyModal(this.app, {
         key: trimmedKey,
@@ -4444,6 +4492,12 @@ export class LogSyncSettingTab extends PluginSettingTab {
   #joinDraft: JoinDraft = emptyJoinDraft();
   #probe: RemoteProbe | null = null;
   #probeError: string | null = null;
+  /**
+   * Bumped whenever the credentials change or a new probe starts. A reply carrying a stale
+   * generation is dropped: the network does not care that the user has retyped the URL, and
+   * an answer about the previous vault must never become this form's state.
+   */
+  #probeGeneration = 0;
 
   /**
    * Fields that stage their value until they lose focus, so the page can flush them if it
@@ -4760,12 +4814,18 @@ export class LogSyncSettingTab extends PluginSettingTab {
     });
   }
 
-  /** A changed credential invalidates what the server told us about the old one. */
+  /**
+   * A changed credential invalidates what the server said about the old one.
+   *
+   * It deliberately does not re-render: `onChange` fires per keystroke, and rebuilding the
+   * page there would destroy the field being typed into. The generation bump is what makes
+   * that safe — an in-flight reply is dropped, and `#completeJoin` refuses a probe whose
+   * credentials no longer match the fields.
+   */
   #resetProbe(): void {
-    if (this.#probe === null && this.#probeError === null) return;
+    this.#probeGeneration += 1;
     this.#probe = null;
     this.#probeError = null;
-    this.display();
   }
 
   /**
@@ -4789,10 +4849,17 @@ export class LogSyncSettingTab extends PluginSettingTab {
       this.display();
       return;
     }
+    const token = draft.token.trim();
+    const generation = ++this.#probeGeneration;
     try {
-      this.#probe = await probeRemote(this.plugin.apiFor(url, draft.token.trim()));
+      const probe = await probeRemote(this.plugin.apiFor(url, token), { url, token });
+      // Dropped, not applied: while this was in flight the user may have retyped the URL, and
+      // an "empty vault" answer about the old one would otherwise offer to mint a key here.
+      if (generation !== this.#probeGeneration) return;
+      this.#probe = probe;
       this.#probeError = null;
     } catch (e) {
+      if (generation !== this.#probeGeneration) return;
       this.#probe = null;
       // Named rather than generic: the live failure this form was built for was a URL pointing
       // at the wrong Worker, which answers, just not to these routes.
@@ -4813,9 +4880,30 @@ export class LogSyncSettingTab extends PluginSettingTab {
     const probe = this.#probe;
     if (probe === null) return;
     const draft = this.#joinDraft;
-    const url = normalizeServerUrl(draft.url.trim());
+
+    // The join uses the credentials the server actually answered about, never whatever is in
+    // the fields now. If they have diverged, refuse: authorising a vault nobody probed is how
+    // "empty, mint a key" gets applied to somebody's existing snapshots.
+    let typedUrl: string;
+    try {
+      typedUrl = normalizeServerUrl(draft.url.trim());
+    } catch {
+      typedUrl = "";
+    }
+    if (typedUrl !== probe.url || draft.token.trim() !== probe.token) {
+      this.#resetProbe();
+      this.#probeError =
+        "The server URL or access token changed after the vault was checked. Press Check " +
+        "again so this device knows what it is joining. Nothing has been saved.";
+      this.display();
+      return;
+    }
+
     const name = draft.name.trim() || this.plugin.settings.deviceName || "this device";
 
+    // Everything that can refuse happens here, before a single setting is written.
+    let payload: SetupPayload;
+    let minted: boolean;
     try {
       if (probe.kind === "encrypted") {
         if (probe.manifest === null) throw new Error("no snapshot to check the key against");
@@ -4823,26 +4911,46 @@ export class LogSyncSettingTab extends PluginSettingTab {
       }
       // The mint for an empty vault happens here, after the server said the vault is empty —
       // a choice made on a screen that said so, never a silent side effect of typing a URL.
-      const minted = probe.kind === "empty";
-      const key = minted ? generateMasterKey() : draft.key.trim();
-      const payload = joinPayload({
-        url,
-        token: draft.token.trim(),
+      minted = probe.kind === "empty";
+      payload = joinPayload({
+        url: probe.url,
+        token: probe.token,
         name,
         kind: probe.kind,
-        key,
+        key: minted ? generateMasterKey() : draft.key.trim(),
         publishedSalt: probe.vaultSalt,
         provisionalSalt: this.plugin.settings.vaultSalt || generateVaultSalt(),
       });
+    } catch (e) {
+      this.#probeError = `${message(e)} Nothing has been saved.`;
+      this.display();
+      return;
+    }
+
+    // Past this line the claim "nothing has been saved" would be false: `applySetup` writes
+    // every field before it awaits anything, and its save may succeed and a later step still
+    // reject. So the previous settings are captured and put back on failure, and the message
+    // says which of the two actually happened.
+    const before = JSON.parse(JSON.stringify(this.plugin.settings)) as Settings;
+    try {
       // A minted key exists nowhere else yet, so it must pass the one-time backup gate before
       // anything is uploaded. A key the user typed is already in their backup.
       await this.plugin.applySetup(payload, { backedUp: !minted });
       this.#joinDraft = emptyJoinDraft();
-      this.#probe = null;
-      this.#probeError = null;
+      this.#resetProbe();
       this.display();
     } catch (e) {
-      this.#probeError = `${message(e)} Nothing has been saved.`;
+      let restored = true;
+      try {
+        Object.assign(this.plugin.settings, before);
+        await this.plugin.saveSettings();
+      } catch {
+        restored = false;
+      }
+      this.#probeError = restored
+        ? `Setting this device up failed: ${message(e)} It has been put back the way it was.`
+        : `Setting this device up failed: ${message(e)} This device may now be half-configured ` +
+          "— check the Connection fields before syncing.";
       this.display();
     }
   }

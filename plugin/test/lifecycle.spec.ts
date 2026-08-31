@@ -1927,3 +1927,64 @@ describe("removing empty folders", () => {
     expect(said).toContain("EPERM");
   });
 });
+
+// --- applySetup as a programmatic caller -------------------------------------------------
+//
+// A human clicking serialises these; the onboarding form does not. `applySetup` is now called
+// from code, which is the caller class that can re-enter sync before the join has settled.
+
+describe("applySetup called programmatically", () => {
+  // Deliberately a DIFFERENT vault from CONFIGURED: with the same URL and token the
+  // assertions below would hold no matter what the join did.
+  const PAYLOAD = {
+    v: 2 as const,
+    url: "https://joined.example.workers.dev",
+    name: "joined-device",
+    token: "joined-token",
+    mode: "plaintext" as const,
+  };
+
+  it("settles its own flags before anything it starts can read them", async () => {
+    const { plugin } = makePlugin(
+      persisted({ settings: { ...CONFIGURED, retryAttempts: 0 }, state: null })
+    );
+    await plugin.onload();
+    requestUrlMock.calls.length = 0;
+
+    // The shape the form produces: apply, then a sync in the same turn, with no click between.
+    await plugin.applySetup(PAYLOAD);
+    await plugin.syncNow();
+    await flush();
+
+    // Whatever ran, it ran against the joined vault — never the previous credentials.
+    expect(plugin.settings.serverUrl).toBe(PAYLOAD.url);
+    expect(plugin.settings.accessToken).toBe(PAYLOAD.token);
+    expect(plugin.settings.deviceName).toBe(PAYLOAD.name);
+    expect(plugin.settings.encryptionMode).toBe("plaintext");
+    expect(plugin.settings.masterKey).toBe("");
+    for (const call of requestUrlMock.calls as { url: string }[]) {
+      expect(String(call.url)).toContain("joined.example.workers.dev");
+    }
+    // And the joined state is what reached disk, not a half-applied mixture.
+    const saved = await flushToDisk(plugin);
+    expect(saved.settings?.serverUrl).toBe(PAYLOAD.url);
+    expect(saved.settings?.accessToken).toBe(PAYLOAD.token);
+  });
+
+  it("does not leave the first-sync gate acknowledged from the previous vault", async () => {
+    // The reconciliation ahead is with a different set of remote files, so the acknowledgement
+    // is owed again — and a programmatic caller must not be able to skip past that.
+    const { plugin } = makePlugin(
+      persisted({
+        settings: { ...CONFIGURED, firstSyncAcknowledged: true, retryAttempts: 0 },
+        state: null,
+      })
+    );
+    await plugin.onload();
+
+    await plugin.applySetup(PAYLOAD);
+    await flush();
+
+    expect(plugin.settings.firstSyncAcknowledged).toBe(false);
+  });
+});

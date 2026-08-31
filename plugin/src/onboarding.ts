@@ -20,6 +20,15 @@ import { parseFileEntries, type Manifest } from "./types";
 export type RemoteKind = "empty" | "encrypted" | "plaintext";
 
 export interface RemoteProbe {
+  /**
+   * The exact credentials this answer describes.
+   *
+   * The probe is asynchronous and the form's fields are not: a reply about vault A can land
+   * after the user has retyped the URL for vault B. Binding the answer to what was asked is
+   * what stops "empty vault, mint a key" being applied to a vault nobody probed.
+   */
+  url: string;
+  token: string;
   kind: RemoteKind;
   head: string | null;
   /** The head manifest, kept so the entered key can be proven against real ciphertext. */
@@ -41,13 +50,23 @@ export interface RemoteProbe {
  * "empty vault", because that is the answer that leads to minting a key over someone's
  * existing snapshots.
  */
-export async function probeRemote(api: SyncApi): Promise<RemoteProbe> {
+export async function probeRemote(
+  api: SyncApi,
+  credentials: { url: string; token: string }
+): Promise<RemoteProbe> {
   const head = await api.getHead();
   if (head === null) {
-    return { kind: "empty", head: null, manifest: null, vaultSalt: await publishedSalt(api) };
+    return {
+      ...credentials,
+      kind: "empty",
+      head: null,
+      manifest: null,
+      vaultSalt: await publishedSalt(api),
+    };
   }
   const manifest = await api.getManifest(head);
   return {
+    ...credentials,
     kind: manifest.v === 1 ? "plaintext" : "encrypted",
     head,
     manifest,
@@ -70,7 +89,19 @@ async function publishedSalt(api: SyncApi): Promise<string | null> {
     if (error instanceof ApiError && error.status === 404) return null;
     throw error;
   }
-  if (!isSettingsDoc(raw)) return null;
+  // A 200 carrying something this plugin cannot parse is a failed read, not an absent
+  // document. Reading it as absent is the same widening as reading an unparseable exclude
+  // list as "no rule": it would let the join proceed — minting a key for an "empty" vault, or
+  // adopting a provisional salt on an established one — on the strength of a read that failed.
+  // `null`/`undefined` from a successful read is a real "no document", the same reading the
+  // agent's policy loader uses.
+  if (raw === null || raw === undefined) return null;
+  if (!isSettingsDoc(raw)) {
+    throw new Error(
+      "the vault's shared settings document is malformed, so this vault cannot be read — " +
+        "refusing to join rather than treating it as a vault with no settings"
+    );
+  }
   const salt = raw.vaultSalt;
   if (salt === undefined) return null;
   // Validated here rather than trusted: it is about to become this device's canonical salt.

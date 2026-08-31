@@ -14,6 +14,7 @@ import { buildManifest, type Manifest } from "../src/types";
 // silently at entry time. Every refusal path below asserts that nothing would have been saved.
 
 const SALT = generateVaultSalt();
+const CREDS = { url: "https://v.example.workers.dev", token: "t" };
 
 async function encryptedManifest(keyText: string, id = "01J0AAAAAAAAAAAAAAAAAAAAAA"): Promise<Manifest> {
   const crypto = await VaultCrypto.fromText(keyText);
@@ -39,7 +40,7 @@ function fakeApi(over: Partial<Record<keyof SyncApi, unknown>>): SyncApi {
 
 describe("probeRemote", () => {
   it("calls an empty vault empty, and asks for no key", async () => {
-    const probe = await probeRemote(fakeApi({ getHead: () => Promise.resolve(null) }));
+    const probe = await probeRemote(fakeApi({ getHead: () => Promise.resolve(null) }), CREDS);
     expect(probe.kind).toBe("empty");
     expect(probe.head).toBeNull();
     expect(probe.manifest).toBeNull();
@@ -57,7 +58,8 @@ describe("probeRemote", () => {
       crypto: null,
     });
     const probe = await probeRemote(
-      fakeApi({ getHead: () => Promise.resolve(manifest.id), getManifest: () => Promise.resolve(manifest) })
+      fakeApi({ getHead: () => Promise.resolve(manifest.id), getManifest: () => Promise.resolve(manifest) }),
+      CREDS
     );
     expect(probe.kind).toBe("plaintext");
     expect(probeSummary(probe)).toContain("not encrypted");
@@ -66,7 +68,8 @@ describe("probeRemote", () => {
   it("reads a v3 head as an existing encrypted vault", async () => {
     const manifest = await encryptedManifest(generateMasterKey());
     const probe = await probeRemote(
-      fakeApi({ getHead: () => Promise.resolve(manifest.id), getManifest: () => Promise.resolve(manifest) })
+      fakeApi({ getHead: () => Promise.resolve(manifest.id), getManifest: () => Promise.resolve(manifest) }),
+      CREDS
     );
     expect(probe.kind).toBe("encrypted");
     expect(probe.manifest).toBe(manifest);
@@ -77,7 +80,10 @@ describe("probeRemote", () => {
     // The dangerous misreading: "I could not tell" answered as "empty" is what leads to
     // minting a key over somebody's existing snapshots.
     await expect(
-      probeRemote(fakeApi({ getHead: () => Promise.reject(new ApiError("unauthorized", 401, "unauthorized")) }))
+      probeRemote(
+        fakeApi({ getHead: () => Promise.reject(new ApiError("unauthorized", 401, "unauthorized")) }),
+        CREDS
+      )
     ).rejects.toThrow(/unauthorized/);
   });
 
@@ -85,15 +91,19 @@ describe("probeRemote", () => {
     const withDoc = await probeRemote(
       fakeApi({
         getSettingsDoc: () => Promise.resolve({ v: 1, updatedAt: 1, device: "d", vaultSalt: SALT, plain: {} }),
-      })
+      }),
+      CREDS
     );
     expect(withDoc.vaultSalt).toBe(SALT);
 
-    const noDoc = await probeRemote(fakeApi({}));
+    const noDoc = await probeRemote(fakeApi({}), CREDS);
     expect(noDoc.vaultSalt).toBeNull();
 
     await expect(
-      probeRemote(fakeApi({ getSettingsDoc: () => Promise.reject(new ApiError("boom", 500, "server")) }))
+      probeRemote(
+        fakeApi({ getSettingsDoc: () => Promise.reject(new ApiError("boom", 500, "server")) }),
+        CREDS
+      )
     ).rejects.toThrow(/boom/);
   });
 });
@@ -290,6 +300,39 @@ describe("the setup form's effect on the settings store", () => {
     await probeVia(tab, "https://v.example.workers.dev", "dead-token");
     expect(settings.masterKey).toBe("");
     expect(settings.encryptionMode).toBe(DEFAULT_SETTINGS.encryptionMode);
+    expect(applied).toEqual([]);
+  });
+});
+
+describe("the probe is bound to the credentials it inspected", () => {
+  it("drops a reply that arrives after the credentials changed", async () => {
+    // The reviewed hazard: an "empty vault" answer about vault A landing after the user has
+    // retyped the URL for encrypted vault B would offer "Create this vault" and mint a key
+    // over B's snapshots.
+    let release: (v: string | null) => void = () => {};
+    const slow = new Promise<string | null>((r) => {
+      release = r;
+    });
+    const { tab, settings, applied } = tabWith(() => slow);
+    tab.display();
+    const rows = (tab as unknown as { containerEl: { log: { rows: { texts: { change: (v: string) => void }[]; buttons: { text: string; click: () => unknown }[] }[] } } }).containerEl.log.rows;
+    rows[1].texts[0].change("https://a.example.workers.dev");
+    rows[2].texts[0].change("token-a");
+    const check = rows.flatMap((r) => r.buttons).find((b) => b.text === "Check");
+    if (check === undefined) throw new Error("no Check button");
+    check.click();
+
+    // The user retypes while the request is still out.
+    rows[1].texts[0].change("https://b.example.workers.dev");
+    release(null); // vault A answers "empty"
+    await flush();
+
+    // No "Create this vault" button, because that answer was about a URL no longer typed.
+    const names = (tab as unknown as { containerEl: { log: { rows: { buttons: { text: string }[] }[] } } }).containerEl.log.rows
+      .flatMap((r) => r.buttons)
+      .map((b) => b.text);
+    expect(names).not.toContain("Create this vault");
+    expect(settings.masterKey).toBe("");
     expect(applied).toEqual([]);
   });
 });
