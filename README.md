@@ -37,8 +37,8 @@ credential lives in gitignored `.env`, managed for you.
   ...
 ```
 
-Then install the plugin (or, once the community listing is live, install **R2DO Sync** from
-Settings → Community plugins — the Worker is yours to deploy either way):
+Then install the plugin — **R2DO Sync** is in Settings → Community plugins, or build it
+yourself. The Worker is yours to deploy either way:
 
 ```bash
 cd plugin && node build.mjs && cd ..
@@ -75,12 +75,11 @@ deleted on a first sync.
 
 ### On a phone
 
-Before the community listing appears, let a computer do the install once: set the vault up
-on a desktop, zip the whole vault folder, and unzip it inside Obsidian's folder on the
-phone — the hidden `.obsidian` folder travels inside the zip even on iOS, carrying plugin,
-settings and keys. Just change **Device name** afterwards. (Android can instead copy the
-three `plugin/dist/` files into `YourVault/.obsidian/plugins/cloudflare-rdo-sync/` and set
-up by QR as usual.)
+Install from Community plugins, then set up by QR from a configured device. If you would
+rather not wait on the store, let a computer do it once: set the vault up on a desktop, zip the
+whole vault folder, and unzip it inside Obsidian's folder on the phone — the hidden `.obsidian`
+folder travels inside the zip even on iOS, carrying plugin, settings and keys. Change **Device
+name** afterwards.
 
 Once running, the **ribbon icon** is the sync button. By default a pass that moved files says
 so and a pass that found nothing stays quiet; **What sync announces** turns that up to every
@@ -96,154 +95,102 @@ a silent device has nothing on screen to say a sync has started failing.
 
 ## Connect an AI assistant
 
-An optional **second Worker** lets an AI assistant read — and, if you allow it, write — this
-vault over [MCP](https://modelcontextprotocol.io), with no Obsidian running anywhere. Ask it
-what you wrote about something last month, have it file a note while you are away from your
-desk, let it keep a log for you. It is off by default and entirely skippable: nothing in the
-plugin depends on it.
+An optional **second Worker** lets Claude, Codex or any MCP client read — and, if you allow it,
+write — this vault, with no Obsidian running anywhere. Ask what you wrote about something last
+month, file a note from your phone, keep a log. Off by default and entirely skippable: nothing
+in the plugin depends on it.
 
-**Understand the trade before you deploy it.** This Worker holds your vault master key, which
-is the one secret the sync Worker never sees. It decrypts your notes in order to answer, so
-whatever it reads reaches your model provider as plaintext. The sync Worker's "the server
-cannot read your notes" property does not extend to this one — that is the point of it being a
-separate thing you have to ask for. Deleting it and revoking its token ends it.
+**Understand the trade first.** This Worker holds your vault master key, the one secret the sync
+Worker never sees. It decrypts your notes to answer, so whatever it reads reaches your model
+provider as plaintext. "The server cannot read your notes" does not extend to this one — that is
+the point of it being separate and opt-in.
 
 ### Deploy it
 
 ```bash
-# Read-only: it can answer questions about your vault, and change nothing.
+# Read-only: answers questions, changes nothing.
 node scripts/deploy.mjs --vault my-vault --agent
 
 # Read and write: adds capture and editing.
 node scripts/deploy.mjs --vault my-vault --agent --agent-writable
 ```
 
-`--agent` needs `--vault`, and refuses to stand an agent over your default deployment — so
-your main vault's master key cannot reach a Worker by way of a flag on a routine deploy. The
-confirmation screen names the new Worker before anything is created.
+`--agent` needs `--vault` and refuses your default deployment, so your main vault's key cannot
+reach a Worker by way of a flag on a routine deploy. For that one, `deploy-agent.mjs --live` is
+the only path, and it **requires `--deny`** (below) — naming what stays out of reach is meant to
+be a decision, not a step you skip.
 
-When it finishes, everything a client needs is in one file at the repository root:
+Everything a client needs lands in one file at the repository root:
 
 ```
-DEPLOY-CREDENTIALS.my-vault.txt      (mode 0600, gitignored)
+DEPLOY-CREDENTIALS.my-vault.txt        (mode 0600, gitignored)
 ```
 
-It holds the URL ending in `/mcp`, the header name, and the complete header value, ready to
-paste. The terminal shows only the URL and a short fingerprint — enough to tell one deploy
-from another, useless for signing in — so the credential itself never sits in your scroll-back
-or in a transcript.
+The URL, the header name and the complete header value, ready to paste. The terminal shows only
+the URL and a short fingerprint — enough to tell one deploy from another, useless for signing in
+— so the credential never sits in your scroll-back. **Store the values somewhere safe, then
+delete the file.**
 
-**Read it, store the values somewhere safe, then delete the file.** It says so itself, and the
-last section explains what deleting it changes.
+### Point a client at it
 
-### Keeping some folders out of its reach
+| | |
+|---|---|
+| **URL** | the one ending in `/mcp` — never `/sse` |
+| **Authentication** | **None**, plus a request header |
+| **Header name** | `Authorization` |
+| **Header value** | `Bearer …` — copy the whole line, `Bearer` and space included |
+
+Anything speaking **streamable HTTP** with a custom header works; there is no OAuth, no session,
+nothing to install locally.
+
+- **Claude (web and desktop)** — Settings → Connectors → Add custom connector. Check for a
+  **Request headers** section in that dialog *first*: it is a gated beta, and without it there is
+  no supported way in. Auth settings cannot be edited once a connector exists, which is why a
+  redeploy never reissues the header value; if you do run `--rotate-bearer`, remove and re-add.
+- **Claude Code** — `claude mcp add --transport http obsidian <url>/mcp --header "Authorization:
+  Bearer <value>"`. Add `-s user` for every project; avoid `-s project`, which writes the
+  credential into a committed `.mcp.json`. Servers load at startup, so restart the session.
+- **Codex** — `codex mcp add obsidian --url <url>/mcp --bearer-token-env-var OBSIDIAN_MCP_TOKEN`,
+  then export that variable from your shell profile rather than a config file. No `Bearer `
+  prefix there; Codex adds it.
+
+### What it can do
+
+Read-only gives `search`, `read`, `list` and `recent`. Writable adds `append`, `edit`, `write`,
+`delete` and `move` on a second, separately revocable credential.
+
+The write tools behave like a file system: `write` replaces a note outright, `delete` removes
+one, neither asks for confirmation, and folders come and go with the notes in them. **Your undo
+is snapshot history**, so the retention window is what a mistake costs, and recovery is done from
+the plugin — the assistant cannot do it for you. `move` is the exception to the plain-`rm`
+reading: it refuses to land on a path that already exists.
+
+Dates it reports are your vault's, not the server's — the deploy records your machine's timezone,
+so "yesterday" means what you mean.
+
+Your vault's own exclude and only-paths rules bind it on reads as well as writes, and everything
+it writes syncs to your devices like any other device's changes, mass-deletion guard included.
+
+### Keeping folders out of its reach
 
 ```bash
 node scripts/deploy-agent.mjs --vault my-vault --deny "Private/**, Keys/**"
 ```
 
 Anything matching is invisible to every tool — it cannot be listed, searched, read, written or
-deleted — and the rule is set where the Worker is deployed, so nothing you sync can widen it.
-That is deliberately a different control from the vault's own excludes, which are a synced
-setting any of your devices can edit, and which also stop the folder reaching your other
-devices. Use `--deny` when you want a folder on all your devices but not in front of a model.
+deleted — and the rule lives where the Worker is deployed, so nothing you sync can widen it.
+That is deliberately different from the vault's own excludes, which are a synced setting any
+device can edit and which also stop the folder reaching your other devices. Use `--deny` for a
+folder you want on all your devices but not in front of a model.
 
-Two honest limits. It governs what the *agent* may decrypt, not what your vault has stored:
-those notes stay in snapshots already taken, exactly as excluded ones do, and only a re-root
-removes them. And a glob that matches nothing denies nothing — check the deploy's `deny list:
-N glob(s)` line, then try to read something under the folder and confirm it refuses.
-
-### Standing one over your default deployment
-
-The default vault is deliberately harder to reach, because its master key is the one worth
-most:
-
-```bash
-node scripts/deploy-agent.mjs --live --deny "Private/**"
-```
-
-`--live` is the only path there, and it **requires `--deny`**. That is not a formality: this
-is the deployment that puts your main vault's key into a Worker secret, and naming what stays
-out of reach is meant to be a decision you make rather than one you skip.
-
-### Claude (web and desktop)
-
-Settings → **Connectors** → **Add custom connector**:
-
-Every value below is in `DEPLOY-CREDENTIALS.<vault>.txt`, in this order, ready to paste:
-
-| | |
-|---|---|
-| **URL** | the one ending in `/mcp` |
-| **Authentication** | **None** |
-| **Header name** | `Authorization` |
-| **Header value** | `Bearer …` — copy the whole line, including the word `Bearer` |
-
-Check for a **Request headers** section in that dialog *first*. It is a gated beta, and if
-your account does not have it there is currently no other supported way in — the deploy is
-wasted effort until it appears.
-
-Three things that each cost an hour if missed. The header value is sent exactly as typed, so
-it must include the word `Bearer` and the space. The URL must end in `/mcp`, never `/sse`.
-And **authentication settings cannot be changed once the connector exists** — which is why a
-redeploy never reissues the header value on its own. If you do run `--rotate-bearer`, remove
-the connector and add it again.
-
-### Claude Code
-
-```bash
-claude mcp add --transport http obsidian https://<your-agent>.workers.dev/mcp \
-  --header "Authorization: Bearer <the value from DEPLOY-CREDENTIALS.<vault>.txt>"
-
-claude mcp list          # confirm it connected
-```
-
-Add `-s user` to make it available in every project rather than just this one. Avoid
-`-s project`: that writes the header, credential and all, into a `.mcp.json` in the repository.
-Claude Code loads MCP servers at startup, so restart the session before the tools appear.
-
-### Codex
-
-```bash
-codex mcp add obsidian --url https://<your-agent>.workers.dev/mcp \
-  --bearer-token-env-var OBSIDIAN_MCP_TOKEN
-
-codex mcp list
-```
-
-Codex reads the token from that environment variable each run, so export it in your shell
-profile rather than putting the secret in a config file:
-
-```bash
-export OBSIDIAN_MCP_TOKEN=<token>      # no "Bearer " prefix here — Codex adds it
-```
-
-### Any other MCP client
-
-Anything that speaks **streamable HTTP** and can send a custom header will work. Point it at
-the `/mcp` URL, send `Authorization: Bearer <token>`, and that is the whole configuration —
-there is no OAuth, no session to establish, and nothing to install locally.
-
-### What it can do
-
-Read-only gives it `search`, `read`, `list` and `recent`. `--agent-writable` mints a second,
-separately revocable token and adds `append`, `edit`, `write`, `delete` and `move`.
-
-The write tools behave like a file system: `write` replaces a note outright and `delete`
-removes one, neither asks for confirmation, and folders are created and left behind
-automatically as notes come and go. **Your undo is snapshot history**, so the retention window
-is what a mistake costs, and getting a note back is done from the plugin — the assistant
-cannot do it for you. `move` is the one exception to the plain-`rm` reading: it refuses to
-land on a path that already exists rather than replacing a different note.
-
-**What it will never touch.** Your vault's own exclude and only-paths rules bind it on reads
-as well as writes, and the credential folders are filtered out of what it can read at all.
-Everything it writes syncs to your devices like any other device's changes, mass-deletion
-guard included.
+Two honest limits. It governs what the *agent* may decrypt, not what your vault has stored: those
+notes stay in snapshots already taken, exactly as excluded ones do, and only a re-root removes
+them. And a glob that matches nothing denies nothing — check the deploy's `deny list: N glob(s)`
+line, then try to read something under the folder and confirm it refuses.
 
 ### Teaching it your vault
 
-Put a note called **`AGENTS.md`** at the root of your vault:
+Put a note called **`AGENTS.md`** at your vault root:
 
 ```markdown
 - Daily notes live in `Daily/YYYY-MM-DD.md`.
@@ -251,60 +198,39 @@ Put a note called **`AGENTS.md`** at the root of your vault:
 - When I say *log X*, append X under `## Log` in today's daily note.
 ```
 
-That is served to the assistant when a conversation starts, so you can ask for things in
-fewer words. It is an ordinary note: edit it on any device and it syncs, and history versions
-it like anything else. On a writable deployment the assistant can edit it itself, so "remember
-that my daily notes live under Daily/" is one request away — with new text taking effect in
-your *next* conversation, not the current one.
+It is served when a conversation starts, so you can ask for things in fewer words. An ordinary
+note: edit it anywhere, history versions it, and a writable deployment can edit it itself — with
+new text taking effect in your *next* conversation, not the current one. It is advice to the
+model, never configuration: it cannot un-hide a path or change what a tool does, and an
+`AGENTS.md` your vault excludes is invisible.
 
-Two limits worth knowing. It is read through the same rules as every other note, so an
-`AGENTS.md` your vault excludes is invisible. And it is advice to the model, never
-configuration — it cannot un-hide a path, widen what the assistant may read, or change what a
-tool does.
+Some clients drop server instructions entirely. Every tool description points at `AGENTS.md` to
+cover that. If the assistant still seems not to know your conventions, ask it what its
+instructions for this vault say — an empty answer means that client dropped them.
 
-Some clients do not pass server instructions to the model at all (Claude Code's deferred tool
-loading is one). The `list` and `search` tools mention `AGENTS.md` in their own descriptions to
-cover that, so the assistant finds the note the first time it looks around your vault. If it
-still seems not to know your conventions, ask it in the chat what its instructions for this
-vault say — an empty answer means that client dropped them, and "read `AGENTS.md` first" is a
-one-line fix for that conversation.
+### Redeploying, rotating, removing
 
-### Updating and reissuing credentials
-
-Redeploying is safe and boring. Code and settings are replaced; **nothing is reissued unless
-you ask**, so a client that works keeps working:
-
-```bash
-node scripts/deploy-agent.mjs --vault my-vault --writable     # new code, same credentials
-```
+Redeploying is safe and boring: code and settings are replaced, and **nothing is reissued unless
+you ask**, so a working client keeps working.
 
 | To change | Pass | What it costs |
 |---|---|---|
-| the header value a client sends | `--rotate-bearer` | connector auth cannot be edited after it is created, so you must remove and re-add the connector |
-| the agent's own vault tokens | `--rotate-tokens` | nothing — no client ever sees these; the pair it replaces is revoked once the new one answers |
-| what it may not touch | `--deny "…"` | takes effect immediately; `--deny ""` clears it |
+| the header value a client sends | `--rotate-bearer` | connector auth cannot be edited after creation, so remove and re-add the connector |
+| the agent's own vault tokens | `--rotate-tokens` | nothing — no client sees these; the pair it replaces is revoked once the new one answers |
+| what it may not touch | `--deny "…"` | immediate; `--deny ""` clears it |
 | read-only ⇄ read-write | add or drop `--writable` | dropping it deletes the write credential outright, not just the tool list |
 
-A failed deploy revokes anything it created before it stops, and a successful one retires the
-credentials it replaced only after the new deployment answers — so you are never left with a
-live credential nothing names, or a working agent whose credential was withdrawn under it.
+A failed deploy revokes anything it created before stopping; a successful one retires what it
+replaced only after the new deployment answers. So you are never left with a live credential
+nothing names, nor a working agent whose credential was withdrawn under it. While the handover
+file still exists a redeploy keeps the admin token it names — otherwise the file would quietly
+stop being true — and once you delete it the next deploy issues a fresh one.
 
-One thing follows from the handover file being the handover: **while it exists, a redeploy
-keeps the admin token it names**, because otherwise the file would quietly stop being true.
-Once you have stored the values and deleted it, the next deploy issues a fresh one and writes
-a new file. The MCP header value is the exception and is never reissued on its own — only
-`--rotate-bearer` changes it.
-
-### Turning it off
-
-Delete the agent Worker in the Cloudflare dashboard, and revoke its tokens with
-`node scripts/access-token.mjs --vault my-vault --list` and `--revoke <id>`. Your vault and
-every device are unaffected — the agent was only ever another device as far as they are
-concerned.
-
-If you want its **search index** gone too, drop it first with an authenticated
-`DELETE <agent-url>/admin/index`. It holds note text in the Worker's own storage, and deleting
-a Worker's code is not the same operation as deleting its stored data.
+To remove it: delete the agent Worker in the Cloudflare dashboard and revoke its tokens with
+`node scripts/access-token.mjs --vault my-vault --list` then `--revoke <id>`. Your vault and
+devices are unaffected. If you want its **search index** gone too, drop it first with an
+authenticated `DELETE <agent-url>/admin/index` — deleting a Worker's code is not the same
+operation as deleting its stored data.
 
 ## Everyday use
 
@@ -363,7 +289,7 @@ a Worker's code is not the same operation as deleting its stored data.
 | **List the changed files** | off | Names each file that moved instead of counts alone, and is what puts the snapshot id in the notice |
 | **Show the status bar on mobile** | off | Forces Obsidian's hidden mobile status bar open, so sync state is readable without notices |
 | **Sync settings between devices** | on | Shares vault-wide settings through the server, encrypted like notes; most recent change wins |
-| **Snapshot retention** (server) | 90 days / 500 snapshots | Not a plugin setting — see [Limits](#limits) |
+| **Snapshot retention** (server) | 14 days, then thinned | Not a plugin setting — see [Limits](#limits) |
 
 Vault-wide settings (excludes, thresholds, intervals, direction…) sync between devices.
 Credentials, **Device name**, **Parallel lanes**, everything under **Notices** and
@@ -498,7 +424,8 @@ The plugin is **R2DO Sync**, but the Cloudflare resources keep this project's or
 All three come from `worker/wrangler.jsonc`. Renaming them is a migration, not an edit — a
 new Worker name means a new, empty Durable Object, and R2 buckets cannot be renamed at all —
 so `scripts/deploy.mjs` refuses to deploy a rename it would fork. The same file's `vars` hold
-snapshot retention (`GC_KEEP_DAYS` / `GC_KEEP_COUNT`); every deploy restates them, so editing
+snapshot retention (`GC_KEEP_DAYS` / `GC_KEEP_COUNT` / `GC_DAILY_DAYS`); every deploy restates
+them, so editing
 the file and redeploying is how they change.
 
 ### A second, separate vault
@@ -521,22 +448,19 @@ node scripts/access-token.mjs --vault notes-2      # re-issue the access token
 node scripts/access-token.mjs --vault notes-2 --list
 ```
 
-Without the flag every script means your default deployment — and *succeeds* there rather
-than failing usefully. The resolved vault is printed before anything is created.
+**Pass `--vault` to every later command for that vault.** Without it a script means your
+default deployment and *succeeds* there rather than failing usefully; the resolved vault is
+printed before anything is created. A name is refused if it is your default deployment's name,
+an unrelated existing bucket, anything containing `sandbox` (the marker
+`scripts/sandbox.mjs --destroy --all` deletes), or a Worker already on your account —
+`--adopt-worker` is the deliberate way past, and only right for a vault of your own whose
+`.env.<name>` you lost.
 
-A name is refused when it is your default deployment's own name, an unrelated existing
-bucket, anything containing `sandbox` (that marker belongs to throwaway test deployments
-that `scripts/sandbox.mjs --destroy --all` deletes), or a name already belonging to a Worker
-on your account — deploying would replace that Worker. `--adopt-worker` is the deliberate
-way past, and only ever right for a vault of your own whose `.env.<name>` you lost.
-
-Use it with a **different** Obsidian vault: pointing an existing device at a new deployment
-copies nothing, it just changes which (empty) remote that device syncs with. REST path only,
-because wrangler deploys whatever `worker/wrangler.jsonc` names.
-
-Nothing changes in the plugin, and there is no extra setting. Each Obsidian vault keeps its
-own plugin settings, so you set the second one up exactly like the first. The vault name is
-an operator-side label and never reaches the plugin, which only ever sees a URL.
+Use it with a **different** Obsidian vault; pointing an existing device at a new deployment
+copies nothing, it just changes which empty remote it syncs with. Nothing changes in the plugin
+— each Obsidian vault keeps its own settings, so you set the second up exactly like the first,
+and the vault name never reaches the plugin, which only ever sees a URL. REST path only, because
+wrangler deploys whatever `worker/wrangler.jsonc` names.
 
 ### Deploying without wrangler
 
@@ -564,12 +488,14 @@ test keeps the two byte-compatible — a bug in the plugin cannot make your back
 - 100 MiB per file (Workers request-body limit); larger files are skipped and reported.
 - 100,000 files per snapshot.
 - Merge granularity is a line; two edits inside one line conflict.
-- Nightly garbage collection (04:00 UTC) keeps the last 500 snapshots **or** 90 days of
-  them, whichever reaches further back, plus every blob they reference —
-  `GC_KEEP_COUNT` / `GC_KEEP_DAYS` in `worker/wrangler.jsonc`; edit them and redeploy.
-  Retained snapshots restate the whole path map, so this — not file content — is usually
-  what a vault's storage is spent on. Shrinking it also shortens how long a device can be
-  offline and still merge cleanly against a shared base.
+- Nightly garbage collection (04:00 UTC) thins history rather than dropping it. Every
+  snapshot survives for `GC_KEEP_DAYS` (14) or the newest `GC_KEEP_COUNT` (100), whichever
+  reaches further back; then one a day out to `GC_DAILY_DAYS` (90); then one a week, kept
+  indefinitely. So recent work is restorable to the individual sync, last month to the day, and
+  older history never expires — set in `worker/wrangler.jsonc`, restated on every deploy.
+  Retained snapshots restate the whole path map, so this — not file content — is usually what a
+  vault's storage is spent on. The dense window is also how long a device can be offline and
+  still merge cleanly against a shared base; shortening it makes that window smaller.
 - One vault per deployment.
 
 ## Development
@@ -593,7 +519,7 @@ npm --prefix plugin run test:live    # skips entirely when no sandbox is deploye
 node scripts/sandbox.mjs --destroy --all
 
 npm --prefix plugin run build        # -> plugin/dist/{main.js,manifest.json,styles.css}
-node scripts/release-validate.mjs 0.3.0   # release layout check; must run from the root
+node scripts/release-validate.mjs 1.0.0   # release layout check; must run from the root
 ```
 
 `worker/wrangler.jsonc` is the single source of deployment metadata for both deploy paths.
