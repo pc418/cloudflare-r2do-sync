@@ -16,7 +16,7 @@
 import { globToRegExp } from "../../plugin/src/paths";
 import type { FileEntry } from "../../plugin/src/types";
 import type { SearchIndex } from "./index-store";
-import { BLOB_BUDGET, search } from "./search";
+import { BLOB_BUDGET, CONTEXT_DEFAULT, CONTEXT_MAX, search } from "./search";
 import { VaultError, type VaultView } from "./vault";
 import type { WriteOp } from "./write";
 
@@ -115,6 +115,9 @@ export const TOOLS: ToolDescriptor[] = [
           description:
             "Treat the query as a regular expression (default false). Slower: regular expressions cannot use the index, so the search always falls back to the budgeted scan.",
         },
+        context: int(
+          `Lines of context either side of each match, like grep -C (default ${CONTEXT_DEFAULT}, cap ${CONTEXT_MAX}). Use 0 for matched lines only — the right choice when harvesting paths or matching structure, where context is noise.`
+        ),
         folder: str("Restrict to a folder, subfolders included, e.g. \"Projects\"."),
         glob: str("Optional path glob, e.g. \"Daily/**\" or \"**/*.md\". ANDed with folder when both are given."),
         max_results: int("Maximum hits to return (default 20, cap 100)."),
@@ -346,6 +349,9 @@ export async function callTool(
       // at all — it is the scan or nothing. Stated in the field description rather than left
       // for the caller to infer from a slow call.
       const regex = asBool(args, "regex");
+      // Clamped rather than refused: an out-of-range number is a preference, not a mistake
+      // worth failing a search over.
+      const context = asInt(args, "context", CONTEXT_DEFAULT);
 
       // The index answers the whole vault with no network; the scan sees only a budget's
       // worth. Prefer the index, but only while it describes exactly this head — a stale one
@@ -358,9 +364,10 @@ export async function callTool(
           folder,
           glob: glob === undefined ? null : globToRegExp(glob),
           maxResults,
+          context,
         });
       } else {
-        result = await search(ctx.view, files, query, { folder, glob, maxResults, regex });
+        result = await search(ctx.view, files, query, { folder, glob, maxResults, regex, context });
         // Advance the index on the way out, so repeated questions converge on the complete
         // answer instead of paying for the scan forever — but out of what the scan LEFT.
         // Two separately-reasonable budgets in one invocation is how the limit gets blown.

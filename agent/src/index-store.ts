@@ -20,7 +20,14 @@
  * Worker secret — the same reasoning, applied once more, deliberately.
  */
 import type { FileEntry } from "../../plugin/src/types";
-import { isProbablyText, MAX_FILE_BYTES, type SearchHit, type SearchResult } from "./search";
+import {
+  contextLines,
+  CONTEXT_DEFAULT,
+  isProbablyText,
+  MAX_FILE_BYTES,
+  type SearchHit,
+  type SearchResult,
+} from "./search";
 
 /** All the index needs from the vault. Narrow on purpose: it reads bytes, nothing more. */
 export type BlobReader = { read(entry: FileEntry): Promise<Uint8Array> };
@@ -155,7 +162,10 @@ export class SearchIndex {
    * what a token-based index would quietly change. The scan is in-process over content already
    * in memory-mapped storage, so it costs a fraction of one blob fetch.
    */
-  query(query: string, opts: { folder?: string; glob?: RegExp | null; maxResults: number }): SearchResult {
+  query(
+    query: string,
+    opts: { folder?: string; glob?: RegExp | null; maxResults: number; context?: number }
+  ): SearchResult {
     const rows = this.#sql
       .exec<{ path: string; content: string }>(
         "SELECT path, content FROM notes WHERE content LIKE ? ESCAPE '\\' ORDER BY path",
@@ -184,7 +194,7 @@ export class SearchIndex {
           path: row.path,
           line: i + 1,
           text: lines[i],
-          context: lines.slice(Math.max(0, i - 2), Math.min(lines.length, i + 3)),
+          context: contextLines(lines, i, opts.context ?? CONTEXT_DEFAULT),
         });
       }
     }

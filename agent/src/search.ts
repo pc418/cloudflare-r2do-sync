@@ -40,8 +40,31 @@ export interface SearchHit {
   path: string;
   line: number;
   text: string;
-  /** Up to two lines either side, for orientation without a second `read` call. */
+  /**
+   * The matched line plus `context` lines either side, for orientation without a second
+   * `read` call. At `context: 0` it is the matched line alone.
+   */
   context: string[];
+}
+
+/** `grep -C`: lines either side of a match. Two is enough to orient, and was the old fixed value. */
+export const CONTEXT_DEFAULT = 2;
+/**
+ * Deliberately small. Context is a *preview* — anything wanting more of a note should `read`
+ * it, and a generous cap here would let one high-hit query fill the whole result budget with
+ * text nobody asked for.
+ */
+export const CONTEXT_MAX = 5;
+
+/**
+ * The window around one matched line, clamped.
+ *
+ * Shared by the scan and the index because two copies of this drifted apart is a class of bug
+ * where a query returns different-looking answers depending on whether the index was warm.
+ */
+export function contextLines(lines: string[], index: number, context: number): string[] {
+  const n = Math.max(0, Math.min(Math.floor(context), CONTEXT_MAX));
+  return lines.slice(Math.max(0, index - n), Math.min(lines.length, index + n + 1));
 }
 
 export interface SearchResult {
@@ -132,6 +155,8 @@ export async function search(
     budget?: number;
     /** Compile the query as a regular expression instead of matching it as a substring. */
     regex?: boolean;
+    /** Lines of context either side of each match (default 2, 0 for the match line alone). */
+    context?: number;
   } = {}
 ): Promise<SearchResult> {
   const maxResults = Math.max(1, Math.min(opts.maxResults ?? 20, 100));
@@ -176,7 +201,7 @@ export async function search(
         path,
         line: i + 1,
         text: lines[i],
-        context: lines.slice(Math.max(0, i - 2), Math.min(lines.length, i + 3)),
+        context: contextLines(lines, i, opts.context ?? CONTEXT_DEFAULT),
       });
     }
   }

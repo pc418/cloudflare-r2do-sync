@@ -4,7 +4,13 @@ import { callTool, TOOLS, type ToolContext } from "../src/tools";
 import { fetchHttp, VaultView } from "../src/vault";
 import { PLUGIN_DIR } from "../../plugin/src/paths";
 import { INDEX_CHUNK, SearchIndex } from "../src/index-store";
-import { BLOB_BUDGET, MAX_SCAN_FILES, REQUEST_OVERHEAD, SUBREQUEST_LIMIT } from "../src/search";
+import {
+  BLOB_BUDGET,
+  CONTEXT_MAX,
+  MAX_SCAN_FILES,
+  REQUEST_OVERHEAD,
+  SUBREQUEST_LIMIT,
+} from "../src/search";
 import { env, runInDurableObject } from "cloudflare:test";
 import type { AgentState } from "../src/agent-state";
 import { VaultWriter, refuseWrite, type WriteOp } from "../src/write";
@@ -183,6 +189,49 @@ describe("read tools", () => {
     expect(await callTool("search", { query: pattern }, ctx)).toContain("No matches");
     const out = await callTool("search", { query: pattern, regex: true }, ctx);
     expect(out).toContain("Projects/Tea.md:3");
+  });
+
+  // The measured case this exists for: an outline query over one note returned ~35 lines of
+  // context for 7 lines of signal, one of them an 800-character bullet, with no way to
+  // suppress it. `context: 0` is grep's own answer, so no `paths_only` flag is needed.
+  it("returns matched lines alone at context 0, and widens on request", async () => {
+    const note = [
+      "# Title",
+      "prose above one",
+      "prose above two",
+      "## Section",
+      "a very long bullet that is pure noise in an outline query",
+      "## Another",
+    ].join("\n");
+    const { ctx } = await context({ notes: { "Outline.md": note } });
+
+    const bare = await callTool(
+      "search",
+      { query: "^#{1,6} ", regex: true, context: 0 },
+      ctx
+    );
+    expect(bare).toContain("Outline.md:1");
+    expect(bare).toContain("# Title");
+    expect(bare).toContain("## Section");
+    // The whole point: none of the surrounding prose comes back.
+    expect(bare).not.toContain("prose above");
+    expect(bare).not.toContain("pure noise");
+
+    // Default is two either side, unchanged from before the option existed.
+    const wide = await callTool("search", { query: "## Section" }, ctx);
+    expect(wide).toContain("prose above two");
+  });
+
+  it("clamps context rather than failing a search over it", async () => {
+    const lines = Array.from({ length: 40 }, (_, i) => (i === 20 ? "needle" : `line ${i}`));
+    const { ctx } = await context({ notes: { "Long.md": lines.join("\n") } });
+    // 99 is a preference, not a mistake worth refusing — but it must not return the note.
+    const out = await callTool("search", { query: "needle", context: 99 }, ctx);
+    const shown = out.split("\n").filter((l) => l.startsWith("    ")).length;
+    expect(shown).toBe(CONTEXT_MAX * 2 + 1);
+    // Negative is nonsense; treat it as zero rather than inverting the slice.
+    const none = await callTool("search", { query: "needle", context: -3 }, ctx);
+    expect(none.split("\n").filter((l) => l.startsWith("    ")).length).toBe(1);
   });
 
   it("reports an unparseable pattern instead of burning the scan budget on it", async () => {
@@ -649,7 +698,7 @@ describe("budgets and configuration", () => {
     const crypto = await testCrypto();
     await seed(vault, crypto, { "Tea.md": "# Tea\n\nGyokuro wants 60C water.\n" });
 
-    const [indexed, viaRegex] = await runInDurableObject(
+    const [indexed, viaRegex, narrow] = await runInDurableObject(
       env.AGENT.getByName(`r-${Math.random().toString(36).slice(2)}`),
       async (_i: AgentState, state) => {
         const view = new VaultView({
@@ -666,13 +715,19 @@ describe("budgets and configuration", () => {
         await callTool("search", { query: "gyokuro" }, ctx);
         const fromIndex = await callTool("search", { query: "gyokuro" }, ctx);
         const fromRegex = await callTool("search", { query: "gyokuro.*[0-9]+C", regex: true }, ctx);
-        return [fromIndex, fromRegex];
+        // `context` reaches the index too. It is an optional parameter on a separate code
+        // path, so a forgotten hand-off would typecheck and silently ignore the caller.
+        const narrow = await callTool("search", { query: "gyokuro", context: 0 }, ctx);
+        return [fromIndex, fromRegex, narrow];
       }
     );
     // The index really was current — otherwise this test proves nothing about bypassing it.
     expect(indexed).toContain("indexed notes");
+    expect(indexed).toContain("# Tea");
     expect(viaRegex).toContain("Tea.md:3");
     expect(viaRegex).not.toContain("indexed notes");
+    expect(narrow).toContain("indexed notes");
+    expect(narrow).not.toContain("# Tea");
   });
 
   // A failed fetch has still been spent. Budgeting on successes lets a run of unreadable
