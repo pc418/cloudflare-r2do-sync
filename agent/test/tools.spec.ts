@@ -69,45 +69,45 @@ describe("tool surface", () => {
     ]);
   });
 
-  // A deferred-tools client shows the model names and one-line blurbs, fetching full
-  // descriptions and schemas only on an explicit request. Until it does, the first sentence is
-  // the entire description — so a contract that lives in sentence two is a contract the model
-  // plans without. Pinned here because the failure is invisible: the tool still works, the
-  // caller just does not know the rule it is about to break.
-  it("states each tool's load-bearing contract in its first sentence", () => {
+  // A deferred-tools client lists each tool as ONE TRUNCATED LINE and fetches the full
+  // description only if the model asks. Claude Desktop cuts at roughly 80 characters, mid-word.
+  // Capping the first *sentence* at 200 was not enough and passed while `edit` was arriving as
+  // "...failing unless that string appear...". 80 is what the model actually receives.
+  const TRUNCATION = 80;
+
+  it("states each tool's contract inside the truncation budget", () => {
     const contracts: Record<string, RegExp> = {
-      search: /case-insensitively: a substring by default, or a regular expression/,
-      read: /line numbers added for reference/,
-      list: /downloading no note content/,
-      recent: /downloading no note content/,
-      append: /at the very end of a note/,
-      edit: /failing unless that string appears exactly once/,
+      search: /substring by default, or regex with `regex: true`/,
+      read: /numbered lines; the numbers are display only/,
+      append: /at the very end of a note, creating it if missing/,
+      list: /downloads no note content/,
+      edit: /fails unless it appears exactly once/,
+      recent: /newest first; downloads nothing/,
       write: /replace an existing one entirely and without warning/,
+      move: /path that must not already exist/,
       delete: /Delete one note permanently/,
-      move: /a path that does not already exist/,
     };
     expect(Object.keys(contracts).sort()).toEqual(TOOLS.map((t) => t.name).sort());
     for (const tool of TOOLS) {
-      const first = firstSentence(tool.description);
-      expect(first, `${tool.name}: contract missing from its first sentence`).toMatch(
-        contracts[tool.name]
-      );
-      // A blurb nobody reads to the end is the same failure in a different costume.
-      expect(first.length, `${tool.name}: first sentence too long to serve as a blurb`)
-        .toBeLessThanOrEqual(200);
+      expect(
+        tool.description.slice(0, TRUNCATION),
+        `${tool.name}: contract does not survive an ${TRUNCATION}-character truncation`
+      ).toMatch(contracts[tool.name]);
     }
   });
 
-  // A captured deferred-harness session dropped `initialize.instructions` entirely, including
-  // the static preamble every build has served since before AGENT.md existed. A tool
-  // description is the only carrier such a client cannot discard, so the pointer lives here —
-  // on the two entry points into an unread vault, and never in the slot the catalog truncates
-  // to, which belongs to each tool's own contract.
-  it("points at AGENT.md from the entry-point read tools, below their first sentence", () => {
+  // Claude Desktop delivers no server instructions block at all, so a tool description is the
+  // only carrier that survives. Claude Code does deliver them — clients differ, and the
+  // surviving channel is the one to design for.
+  it("points at AGENT.md from every tool, below the truncation budget", () => {
     const carriers = TOOLS.filter((t) => t.description.includes("`AGENT.md`"));
-    expect(carriers.map((t) => t.name)).toEqual(["search", "list"]);
+    // EVERY tool. Two carriers was a guess that a session opens with `search` or `list`;
+    // Claude Desktop shows it can open with `recent`, `read` or `append` just as easily, and a
+    // pointer the model never loads is no pointer at all.
+    expect(carriers.map((t) => t.name).sort()).toEqual(TOOLS.map((t) => t.name).sort());
     for (const tool of carriers) {
-      expect(firstSentence(tool.description)).not.toContain("AGENT.md");
+      // Never inside the truncated head: that budget belongs to the tool's own contract.
+      expect(tool.description.slice(0, TRUNCATION)).not.toContain("AGENT.md");
       expect(tool.description).toMatch(/If the vault has a root note `AGENT\.md`/);
       // Supersession, without which a mid-session rewrite leaves the model arbitrating between
       // the note it just read and the copy its client cached at `initialize`.
@@ -117,12 +117,6 @@ describe("tool surface", () => {
     }
   });
 });
-
-/** Up to the first sentence-ending period followed by whitespace, or the whole string. */
-function firstSentence(text: string): string {
-  const end = /\.\s/.exec(text);
-  return end === null ? text : text.slice(0, end.index + 1);
-}
 
 describe("read tools", () => {
   it("lists notes with no blob downloads", async () => {

@@ -163,13 +163,13 @@ describe("tools/list", () => {
     expect(body.result.tools.map((t) => t.name)).toEqual([
       "search",
       "read",
-      "list",
-      "recent",
       "append",
+      "list",
       "edit",
+      "recent",
       "write",
-      "delete",
       "move",
+      "delete",
     ]);
     for (const tool of body.result.tools) expect(tool.title).toBeTruthy();
   });
