@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -290,8 +290,12 @@ test("a redeploy keeps the vault tokens unless a rotation was asked for", async 
 
 test("minting is the exception, and a read-only redeploy really removes write", () => {
   const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
-  // Mint only on request, on a first deploy, or when write is newly needed.
-  assert.match(source, /const mintTokens = opts\.rotateTokens === true \|\| !agentEnv\.READ_TOKEN_ID \|\| needsWrite;/);
+  // Mint only on request, on a first deploy, or when write is newly needed — and decide that
+  // from the secrets the Worker actually has, never from the locally recorded ids. A run that
+  // died between the upload and /health leaves those two disagreeing.
+  assert.match(source, /const mintTokens = opts\.rotateTokens === true \|\| !present\.has\("SYNC_TOKEN"\) \|\| needsWrite;/);
+  assert.match(source, /const needsWrite = opts\.writable && !present\.has\("SYNC_WRITE_TOKEN"\);/);
+  assert.doesNotMatch(source, /needsWrite = opts\.writable && !agentEnv\./);
   // Kept tokens are kept by OMITTING the binding: Cloudflare never deletes a secret on a
   // deployment, and the deploy has no copy of the value to re-send.
   assert.match(source, /readToken === undefined\s*\?\s*\[\]/);
@@ -390,4 +394,66 @@ test("a deploy never rotates the MCP bearer on its own", async () => {
   assert.doesNotMatch(source, /handoffPending/);
   // Nothing recorded to reuse is issuance, not rotation, and is worded as such.
   assert.match(source, /none was recorded for this deployment/);
+});
+
+test("a partial handover write never drops the sections it is not replacing", async () => {
+  const { readHandoffSections, writeHandoff } = await import("./setup-lib.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "handoff-"));
+
+  // deploy.mjs --agent writes both.
+  const file = writeHandoff(dir, "v", { vault: "  ADMIN_TOKEN aaa", mcp: "  Bearer bbb" });
+  assert.deepEqual(Object.keys(readHandoffSections(file)).sort(), ["mcp", "vault"]);
+
+  // deploy-agent.mjs on its own writes only the MCP half. The admin token the operator has
+  // not collected yet must survive — the file's presence is what suppresses its rotation, so
+  // dropping it would leave the file promising a credential it no longer names.
+  writeHandoff(dir, "v", { mcp: "  Bearer ccc" });
+  let now = readHandoffSections(file);
+  assert.match(now.vault, /ADMIN_TOKEN aaa/);
+  assert.match(now.mcp, /Bearer ccc/);
+
+  // And the same in the other direction: a vault-only redeploy keeps the bearer.
+  writeHandoff(dir, "v", { vault: "  ADMIN_TOKEN ddd" });
+  now = readHandoffSections(file);
+  assert.match(now.vault, /ADMIN_TOKEN ddd/);
+  assert.match(now.mcp, /Bearer ccc/);
+  rmSync(dir, { recursive: true });
+});
+
+test("the handover file is replaced atomically, never truncated in place", async () => {
+  const { writeHandoff } = await import("./setup-lib.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "handoff-"));
+  const file = writeHandoff(dir, null, { vault: "  first" });
+  // A mode someone widened by hand must not be inherited by the next set of credentials.
+  chmodSync(file, 0o644);
+  writeHandoff(dir, null, { vault: "  second" });
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.match(readFileSync(file, "utf8"), /second/);
+  // The temp file is renamed, not left behind.
+  assert.equal(existsSync(`${file}.tmp`), false);
+  rmSync(dir, { recursive: true });
+});
+
+test("two deploys of one vault cannot mint at the same time", async () => {
+  const { withDeployLock } = await import("./setup-lib.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "handoff-"));
+
+  // Both runs would otherwise mint a permanent vault credential, upload, and race to write the
+  // local files — leaving the Worker on one credential while every file names the other, and
+  // the live one unnameable and so unrevokable.
+  let inner = null;
+  await withDeployLock(dir, "v", async () => {
+    inner = await withDeployLock(dir, "v", async () => "should not run").catch((e) => e.message);
+  });
+  assert.match(inner, /another deploy of v is running/);
+  assert.match(inner, /Nothing was changed/);
+
+  // A different deployment is not blocked by it.
+  await withDeployLock(dir, "v", async () => {
+    assert.equal(await withDeployLock(dir, null, async () => "ok"), "ok");
+  });
+  // Released on the way out, including when the body throws.
+  await assert.rejects(withDeployLock(dir, "v", async () => { throw new Error("boom"); }), /boom/);
+  assert.equal(await withDeployLock(dir, "v", async () => "free"), "free");
+  rmSync(dir, { recursive: true });
 });

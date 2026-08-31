@@ -4,7 +4,7 @@
 // decide *what* setup does (which credentials, which words the user is told) are unit
 // tested without touching a Cloudflare account.
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEPLOYMENT_NAME_RE } from "./worker-config.mjs";
@@ -741,8 +741,37 @@ export function fingerprint(secret) {
   return createHash("sha256").update(secret).digest("hex").slice(0, 8);
 }
 
+/** Machine-readable fences, so a partial rewrite can keep the sections it is not replacing. */
+const SECTION_OPEN = (id) => `<<< SECTION ${id} >>>`;
+const SECTION_CLOSE = (id) => `<<< END ${id} >>>`;
+const SECTION_RE = /<<< SECTION ([a-z-]+) >>>\n([\s\S]*?)\n<<< END \1 >>>/g;
+
+/** The sections an existing handover file already holds, by id. */
+export function readHandoffSections(file) {
+  if (!existsSync(file)) return {};
+  const text = readFileSync(file, "utf8");
+  const found = {};
+  for (const m of text.matchAll(SECTION_RE)) found[m[1]] = m[2];
+  return found;
+}
+
+/**
+ * Writes the handover file, **merging** the given sections over whatever it already holds.
+ *
+ * A vault-only redeploy must not delete the MCP section, and `deploy-agent.mjs` on its own must
+ * not delete the vault section: both write the same file, and whichever ran last would
+ * otherwise take an uncollected credential with it. Presence suppresses admin rotation, so the
+ * damage is worse than losing text — the file would go on promising a credential it no longer
+ * names.
+ *
+ * @param sections {Record<string, string>} section id -> body. Ids not given are preserved.
+ */
 export function writeHandoff(root, deploymentName, sections) {
   const file = handoffPath(root, deploymentName);
+  const merged = { ...readHandoffSections(file), ...sections };
+  // Fixed order, so the file does not reshuffle between deploys.
+  const ordered = ["vault", "mcp"].filter((id) => merged[id] !== undefined);
+  for (const id of Object.keys(merged)) if (!ordered.includes(id)) ordered.push(id);
   const body = [
     "=".repeat(88),
     "  DEPLOYMENT CREDENTIALS — everything you need, in one place",
@@ -752,8 +781,7 @@ export function writeHandoff(root, deploymentName, sections) {
     "Read the last section before you close this. This file is the only copy of some of",
     "these values, and it decides whether the next deploy rotates them.",
     "",
-    ...sections,
-    "",
+    ...ordered.flatMap((id) => [SECTION_OPEN(id), merged[id], SECTION_CLOSE(id), ""]),
     "-".repeat(88),
     "  WHAT TO DO WITH THIS FILE",
     "-".repeat(88),
@@ -773,7 +801,48 @@ export function writeHandoff(root, deploymentName, sections) {
     "new bearer means removing and re-adding the connector.",
     "",
   ].join("\n");
-  writeFileSync(file, `${body}\n`, { mode: 0o600 });
-  chmodSync(file, 0o600); // `mode:` only applies on creation; the file may already exist
+  // Written to a sibling and renamed: replacing in place would truncate the previous file's
+  // credentials before the new ones land, and would expose them at whatever mode that file had
+  // until the chmod caught up. Rename is atomic, so the file is either the old one or the new
+  // one — never a half-written document whose mere presence suppresses the next rotation.
+  const temp = `${file}.tmp`;
+  writeFileSync(temp, `${body}\n`, { mode: 0o600 });
+  chmodSync(temp, 0o600); // `mode:` only applies on creation; the temp may already exist
+  renameSync(temp, file);
   return file;
+}
+
+/**
+ * An exclusive lock for one deployment, held for the whole run.
+ *
+ * Two deploys of the same vault at once can each mint a permanent credential, upload, and then
+ * race to write the local files — leaving the Worker using one credential while every file
+ * names the other, and the live one unnameable and therefore unrevokable. Nothing about the
+ * REST API serialises that, so the lock does.
+ *
+ * `wx` fails if the file exists rather than truncating it. A crash leaves it behind; the error
+ * says exactly what to delete, which is better than a timeout heuristic that could break the
+ * lock while the other run is mid-mint.
+ */
+export async function withDeployLock(root, deploymentName, fn) {
+  const file = `${handoffPath(root, deploymentName)}.lock`;
+  let handle;
+  try {
+    handle = openSync(file, "wx");
+    writeFileSync(handle, `pid ${process.pid} started ${new Date().toISOString()}\n`);
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    throw new Error(
+      `another deploy of ${deploymentName ?? "production"} is running (or crashed).\n` +
+        `Wait for it, or if nothing is running delete ${path.relative(root, file)} and retry.\n` +
+        "Two at once can each mint a permanent vault credential and then lose track of which\n" +
+        "one the Worker actually took. Nothing was changed."
+    );
+  }
+  try {
+    return await fn();
+  } finally {
+    closeSync(handle);
+    rmSync(file, { force: true });
+  }
 }

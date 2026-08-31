@@ -24,6 +24,7 @@ import {
   localBin,
   upsertEnvFile,
   waitForHealth,
+  withDeployLock,
   writeHandoff,
 } from "./setup-lib.mjs";
 
@@ -238,6 +239,10 @@ export function supersededTokenIds(agentEnv, minted, opts = {}) {
 }
 
 export async function deployAgent(opts) {
+  return withDeployLock(ROOT, opts.vault, () => deployAgentLocked(opts));
+}
+
+async function deployAgentLocked(opts) {
   const vault = opts.vault;
 
   // Read before the name is chosen: the name is generated once and then persisted, the way
@@ -380,13 +385,25 @@ export async function deployAgent(opts) {
     // Keeping them is possible because Cloudflare never deletes a secret on a deployment: an
     // upload that omits SYNC_TOKEN leaves the existing one in place, so the deploy does not
     // need a value it deliberately never kept a copy of.
-    const needsWrite = opts.writable && !agentEnv.WRITE_TOKEN_ID;
-    const mintTokens = opts.rotateTokens === true || !agentEnv.READ_TOKEN_ID || needsWrite;
+    //
+    // Decided from the secrets the Worker ACTUALLY has, never from the recorded ids. Those two
+    // disagree whenever a run died between the upload and `/health`: a read-only deploy that
+    // deletes SYNC_WRITE_TOKEN and then fails leaves WRITE_TOKEN_ID recorded, and the next
+    // `--writable` run would read that id, skip minting, omit the binding, and report success
+    // over an agent that cannot write. Asking the platform also covers the day the
+    // never-deletes-a-secret behaviour stops being true: the binding is simply absent, and this
+    // mints rather than deploying a tokenless agent.
+    const live = await cf(`/workers/scripts/${scriptName}/secrets`);
+    const present = new Set(
+      live.status === 200 ? (live.body?.result ?? []).map((secret) => secret.name) : []
+    );
+    const needsWrite = opts.writable && !present.has("SYNC_WRITE_TOKEN");
+    const mintTokens = opts.rotateTokens === true || !present.has("SYNC_TOKEN") || needsWrite;
     if (mintTokens) {
       log(
         opts.rotateTokens
           ? "minting a new vault token pair (--rotate-tokens); the old pair is revoked once this deploy is healthy"
-          : needsWrite && agentEnv.READ_TOKEN_ID
+          : needsWrite && present.has("SYNC_TOKEN")
             ? "this deployment is becoming writable — minting the vault token pair"
             : "minting the vault access tokens for this deployment"
       );
@@ -598,7 +615,7 @@ if (invokedDirectly) {
     const result = await deployAgent(parseArgs(process.argv.slice(2)));
     // Written here rather than inside deployAgent, so `deploy.mjs --agent` can put this
     // section and the vault's into one document instead of leaving two behind.
-    const handoffFile = writeHandoff(ROOT, result.vault, [result.handoff]);
+    const handoffFile = writeHandoff(ROOT, result.vault, { mcp: result.handoff });
     log(mcpSetupInstructions({ ...result, handoffFile: path.relative(ROOT, handoffFile) }));
   } catch (error) {
     console.error(`\ndeploy-agent failed: ${error.message}`);

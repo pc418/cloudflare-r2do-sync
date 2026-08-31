@@ -31,6 +31,7 @@ import {
   upsertEnvFile,
   verifyAdminToken,
   waitForHealth,
+  withDeployLock,
   writeHandoff,
 } from "./setup-lib.mjs";
 
@@ -77,7 +78,11 @@ export function workerHandoffSection({ url, adminToken, adminTokenKept, bucket, 
   ].join("\n");
 }
 
-export async function deployViaRest({
+export async function deployViaRest(opts) {
+  return withDeployLock(ROOT, opts.deploymentName ?? null, () => deployViaRestLocked(opts));
+}
+
+async function deployViaRestLocked({
   log = console.log,
   confirm = null,
   adoptBucket = false,
@@ -467,8 +472,8 @@ if (invokedDirectly) {
 
     // Collected as sections and written once, at the very end. Two files, or a file written
     // before the agent runs, is how an operator ends up hunting for the other half.
-    const sections = [
-      workerHandoffSection({
+    const sections = {
+      vault: workerHandoffSection({
         url,
         adminToken,
         adminTokenKept,
@@ -476,7 +481,7 @@ if (invokedDirectly) {
         retention,
         envFile,
       }),
-    ];
+    };
 
     // Second, and only on request. Imported here rather than at the top so the ordinary deploy
     // never loads the agent's bundler path at all, and so a syntax error in the agent script
@@ -494,7 +499,7 @@ if (invokedDirectly) {
           rotateBearer: false,
           name: null,
         });
-        sections.push(result.handoff);
+        sections.mcp = result.handoff;
         console.log(
           mcpSetupInstructions({
             ...result,
