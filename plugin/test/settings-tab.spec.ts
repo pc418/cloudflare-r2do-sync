@@ -743,21 +743,32 @@ describe("settings tab rendering", () => {
   describe("first run", () => {
     const FRESH: Partial<Settings> = { serverUrl: "", accessToken: "" };
 
-    it("leads with the setup panel and shows nothing that needs a server yet", () => {
-      // Every section below "Connection" needs credentials to do anything, and each one is
-      // something to scroll past on the way to the two fields that provide them.
+    it("is the whole setup form, and offers no other way to configure", () => {
+      // Every section below needs credentials to do anything. More importantly the old
+      // Connection fields are NOT here: they persisted on blur, which is how URL+token alone
+      // used to configure a device and mint it a key.
       const { log, names } = render(FRESH);
-      expect(log.headings).toEqual(["Set up sync", "Connection"]);
+      expect(log.headings).toEqual(["Set up sync", "Or set it up by hand"]);
       expect(names).toEqual([
         "Join a vault that already syncs",
         "Server URL",
         "Access token",
-        "Test connection",
         "Device name",
+        "Check the vault",
       ]);
+      expect(names).not.toContain("Test connection");
     });
 
-    it("grows into the whole page the moment both credentials are in", async () => {
+    it("asks for no master key until the server says the vault is encrypted", () => {
+      // The key field is what the old form lacked entirely; showing it unconditionally would
+      // be just as wrong, since an empty vault has no key to type.
+      expect(render(FRESH).names).not.toContain("Master key");
+    });
+
+    it("typing credentials configures nothing at all until the join completes", async () => {
+      // This is the whole behavioural change. Previously blurring these two fields wrote them
+      // to settings, flipped `isUnconfigured`, revealed the full page and minted a master key
+      // — a device that looked configured and could open nothing.
       const plugin = fakePlugin(FRESH);
       const tab = newTab(plugin);
       tab.display();
@@ -766,18 +777,16 @@ describe("settings tab rendering", () => {
 
       url.inputEl.value = "https://vault.example.workers.dev";
       url.inputEl.fire("blur");
-      await flush();
-      // Half a pair configures nothing, so the page is still the short one.
-      expect(logOf(tab).settings.map((s) => s.name)).not.toContain("Vault master key");
-
       token.inputEl.value = "access-token";
       token.inputEl.fire("blur");
       await flush();
 
+      expect(plugin.settings.serverUrl).toBe("");
+      expect(plugin.settings.accessToken).toBe("");
+      expect(plugin.settings.masterKey).toBe("");
       const names = logOf(tab).settings.map((s) => s.name);
-      expect(names).toContain("Vault master key");
-      expect(names).toContain("Exclude globs");
-      expect(names).not.toContain("Join a vault that already syncs");
+      expect(names).toContain("Join a vault that already syncs");
+      expect(names).not.toContain("Exclude globs");
     });
 
     it("offers the setup-link route first, as the default action", () => {
@@ -790,10 +799,11 @@ describe("settings tab rendering", () => {
       expect(() => button.click()).not.toThrow();
     });
 
-    it("warns that hand-typed credentials cannot join an encrypted vault", () => {
-      // The single most expensive misunderstanding this plugin has: a URL and a token look
-      // like enough, so the user types them and the device silently mints a key of its own.
-      expect(render(FRESH).log.settings[0].desc).toContain("mint a key of its own");
+    it("leads with the link route, which is the only one that carries the key", () => {
+      // The old copy warned that hand-typed credentials could not join an encrypted vault.
+      // They can now — the form asks for the key and proves it — so the row states what the
+      // link carries instead of warning about what typing cannot do.
+      expect(render(FRESH).log.settings[0].desc).toContain("carries the master key");
     });
 
     it("points a first device at the setup script and the fields below", () => {

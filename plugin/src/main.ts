@@ -16,6 +16,13 @@ import {
 import qrcode from "qrcode-generator";
 import { SettingsStaleError, SyncApi, type HttpClient } from "./api";
 import {
+  joinPayload,
+  probeRemote,
+  probeSummary,
+  proveMasterKey,
+  type RemoteProbe,
+} from "./onboarding";
+import {
   VaultCrypto,
   deriveMasterKeyFromPassphrase,
   generateMasterKey,
@@ -372,6 +379,18 @@ export function emptyVaultConsentBody(mode: EncryptionMode): readonly string[] {
  * `#finishRebuild` share this so the page and the engine can never disagree about whether
  * this device is set up — a page claiming otherwise would send the user looking for a bug.
  */
+/** The manual-join form's unsaved fields. Drafts, deliberately: nothing here is settings. */
+export interface JoinDraft {
+  url: string;
+  token: string;
+  name: string;
+  key: string;
+}
+
+export function emptyJoinDraft(): JoinDraft {
+  return { url: "", token: "", name: "", key: "" };
+}
+
 export function isUnconfigured(s: Pick<Settings, "serverUrl" | "accessToken">): boolean {
   return s.serverUrl.trim() === "" || s.accessToken.trim() === "";
 }
@@ -1784,13 +1803,17 @@ export default class LogSyncPlugin extends Plugin {
   }
 
   /** Applies a scanned setup link. The device identity changes, so cached sync state goes. */
-  async applySetup(payload: SetupPayload): Promise<void> {
+  async applySetup(payload: SetupPayload, opts: { backedUp?: boolean } = {}): Promise<void> {
     this.settings.serverUrl = normalizeServerUrl(payload.url);
     this.settings.accessToken = payload.token;
     this.settings.deviceName = payload.name;
     this.settings.encryptionMode = payload.mode;
     this.settings.masterKey = payload.mode === "encrypted" ? payload.key : "";
-    this.settings.masterKeyBackedUp = true;
+    // True for a pasted link (the sender's claim) and for a hand-typed key (the user is
+    // reading it off their own backup). False only when this device just *minted* the key for
+    // an empty vault — that key exists nowhere else yet, so it must pass the backup gate
+    // before anything is uploaded, which `rebuild()` enforces via `backup-required`.
+    this.settings.masterKeyBackedUp = opts.backedUp ?? true;
     this.settings.vaultSalt = payload.mode === "encrypted" ? payload.vaultSalt : "";
     // A device pointed at a vault it has never synced owes the first-pass acknowledgement
     // again: the reconciliation ahead of it is with a different set of remote files.
@@ -1824,6 +1847,17 @@ export default class LogSyncPlugin extends Plugin {
     } catch (e) {
       new Notice(`R2DO Sync configured, but the connection test failed: ${message(e)}`, 0);
     }
+  }
+
+  /**
+   * A client for credentials that are not saved yet.
+   *
+   * The setup form probes a URL and token the settings do not hold — that is the whole point
+   * of it — so it cannot go through the engine's own API. One method rather than a `new
+   * SyncApi` at each call site, so the transport stays injectable the way `api.ts` intends.
+   */
+  apiFor(baseUrl: string, token: string): SyncApi {
+    return new SyncApi({ baseUrl, token, http: obsidianHttp });
   }
 
   /** Opens the mandatory one-time backup gate for the current generated key. */
@@ -4404,6 +4438,14 @@ export class PasteSetupModal extends Modal {
 
 export class LogSyncSettingTab extends PluginSettingTab {
   /**
+   * The manual-join form's state, held on the tab because `display()` destroys the controls.
+   * None of it is settings: a half-filled form must not produce a half-configured device.
+   */
+  #joinDraft: JoinDraft = emptyJoinDraft();
+  #probe: RemoteProbe | null = null;
+  #probeError: string | null = null;
+
+  /**
    * Fields that stage their value until they lose focus, so the page can flush them if it
    * closes first. Rebuilt by every `display()`, because the controls are.
    */
@@ -4573,21 +4615,32 @@ export class LogSyncSettingTab extends PluginSettingTab {
    * be discoverable only by hitting it, since the cure lived in a banner that appears *after*
    * the failure. Leading with both routes puts the choice before the mistake.
    */
+  /**
+   * The whole setup form: the link route, and every field a manual join needs — master key
+   * included.
+   *
+   * It used to be prose plus a "Paste setup link" button, with the fields scattered across
+   * Connection and Encryption and **no way to enter an existing master key**. A hand-configured
+   * device therefore minted a key of its own and only found out at the first pass. Worse,
+   * committing URL and token alone flipped `isUnconfigured` and revealed the rest of the page
+   * with that minted key already in place.
+   *
+   * So nothing here writes settings. The fields are drafts; the probe asks the server what the
+   * vault actually is; and only a completed join persists anything, through `applySetup` —
+   * the same path a setup link takes.
+   */
   #renderFirstRun(containerEl: HTMLElement): void {
     this.#heading(containerEl, "Set up sync");
     containerEl.createEl("p", {
       text:
-        "This device is not connected to a vault yet. There are two ways in, and they are " +
-        "not interchangeable.",
+        "This device is not connected to a vault yet. Paste a setup link if another device " +
+        "already syncs this vault — it carries the master key, which nothing else does. " +
+        "Otherwise fill in the fields below and this page will ask the server what it holds.",
     });
 
     new Setting(containerEl)
       .setName("Join a vault that already syncs")
-      .setDesc(
-        "A server URL and access token typed in by hand cannot join an encrypted vault: they " +
-          "do not carry the master key, so this device would mint a key of its own and be " +
-          "refused at the first pass. Bring the key across instead."
-      )
+      .setDesc("The setup link or QR from a configured device. It carries the master key.")
       .addButton((b) =>
         b
           .setButtonText("Paste setup link")
@@ -4595,32 +4648,203 @@ export class LogSyncSettingTab extends PluginSettingTab {
           .onClick(() => new PasteSetupModal(this.app, this.plugin).open())
       );
 
-    // Short paragraphs with the path in bold, because this is a procedure to follow on another
-    // device while reading it here — six sentences in a row is not something anyone follows.
     const join = containerEl.createEl("p");
     join.appendText("On the device that already syncs, open ");
     join.createEl("strong", { text: "Settings → R2DO Sync → Set up another device" });
     join.appendText(
-      ". Scan the QR with this device's camera, or press \"Show setup link\" there, copy it, " +
+      ". Scan the QR with this device\u2019s camera, or press \"Show setup link\" there, copy it, " +
         "and paste it with the button above — that is the route for a second computer, which " +
         "has nothing to scan with."
     );
 
+    this.#heading(containerEl, "Or set it up by hand");
+
     const first = containerEl.createEl("p");
-    first.appendText("Setting up the first device instead? Run ");
+    first.appendText("Setting up the first device? Run ");
     first.createEl("strong", { text: "scripts/setup.mjs" });
     first.appendText(" from the ");
     first.createEl("a", { text: "project repository", href: REPO_URL });
-    first.appendText(
-      " on a computer, then paste the server URL and access token it prints into the fields " +
-        "below. This device then generates the vault's master key and asks you to save it " +
-        "before anything is uploaded."
-    );
+    first.appendText(" on a computer and paste what it prints below.");
 
+    const draft = this.#joinDraft;
+
+    new Setting(containerEl)
+      .setName("Server URL")
+      .setDesc("Base URL of the sync Worker — not the agent Worker, if you run one.")
+      .addText((t) => {
+        t.setValue(draft.url);
+        t.onChange((v) => {
+          draft.url = v;
+          this.#resetProbe();
+        });
+      });
+
+    const tokenSetting = new Setting(containerEl)
+      .setName("Access token")
+      .setDesc("Printed by scripts/setup.mjs. Never the admin token.");
+    tokenSetting.addText((t) => {
+      t.inputEl.type = "password";
+      t.setValue(draft.token);
+      addReveal(tokenSetting, t.inputEl);
+      t.onChange((v) => {
+        draft.token = v;
+        this.#resetProbe();
+      });
+    });
+
+    new Setting(containerEl)
+      .setName("Device name")
+      .setDesc("Recorded on every snapshot this device commits.")
+      .addText((t) => {
+        t.setPlaceholder(this.plugin.settings.deviceName || "this device");
+        t.setValue(draft.name);
+        t.onChange((v) => {
+          draft.name = v;
+        });
+      });
+
+    // The probe is a required step, not a diagnostic: it is what decides whether a master key
+    // is even asked for, and it reads nothing this URL and token cannot already read.
+    new Setting(containerEl)
+      .setName("Check the vault")
+      .setDesc("Asks the server whether this vault is new, encrypted, or plaintext.")
+      .addButton((b) => {
+        b.setButtonText(this.#probe === null ? "Check" : "Check again").onClick(() => {
+          void this.#runProbe();
+        });
+      });
+
+    const probe = this.#probe;
+    if (this.#probeError !== null) {
+      containerEl.createEl("p", { text: this.#probeError, cls: "r2do-error" });
+    } else if (probe !== null) {
+      containerEl.createEl("p", { text: probeSummary(probe) });
+    }
+
+    if (probe !== null && probe.kind === "encrypted") {
+      const keySetting = new Setting(containerEl)
+        .setName("Master key")
+        .setDesc("Base64, 32 bytes — the key saved when this vault was created.");
+      keySetting.addText((t) => {
+        t.inputEl.type = "password";
+        t.setPlaceholder("Base64, 32 bytes");
+        t.setValue(draft.key);
+        addReveal(keySetting, t.inputEl);
+        t.onChange((v) => {
+          draft.key = v;
+        });
+      });
+    }
+
+    if (probe !== null) {
+      new Setting(containerEl).addButton((b) => {
+        b.setButtonText(probe.kind === "empty" ? "Create this vault" : "Join this vault")
+          .setCta()
+          .onClick(() => {
+            void this.#completeJoin();
+          });
+      });
+    }
+
+    // Always shown, not only after a probe: it is the thing worth reading before typing a
+    // token, and it names the probed mode once the server has settled what this vault is.
     containerEl.createEl("p", {
-      text: dataResponsibility(this.plugin.settings.encryptionMode),
+      text: dataResponsibility(
+        probe === null
+          ? this.plugin.settings.encryptionMode
+          : probe.kind === "plaintext"
+            ? "plaintext"
+            : "encrypted"
+      ),
       cls: "r2do-disclaimer",
     });
+  }
+
+  /** A changed credential invalidates what the server told us about the old one. */
+  #resetProbe(): void {
+    if (this.#probe === null && this.#probeError === null) return;
+    this.#probe = null;
+    this.#probeError = null;
+    this.display();
+  }
+
+  /**
+   * Asks the server what this vault is. Writes nothing: a failure here is exactly the case
+   * that used to be accepted silently and discovered a day later.
+   */
+  async #runProbe(): Promise<void> {
+    const draft = this.#joinDraft;
+    let url: string;
+    try {
+      url = normalizeServerUrl(draft.url.trim());
+    } catch (e) {
+      this.#probe = null;
+      this.#probeError = `That server URL is not usable: ${message(e)}`;
+      this.display();
+      return;
+    }
+    if (draft.token.trim() === "") {
+      this.#probe = null;
+      this.#probeError = "An access token is needed to read the vault.";
+      this.display();
+      return;
+    }
+    try {
+      this.#probe = await probeRemote(this.plugin.apiFor(url, draft.token.trim()));
+      this.#probeError = null;
+    } catch (e) {
+      this.#probe = null;
+      // Named rather than generic: the live failure this form was built for was a URL pointing
+      // at the wrong Worker, which answers, just not to these routes.
+      this.#probeError =
+        `Could not read that vault: ${message(e)}. Check the URL points at the sync Worker ` +
+        "and the token is current. Nothing has been saved.";
+    }
+    this.display();
+  }
+
+  /**
+   * Proves the key, then hands the whole join to `applySetup`.
+   *
+   * Order is the guarantee: every refusal below happens before a single setting is written,
+   * and no key is minted on any path that does not reach the end.
+   */
+  async #completeJoin(): Promise<void> {
+    const probe = this.#probe;
+    if (probe === null) return;
+    const draft = this.#joinDraft;
+    const url = normalizeServerUrl(draft.url.trim());
+    const name = draft.name.trim() || this.plugin.settings.deviceName || "this device";
+
+    try {
+      if (probe.kind === "encrypted") {
+        if (probe.manifest === null) throw new Error("no snapshot to check the key against");
+        await proveMasterKey(probe.manifest, draft.key.trim());
+      }
+      // The mint for an empty vault happens here, after the server said the vault is empty —
+      // a choice made on a screen that said so, never a silent side effect of typing a URL.
+      const minted = probe.kind === "empty";
+      const key = minted ? generateMasterKey() : draft.key.trim();
+      const payload = joinPayload({
+        url,
+        token: draft.token.trim(),
+        name,
+        kind: probe.kind,
+        key,
+        publishedSalt: probe.vaultSalt,
+        provisionalSalt: this.plugin.settings.vaultSalt || generateVaultSalt(),
+      });
+      // A minted key exists nowhere else yet, so it must pass the one-time backup gate before
+      // anything is uploaded. A key the user typed is already in their backup.
+      await this.plugin.applySetup(payload, { backedUp: !minted });
+      this.#joinDraft = emptyJoinDraft();
+      this.#probe = null;
+      this.#probeError = null;
+      this.display();
+    } catch (e) {
+      this.#probeError = `${message(e)} Nothing has been saved.`;
+      this.display();
+    }
   }
 
   /**
@@ -5625,11 +5849,11 @@ export class LogSyncSettingTab extends PluginSettingTab {
     }
 
     if (fresh) {
-      // Nothing below this point can act without a server, and every one of those rows is
-      // something to scroll past before reaching the two fields that can. They arrive the
-      // moment the credentials do.
-      this.#renderConnection(containerEl);
-      this.#deviceNameRow(containerEl);
+      // Deliberately NOT the Connection section. Its fields persist on blur, and that is the
+      // half-config path this form replaces: URL and token alone used to flip `isUnconfigured`
+      // and reveal the whole page with a freshly minted key already in place. On an
+      // unconfigured device the form above owns those fields, and only a completed join
+      // writes anything.
       this.#renderOverview(containerEl);
       return;
     }
