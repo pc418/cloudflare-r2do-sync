@@ -60,6 +60,72 @@ export function refuseWrite(path: string, configDir: string): string | null {
   return null;
 }
 
+/**
+ * Refuses a batch whose **result** holds one path as both a note and a folder.
+ *
+ * A manifest is a flat path map, so folders have no entries and nothing in the format stops a
+ * commit holding both `Projects` and `Projects/Roadmap.md`. **No filesystem can materialize
+ * that**, and a device pulling it fails in `#ensureFolder` ("parent path is not a folder") —
+ * so the agent would have published a snapshot that wedges every device's next sync. The
+ * server cannot catch it either: on an encrypted vault it never sees a path.
+ *
+ * Judged **once, on the finished map**, never per operation. A per-op check rejected
+ * `write Projects` followed by `delete Projects/Roadmap.md` — a batch whose result is perfectly
+ * materializable — purely because of the order the two arrived in. What is committed is the
+ * only thing that has to be legal.
+ *
+ * Only paths the batch *introduced* are checked, so a clash already sitting in the vault from
+ * some other source does not start failing every unrelated agent write.
+ *
+ * Found by adversarial review on `move`; it was never specific to `move`. `write` and `append`
+ * reach it with one mistyped path, which is why this guards the batch rather than one case.
+ */
+function assertMaterializable(
+  touched: Iterable<string>,
+  files: Record<string, FileEntry>,
+  visible: Record<string, FileEntry>
+): void {
+  const keys = new Set(Object.keys(files));
+  for (const path of touched) {
+    if (!keys.has(path)) continue; // introduced and then removed again by a later op
+    // An ancestor of this path that is itself a note: `Notes` exists, and we wrote `Notes/a.md`.
+    for (let i = path.indexOf("/"); i !== -1; i = path.indexOf("/", i + 1)) {
+      const ancestor = path.slice(0, i);
+      if (keys.has(ancestor)) {
+        throw new VaultError(
+          `"${ancestor}" is a note, so "${path}" cannot live inside it. Pick another path.`
+        );
+      }
+    }
+    // Or this path is itself a folder someone still has files in.
+    const child = Object.keys(files).find((k) => k.startsWith(`${path}/`));
+    if (child !== undefined) {
+      // Naming the child is the helpful message, but `files` carries excluded entries the
+      // agent may not read — and an exclude glob like `Credentials/**` does not match the bare
+      // folder, so this refusal is reachable with a hidden child behind it. An error is a read
+      // channel: name the child only when the agent could have listed it anyway.
+      throw new VaultError(
+        Object.hasOwn(visible, child)
+          ? `"${path}" is a folder in this vault (it holds "${child}"), so it cannot also be a note. Pick another path.`
+          : `"${path}" is a folder in this vault, so it cannot also be a note. Pick another path.`
+      );
+    }
+  }
+}
+
+/**
+ * A path map with no prototype.
+ *
+ * Vault paths are caller-chosen strings and `constructor`, `toString` and `valueOf` are all
+ * legal ones. On a plain object `files["toString"]` answers with an inherited function, so an
+ * existence check finds a note that is not there — and a `move` would carry that function into
+ * the manifest. Dropping the prototype makes the whole class of question impossible rather
+ * than remembering `Object.hasOwn` at every lookup.
+ */
+function pathMap(from: Record<string, FileEntry>): Record<string, FileEntry> {
+  return Object.assign(Object.create(null) as Record<string, FileEntry>, from);
+}
+
 export class VaultWriter {
   readonly #view: VaultView;
   readonly #device: string;
@@ -87,32 +153,51 @@ export class VaultWriter {
       if (refusal !== null) throw new VaultError(refusal);
     }
 
-    // The shared policy, not just the hard skips: a path this vault excludes is one ordinary
-    // devices deliberately do not scan, so committing it would report success for a note that
-    // never reaches anyone's disk.
-    const inScope = await this.#view.scope();
-    for (const path of ops.flatMap(opPaths)) {
-      if (!inScope(path)) {
-        throw new VaultError(
-          `"${path}" is outside what this vault syncs (its exclude or only-paths policy), so writing it would publish a note no device would download`
-        );
-      }
-    }
-
     let lastError: unknown = null;
     for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt++) {
       const snapshot = await this.#view.snapshot({ fresh: true });
+
+      // The shared policy, not just the hard skips: a path this vault excludes is one ordinary
+      // devices deliberately do not scan, so committing it would report success for a note that
+      // never reaches anyone's disk.
+      //
+      // Re-read **inside the loop**, against this attempt's snapshot. Hoisted above it, a batch
+      // that lost its first CAS while the settings document changed would keep applying a
+      // predicate the vault has since replaced — and go on to delete a path the vault had just
+      // excluded, which is exactly the content the exclude was added to protect.
+      const inScope = await this.#view.scope();
+      for (const path of ops.flatMap(opPaths)) {
+        if (!inScope(path)) {
+          throw new VaultError(
+            `"${path}" is outside what this vault syncs (its exclude or only-paths policy), so writing it would publish a note no device would download`
+          );
+        }
+      }
+
       // The complete map, not `snapshot.files`. Excluded and hard-skipped entries are carried
       // through snapshots deliberately; building from the visible subset would delete every
       // one of them — silently destroying exactly what the vault takes most care to keep.
-      const files: Record<string, FileEntry> = { ...snapshot.all };
+      //
+      // Null-prototype: see `pathMap`.
+      const files = pathMap(snapshot.all);
+      // A working copy of the visible half, carried alongside so ops chain within a batch —
+      // a second append to one path must see the first. Copied, never the snapshot's own
+      // object: mutating that would poison the view's cache for every later read.
+      const seen = pathMap(snapshot.files);
       const applied: string[] = [];
 
       for (const op of ops) {
         // Sequential, and reading `files` as it goes, so two ops on one path in the same
         // batch chain instead of racing — the second sees what the first wrote.
-        applied.push(await this.#applyOne(op, files));
+        applied.push(await this.#applyOne(op, files, seen));
       }
+
+      // On the finished map, because only what is committed has to be legal.
+      assertMaterializable(
+        ops.flatMap((op) => (op.kind === "move" ? [op.to] : op.kind === "delete" ? [] : [op.path])),
+        files,
+        seen
+      );
 
       // Everything the resulting map references, including entries carried untouched from the
       // parent — which is what preserves excluded/skipped carry semantics for free.
@@ -149,26 +234,34 @@ export class VaultWriter {
    * return would have needed a second shape for "and here is the key to drop", which is how a
    * map mutation ends up expressed in two places.
    */
-  async #applyOne(op: WriteOp, files: Record<string, FileEntry>): Promise<string> {
+  async #applyOne(
+    op: WriteOp,
+    files: Record<string, FileEntry>,
+    visible: Record<string, FileEntry>
+  ): Promise<string> {
+    // Existence is judged against what the agent may SEE, never against the carried map. The
+    // scope predicate says the same thing today, but this is structural: the agent cannot
+    // remove or read a note that is hidden from it even if a predicate goes stale.
     if (op.kind === "delete") {
       // Deliberately no hash, no confirmation, no percent cap: `rm` semantics, owner's call.
       // Recovery is snapshot history within GC retention, which is what that budget buys.
-      if (files[op.path] === undefined) {
+      if (!Object.hasOwn(visible, op.path)) {
         throw new VaultError(`"${op.path}" does not exist, so there is nothing to delete`);
       }
       delete files[op.path];
+      delete visible[op.path];
       return `deleted ${op.path}`;
     }
 
     if (op.kind === "move") {
-      const entry = files[op.from];
+      const entry = Object.hasOwn(visible, op.from) ? visible[op.from] : undefined;
       if (entry === undefined) {
         throw new VaultError(`"${op.from}" does not exist, so there is nothing to move`);
       }
       // The one deliberate departure from `rename`'s silent clobber. Overwriting a *different*
       // note by accident is the worst surprise this surface can produce, and an agent that
       // means it can delete the destination first.
-      if (files[op.to] !== undefined) {
+      if (Object.hasOwn(files, op.to)) {
         throw new VaultError(
           `"${op.to}" already exists, so moving "${op.from}" onto it would replace a different note. Delete it first if that is what you want.`
         );
@@ -177,13 +270,17 @@ export class VaultWriter {
       // its key in the map. Per-file keys are derived from `blob:<content hash>` — content, not
       // path — so the ciphertext and its blob are untouched and no re-encryption is needed.
       delete files[op.from];
+      delete visible[op.from];
       files[op.to] = entry;
+      visible[op.to] = entry;
       return `moved ${op.from} to ${op.to}`;
     }
 
-    const { entry, bytes, summary } = await this.#nextContent(op, files);
+    const { entry, bytes, summary } = await this.#nextContent(op, visible);
     const c = await this.#view.store(entry.h, bytes);
-    files[op.path] = c === undefined ? entry : { ...entry, c };
+    const stored = c === undefined ? entry : { ...entry, c };
+    files[op.path] = stored;
+    visible[op.path] = stored;
     return summary;
   }
 
@@ -212,6 +309,16 @@ export class VaultWriter {
       }
       case "edit": {
         if (current === null) throw new VaultError(`"${op.path}" does not exist, so there is nothing to edit`);
+        // An empty anchor matches between every character, so `split`/`join` would interleave
+        // `new_text` through the whole note and report a count nobody asked for — and on an
+        // empty note the count comes out as -1, which is not a number of occurrences at all.
+        // There is no sensible reading of "replace nothing", so it is refused rather than
+        // interpreted.
+        if (op.oldText === "") {
+          throw new VaultError(
+            `"old_text" is empty, so there is nothing to find. Give the exact text to replace.`
+          );
+        }
         const count = current.split(op.oldText).length - 1;
         // Zero still fails loud in both modes. "Replace every one of them" is not an answer to
         // "there are none of them", and silently succeeding would report an edit that no

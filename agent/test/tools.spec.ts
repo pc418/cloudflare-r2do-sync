@@ -451,6 +451,83 @@ describe("write tools", () => {
     expect(Object.keys(after.files)).toContain("Projects/Tea.md");
   });
 
+  // Found by adversarial review, on `move`, but it was never specific to `move`. A manifest is
+  // a flat path map, so nothing in the format stops a commit holding both `Projects` and
+  // `Projects/Roadmap.md` — and no filesystem can materialize that. A device pulling it fails
+  // in `#ensureFolder`, so the agent would have published a snapshot that wedges every
+  // device's next sync, with the server unable to catch it because it never sees a path.
+  it("refuses any op that would make one path both a note and a folder", async () => {
+    const { ctx, view } = await context();
+    const before = await view.snapshot();
+
+    // move onto a folder that holds files
+    await expect(
+      callTool("move", { from: "Welcome.md", to: "Projects" }, ctx)
+    ).rejects.toThrow(/is a folder in this vault/);
+    // write turning an existing folder into a note
+    await expect(callTool("write", { path: "Projects", content: "x\n" }, ctx)).rejects.toThrow(
+      /is a folder in this vault/
+    );
+    // append below an existing note, which is the same clash from the other side
+    await expect(
+      callTool("append", { path: "Welcome.md/child.md", text: "x\n" }, ctx)
+    ).rejects.toThrow(/is a note, so/);
+
+    // Every refusal left the vault exactly as it was.
+    const after = await view.snapshot({ fresh: true });
+    expect(after.files).toEqual(before.files);
+  });
+
+  // The follow-up review's catch: a per-op check rejected a batch whose *result* was legal,
+  // purely on the order the ops arrived in. Only what gets committed has to be materializable.
+  it("judges the clash on the finished batch, not one operation at a time", async () => {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, { "Projects/Roadmap.md": "road\n" });
+    const client = () => new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const view = new VaultView({ api: client(), writeApi: client(), crypto });
+    const writer = new VaultWriter({ view, device: "agent" });
+
+    // Written first, so a per-op check fires on an intermediate state that never reaches R2.
+    await writer.apply([
+      { kind: "write", path: "Projects", content: "now a note\n" },
+      { kind: "delete", path: "Projects/Roadmap.md" },
+    ]);
+    const after = await view.snapshot({ fresh: true });
+    expect(Object.keys(after.files)).toEqual(["Projects"]);
+
+    // The genuinely unmaterializable batch still fails, and commits nothing.
+    await expect(
+      writer.apply([{ kind: "write", path: "Projects/again.md", content: "x\n" }])
+    ).rejects.toThrow(/is a note, so/);
+  });
+
+  it("still allows a move onto a folder name the same op empties", async () => {
+    const { ctx, view } = await context({ notes: { "Only/note.md": "solo\n", "T.md": "t\n" } });
+    // `Only` stops being a folder in the same operation that makes it a note, so there is no
+    // moment at which the map holds both — the clash has to survive the batch to be one.
+    await callTool("move", { from: "Only/note.md", to: "Only" }, ctx);
+    const after = await view.snapshot({ fresh: true });
+    expect(Object.keys(after.files).sort()).toEqual(["Only", "T.md"]);
+  });
+
+  // An empty anchor matches between every character: `split`/`join` would interleave new_text
+  // through the whole note and report a count nobody asked for, and on an empty note the count
+  // arrives as -1, which is not a number of occurrences at all.
+  it("refuses an empty edit anchor rather than interleaving the note", async () => {
+    const { ctx, view } = await context({ notes: { "A.md": "abc", "E.md": "" } });
+    for (const path of ["A.md", "E.md"]) {
+      await expect(
+        callTool("edit", { path, old_text: "", new_text: "X", replace_all: true }, ctx)
+      ).rejects.toThrow(/"old_text" is empty/);
+      await expect(
+        callTool("edit", { path, old_text: "", new_text: "X" }, ctx)
+      ).rejects.toThrow(/"old_text" is empty/);
+    }
+    const after = await view.snapshot({ fresh: true });
+    expect(new TextDecoder().decode(await view.read(after.files["A.md"]))).toBe("abc");
+  });
+
   it("is refused entirely when the deployment holds no write credential", async () => {
     const { ctx } = await context({ writable: false });
     await expect(callTool("append", { path: "a.md", text: "x" }, ctx)).rejects.toThrow(/read-only/);
