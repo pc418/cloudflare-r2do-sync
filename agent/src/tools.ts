@@ -93,7 +93,7 @@ const WRITES = (destructive: boolean): ToolAnnotations => ({
  * as authority over the chat.
  */
 const AGENT_NOTE_POINTER =
-  " Read `AGENTS.md` first for conventions.";
+  " Read `AGENTS.md` first.";
 
 /**
  * Ordered by how often a tool is reached for, and every contract inside 80 characters.
@@ -126,22 +126,22 @@ export const TOOLS: ToolDescriptor[] = [
     name: "search",
     title: "Search notes",
     description:
-      "Search note text: substring by default, or regex with `regex: true`. Case-insensitive. The result says when it could not cover the whole vault." +
+      "Substring by default, or pass `regex: true`. Case-insensitive." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
       properties: {
-        query: str("Text to look for."),
+        query: str("Text to search."),
         regex: {
           type: "boolean",
           description:
-            "Treat the query as a regular expression (default false). Slower, and may cover less of the vault — narrow with folder or glob.",
+            "Parse regex (default false). Budgeted.",
         },
         context: int(
-          `Lines of context either side of each match, like grep -C (default ${CONTEXT_DEFAULT} — matched lines only; cap ${CONTEXT_MAX}). Ask for 1-2 when you need to see what surrounds a hit; leave it alone for structure queries, path-harvesting, or anything with many hits.`
+          `Lines of context either side, like grep -C (default ${CONTEXT_DEFAULT}; cap ${CONTEXT_MAX}).`
         ),
-        folder: str("Restrict to a folder, subfolders included, e.g. \"Projects\"."),
-        glob: str("Optional path glob, e.g. \"Daily/**\" or \"**/*.md\". ANDed with folder when both are given."),
+        folder: str("In folder, recursive, e.g. \"Projects\"."),
+        glob: str("Optional path glob, e.g. \"Daily/**\" or \"**/*.md\". Could pass with folder."),
         max_results: int("Maximum hits to return (default 20, cap 100)."),
       },
       required: ["query"],
@@ -153,7 +153,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "recent",
     title: "Recently modified notes",
     description:
-      "Catch up: notes changed in the last N days, newest first, no downloads. Reach for this first when you need to know what someone has been working on." +
+      "List notes changed in N days, newest first." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
@@ -169,7 +169,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "read",
     title: "Read a note",
     description:
-      "Read one note as numbered lines; the numbers are display only. Use offset and limit to page through a long note." +
+      "Line numbers are display only. Pass offset and limit for sections." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
@@ -187,7 +187,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "list",
     title: "List notes",
     description:
-      "List note paths, sizes and times. Path finder." +
+      "List note paths, sizes and times." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
@@ -196,13 +196,13 @@ export const TOOLS: ToolDescriptor[] = [
           type: "string",
           enum: ["path", "modified", "size"],
           description:
-            "Order (default \"path\"). Each key has one direction, as `ls` does it: path A-Z, modified newest first, size largest first. Keeps sorted first-N.",
+            "Order (default \"path\"). Path A-Z, modified newest first, size largest first. Keeps sorted first-N.",
         },
         modified_after: str(
-          "Only notes modified at or after this ISO 8601 time, inclusive. A date alone is UTC midnight."
+          "At or after this ISO 8601 time. A date alone is UTC midnight."
         ),
         modified_before: str(
-          "Only notes modified strictly before this ISO 8601 time, exclusive — so after: \"2026-08-01\", before: \"2026-09-01\" is exactly August, and consecutive ranges tile with no overlap. A date alone is UTC midnight."
+          "Strictly before this ISO 8601 time, exclusive. A date alone is UTC midnight."
         ),
         folder: str("Folder to list, subfolders included, e.g. \"Daily\"."),
         glob: str("Optional path glob, e.g. \"**/*.md\". ANDed with folder when both are given."),
@@ -216,7 +216,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "append",
     title: "Append to a note",
     description:
-      "Append text to a note, creating if missing. It cannot target a section — to insert mid-note use `edit`." +
+      "Creating if missing." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
@@ -242,9 +242,9 @@ export const TOOLS: ToolDescriptor[] = [
         replace_all: {
           type: "boolean",
           description:
-            "Replace every occurrence instead of requiring exactly one (default false). Text that appears nowhere still fails.",
+            "Replace every occurrence (default false).",
         },
-        old_text: str("Exact text to replace, as it appears in the note — without `read`'s line-number prefix. Must appear exactly once unless replace_all is set."),
+        old_text: str("Exact text to replace. Pass `replace_all` for multiple occurrences."),
         new_text: str("Replacement text."),
       },
       required: ["path", "old_text", "new_text"],
@@ -273,7 +273,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "move",
     title: "Move or rename a note",
     description:
-      "Move one note to a path that must not already exist; delete the destination first to replace it. No folder is created or removed." +
+      "Folders are derived from path. Cannot overwrite." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
@@ -292,7 +292,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "delete",
     title: "Delete a note",
     description:
-      "Delete one note permanently; only a missing note is an error. Folders are never deleted, and a folder path is not a valid argument." +
+      "Delete a note. Folders are derived from path." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",

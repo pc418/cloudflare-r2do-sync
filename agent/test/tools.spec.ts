@@ -77,15 +77,15 @@ describe("tool surface", () => {
 
   it("states each tool's contract inside the truncation budget", () => {
     const contracts: Record<string, RegExp> = {
-      search: /substring by default, or regex with `regex: true`/,
-      read: /numbered lines; the numbers are display only/,
-      append: /Append text to a note, creating if missing/,
+      search: /Substring by default, or pass `regex: true`/,
+      read: /Line numbers are display only/,
+      append: /Creating if missing/,
       list: /List note paths, sizes and times/,
       edit: /fails unless it appears exactly once/,
-      recent: /notes changed in the last N days, newest first, no downloads/,
-      write: /Create a note, or overwrite if exists/,
-      move: /path that must not already exist/,
-      delete: /Delete one note permanently/,
+      recent: /notes changed in N days, newest first/,
+      write: /overwrite if exists/,
+      move: /Folders are derived from path\. Cannot overwrite/,
+      delete: /Delete a note/,
     };
     expect(Object.keys(contracts).sort()).toEqual(TOOLS.map((t) => t.name).sort());
     for (const tool of TOOLS) {
@@ -111,7 +111,7 @@ describe("tool surface", () => {
       // contract short enough that the pointer also fits inside the catalog line is fine.)
       // The supersession clause was traded for brevity (owner, 2026-08-31); "first" carries
       // the priority, and a missing AGENTS.md costs one cheap fs-shaped "no note" answer.
-      expect(tool.description).toMatch(/Read `AGENTS\.md` first for conventions\.$/);
+      expect(tool.description).toMatch(/Read `AGENTS\.md` first\.$/);
       // Scoped to vault conventions: a synced note must not read as authority over the chat.
       expect(tool.description).not.toMatch(/ignore|disregard|previous instructions/i);
     }

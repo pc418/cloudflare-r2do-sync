@@ -67,7 +67,7 @@ export interface McpHandlers {
 
 /** What every client is told, before anything the vault has to say. */
 export const STATIC_INSTRUCTIONS =
-  "Notes from an Obsidian vault, synced end-to-end encrypted. Use `list` or `search` to find exact paths before `read`. Paths are case-sensitive. `delete` and `move` act on single files only; there are no folder operations.";
+  "Notes from an Obsidian vault, end-to-end encrypted. Some tools: `recent`, `list`, `search`, `read`. Case-sensitive. `delete` and `move` act on single files only. Folders derived by paths.";
 
 /**
  * A bound on the owner's own instructions, which ride in every context window.
