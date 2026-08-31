@@ -246,6 +246,11 @@ configuration: it cannot un-hide a path, widen what the agent may read, or chang
 does. Anyone holding a write token could rewrite it — the same boundary that already lets them
 forge any note — so if you ever want that channel frozen, exclude `AGENT.md`.
 
+Whether a given client shows the model those instructions is the client's business, not the
+server's. If the agent seems not to know your conventions, ask it in the chat what its
+instructions for this vault say: an empty answer means the client dropped them, and the
+conventions are still worth stating once in the conversation.
+
 Health check: `curl <AGENT_URL>/health`. An unauthenticated `GET /mcp` answers **401**, not
 405 — the bearer is checked before the method, so that is the correct answer to an anonymous
 probe rather than a broken deployment.

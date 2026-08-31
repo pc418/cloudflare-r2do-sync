@@ -67,12 +67,23 @@ const WRITES = (destructive: boolean): ToolAnnotations => ({
   openWorldHint: false,
 });
 
+/**
+ * Every description's **first sentence** carries that tool's load-bearing contract.
+ *
+ * Not a style rule. A deferred-tools client (Claude Code's own MCP loading) shows the model
+ * tool names and one-line blurbs, and fetches the full description and schema only if the model
+ * explicitly asks — so until it does, the first sentence *is* the description. Measured in a
+ * real session: with the contracts sitting in sentence two, the model planned a `write` over an
+ * existing note not knowing overwrites are version-bound, did not know `edit` refuses an
+ * ambiguous match, and had no reason to prefer `list`/`recent` because it could not see they
+ * download nothing. A test pins each first sentence so a rewrite cannot quietly demote one.
+ */
 export const TOOLS: ToolDescriptor[] = [
   {
     name: "search",
     title: "Search notes",
     description:
-      "Search the vault's note text for a substring (case-insensitive). Returns path:line hits with surrounding context. Scans newest notes first within a fixed budget and reports when it could not scan everything.",
+      "Search the vault's note text for a case-insensitive substring, never a regular expression. Returns path:line hits with surrounding context. Scans newest notes first within a fixed budget and reports when it could not scan everything.",
     inputSchema: {
       type: "object",
       properties: {
@@ -90,7 +101,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "read",
     title: "Read a note",
     description:
-      "Read one note by its exact vault path. Returns line-numbered text. Use offset and limit to page through a long note.",
+      "Read one note by its exact vault path, returning line-numbered text and the content hash that `write` requires to replace it. Use offset and limit to page through a long note.",
     inputSchema: {
       type: "object",
       properties: {
@@ -107,7 +118,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "list",
     title: "List notes",
     description:
-      "List note paths with their sizes and modification times. Costs no note downloads. Use it to find exact paths before reading.",
+      "List note paths with their sizes and modification times, reading snapshot metadata only and downloading no note content. Use it to find exact paths before reading.",
     inputSchema: {
       type: "object",
       properties: {
@@ -123,7 +134,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "recent",
     title: "Recently modified notes",
     description:
-      "List notes modified within the last N days, newest first. Reads only snapshot metadata, so it costs no note downloads.",
+      "List notes modified within the last N days, newest first, reading snapshot metadata only and downloading no note content. Use it to catch up on what changed before reading anything.",
     inputSchema: {
       type: "object",
       properties: {
@@ -138,7 +149,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "append",
     title: "Append to a note",
     description:
-      "Append text to a note, creating it if it does not exist. This is the capture tool — use it for quick notes, journal entries and additions.",
+      "Append text at the very end of a note, creating the note if it does not exist. It cannot write into a section that has anything below it — for that use `edit`. This is the capture tool: quick notes, journal entries, additions.",
     inputSchema: {
       type: "object",
       properties: {
@@ -154,7 +165,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "edit",
     title: "Edit a note",
     description:
-      "Replace one unique occurrence of a string in a note. Fails if the string appears zero or several times, so include enough surrounding context to make it unique.",
+      "Replace one occurrence of a string in a note, failing unless that string appears exactly once. Include enough surrounding context to make the match unique.",
     inputSchema: {
       type: "object",
       properties: {
@@ -171,7 +182,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "write",
     title: "Create or replace a note",
     description:
-      "Create a note, or replace one entirely. To replace an existing note you must pass expected_hash from a prior read, so an overwrite is bound to the version you actually saw.",
+      "Create a note, or replace one entirely — replacing an existing note requires expected_hash from a prior `read`, so an overwrite is bound to the version you actually saw. Prefer `append` or `edit` when you mean to change part of a note.",
     inputSchema: {
       type: "object",
       properties: {

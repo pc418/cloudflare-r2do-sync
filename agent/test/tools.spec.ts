@@ -62,7 +62,40 @@ describe("tool surface", () => {
       "recent",
     ]);
   });
+
+  // A deferred-tools client shows the model names and one-line blurbs, fetching full
+  // descriptions and schemas only on an explicit request. Until it does, the first sentence is
+  // the entire description — so a contract that lives in sentence two is a contract the model
+  // plans without. Pinned here because the failure is invisible: the tool still works, the
+  // caller just does not know the rule it is about to break.
+  it("states each tool's load-bearing contract in its first sentence", () => {
+    const contracts: Record<string, RegExp> = {
+      search: /case-insensitive substring, never a regular expression/,
+      read: /hash that `write` requires/,
+      list: /downloading no note content/,
+      recent: /downloading no note content/,
+      append: /at the very end of a note/,
+      edit: /failing unless that string appears exactly once/,
+      write: /requires expected_hash from a prior `read`/,
+    };
+    expect(Object.keys(contracts).sort()).toEqual(TOOLS.map((t) => t.name).sort());
+    for (const tool of TOOLS) {
+      const first = firstSentence(tool.description);
+      expect(first, `${tool.name}: contract missing from its first sentence`).toMatch(
+        contracts[tool.name]
+      );
+      // A blurb nobody reads to the end is the same failure in a different costume.
+      expect(first.length, `${tool.name}: first sentence too long to serve as a blurb`)
+        .toBeLessThanOrEqual(200);
+    }
+  });
 });
+
+/** Up to the first sentence-ending period followed by whitespace, or the whole string. */
+function firstSentence(text: string): string {
+  const end = /\.\s/.exec(text);
+  return end === null ? text : text.slice(0, end.index + 1);
+}
 
 describe("read tools", () => {
   it("lists notes with no blob downloads", async () => {
