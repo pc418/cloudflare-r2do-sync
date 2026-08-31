@@ -26,7 +26,7 @@ export const PREFERRED_VERSION = "2025-11-25";
 export const SERVER_INFO = {
   name: "obsidian-vault-agent",
   title: "Obsidian vault",
-  version: "1.0.0",
+  version: "1.1.0",
 };
 
 const PARSE_ERROR = -32700;
