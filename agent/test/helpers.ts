@@ -117,7 +117,7 @@ export async function seed(
   vault: FakeVault,
   crypto: VaultCrypto,
   notes: Record<string, string>,
-  opts: { mtime?: number } = {}
+  opts: { mtime?: number; mtimes?: Record<string, number> } = {}
 ): Promise<string> {
   const files: Record<string, FileEntry> = {};
   const blobs: string[] = [];
@@ -130,7 +130,7 @@ export async function seed(
     files[path] = {
       h,
       size: plain.length,
-      mtime: opts.mtime ?? Date.now(),
+      mtime: opts.mtimes?.[path] ?? opts.mtime ?? Date.now(),
       c,
       lines: text.split("\n").length,
     };

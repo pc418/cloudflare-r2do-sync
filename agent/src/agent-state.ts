@@ -37,7 +37,7 @@ export const WRITE_DEBOUNCE_MS = 2000;
  * The name is fixed. A configurable filename would be a knob with one caller, which is exactly
  * the speculative flag the simplicity rule bans.
  */
-export const INSTRUCTIONS_NOTE = "AGENT.md";
+export const INSTRUCTIONS_NOTE = "AGENTS.md";
 
 export class AgentState extends DurableObject<AgentEnv> {
   #view: VaultView | null = null;
@@ -106,7 +106,7 @@ export class AgentState extends DurableObject<AgentEnv> {
    * The owner's standing instructions, or "" when the vault has none.
    *
    * Read through the **scoped** snapshot, so the shared exclude policy applies to it exactly
-   * as it does to every other note: a hidden `AGENT.md` is simply absent, and the agent never
+   * as it does to every other note: a hidden `AGENTS.md` is simply absent, and the agent never
    * gains a second, unfiltered way to read a path.
    *
    * It is bytes handed to the model, never parsed as configuration — it cannot un-hide a path,

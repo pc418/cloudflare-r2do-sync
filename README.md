@@ -207,7 +207,7 @@ guard included.
 
 ### Teaching it your vault
 
-Put a note called **`AGENT.md`** at the root of your vault:
+Put a note called **`AGENTS.md`** at the root of your vault:
 
 ```markdown
 - Daily notes live in `Daily/YYYY-MM-DD.md`.
@@ -222,15 +222,15 @@ that my daily notes live under Daily/" is one request away — with new text tak
 your *next* conversation, not the current one.
 
 Two limits worth knowing. It is read through the same rules as every other note, so an
-`AGENT.md` your vault excludes is invisible. And it is advice to the model, never
+`AGENTS.md` your vault excludes is invisible. And it is advice to the model, never
 configuration — it cannot un-hide a path, widen what the assistant may read, or change what a
 tool does.
 
 Some clients do not pass server instructions to the model at all (Claude Code's deferred tool
-loading is one). The `list` and `search` tools mention `AGENT.md` in their own descriptions to
+loading is one). The `list` and `search` tools mention `AGENTS.md` in their own descriptions to
 cover that, so the assistant finds the note the first time it looks around your vault. If it
 still seems not to know your conventions, ask it in the chat what its instructions for this
-vault say — an empty answer means that client dropped them, and "read `AGENT.md` first" is a
+vault say — an empty answer means that client dropped them, and "read `AGENTS.md` first" is a
 one-line fix for that conversation.
 
 ### Turning it off

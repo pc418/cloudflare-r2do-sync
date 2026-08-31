@@ -194,7 +194,7 @@ describe("owner instructions from the vault", () => {
     return body.result.instructions;
   };
 
-  it("serves the static string alone when the vault has no AGENT.md", async () => {
+  it("serves the static string alone when the vault has no AGENTS.md", async () => {
     // Byte-identical to what every client got before this feature existed.
     expect(await initialize({ instructions: async () => "" })).toBe(STATIC_INSTRUCTIONS);
   });
@@ -204,7 +204,7 @@ describe("owner instructions from the vault", () => {
       instructions: async () => "Daily notes live in Daily/YYYY-MM-DD.md. Read Inbox.md first.",
     });
     expect(text.startsWith(STATIC_INSTRUCTIONS)).toBe(true);
-    expect(text).toContain("## Owner instructions (AGENT.md in this vault)");
+    expect(text).toContain("## Owner instructions (AGENTS.md in this vault)");
     expect(text).toContain("Daily notes live in Daily/YYYY-MM-DD.md");
   });
 
@@ -216,7 +216,7 @@ describe("owner instructions from the vault", () => {
     const text = await initialize({
       instructions: async () => "x".repeat(MAX_INSTRUCTION_CHARS + 500),
     });
-    expect(text).toContain("[truncated: AGENT.md exceeded");
+    expect(text).toContain("[truncated: AGENTS.md exceeded");
     expect(text.length).toBeLessThan(MAX_INSTRUCTION_CHARS + STATIC_INSTRUCTIONS.length + 300);
     expect(text).not.toContain("x".repeat(MAX_INSTRUCTION_CHARS + 1));
   });

@@ -81,8 +81,10 @@ const WRITES = (destructive: boolean): ToolAnnotations => ({
  *
  * On **every** tool, not the two entry points it started on. That guess was wrong: a session
  * can open with `recent`, `read` or `append` just as easily as with `search`, and a pointer the
- * model never loads is no pointer. Nine copies of one sentence is the price of the only channel
- * that survives.
+ * model never loads is no pointer. Nine copies is the price of the only channel that survives,
+ * which is exactly why it is this short: the supersession clause was traded for brevity
+ * (owner, 2026-08-31) — "first" carries the priority, and a vault with no `AGENTS.md` pays one
+ * cheap filesystem-shaped "no note" answer for it.
  *
  * Never in the first 80 characters — that budget belongs to the tool's own contract. Static
  * text, because a vault-dependent descriptor would put a snapshot read inside `tools/list`.
@@ -91,7 +93,7 @@ const WRITES = (destructive: boolean): ToolAnnotations => ({
  * as authority over the chat.
  */
 const AGENT_NOTE_POINTER =
-  " If the vault has a root note `AGENT.md`, read it first — it carries the owner's conventions, replacing any vault conventions you were given earlier.";
+  " Read `AGENTS.md` first for conventions.";
 
 /**
  * Ordered by how often a tool is reached for, and every contract inside 80 characters.
@@ -124,7 +126,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "search",
     title: "Search notes",
     description:
-      "Search note text: substring by default, or regex with `regex: true`. Case-insensitive either way. No matches is not proof of absence — the scan is budgeted, and the result says when it could not cover everything." +
+      "Search note text: substring by default, or regex with `regex: true`. Case-insensitive. The result says when it could not cover the whole vault." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
@@ -133,7 +135,7 @@ export const TOOLS: ToolDescriptor[] = [
         regex: {
           type: "boolean",
           description:
-            "Treat the query as a regular expression (default false). Slower: regular expressions cannot use the index, so the search always falls back to the budgeted scan.",
+            "Treat the query as a regular expression (default false). Slower, and may cover less of the vault — narrow with folder or glob.",
         },
         context: int(
           `Lines of context either side of each match, like grep -C (default ${CONTEXT_DEFAULT} — matched lines only; cap ${CONTEXT_MAX}). Ask for 1-2 when you need to see what surrounds a hit; leave it alone for structure queries, path-harvesting, or anything with many hits.`
@@ -185,11 +187,23 @@ export const TOOLS: ToolDescriptor[] = [
     name: "list",
     title: "List notes",
     description:
-      "List note paths, sizes and times; downloads no note content. Use it to find exact paths before reading." +
+      "List note paths, sizes and times. Path finder." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
       properties: {
+        sort: {
+          type: "string",
+          enum: ["path", "modified", "size"],
+          description:
+            "Order (default \"path\"). Direction is fixed per key, as `ls` does it: path A-Z, modified newest first, size largest first. Truncation happens after sorting, so a cut listing is a meaningful top-N.",
+        },
+        modified_after: str(
+          "Only notes modified at or after this ISO 8601 time, inclusive. A date alone is UTC midnight."
+        ),
+        modified_before: str(
+          "Only notes modified strictly before this ISO 8601 time, exclusive — so after: \"2026-08-01\", before: \"2026-09-01\" is exactly August, and consecutive ranges tile with no overlap. A date alone is UTC midnight."
+        ),
         folder: str("Folder to list, subfolders included, e.g. \"Daily\"."),
         glob: str("Optional path glob, e.g. \"**/*.md\". ANDed with folder when both are given."),
         max_results: int("Maximum paths to return (default 200, cap 1000)."),
@@ -202,7 +216,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "append",
     title: "Append to a note",
     description:
-      "Append text at the very end of a note, creating it if missing. It cannot write into a section that has anything below it — for that use `edit`. This is the capture tool: quick notes, journal entries, additions." +
+      "Append text to a note, creating if missing. It cannot target a section — to insert mid-note use `edit`." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
@@ -242,7 +256,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "write",
     title: "Create or replace a note",
     description:
-      "Create a note, or replace an existing one entirely and without warning. For a partial change prefer `append` or `edit`." +
+      "Create a note, or overwrite if exists." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
@@ -259,7 +273,7 @@ export const TOOLS: ToolDescriptor[] = [
     name: "move",
     title: "Move or rename a note",
     description:
-      "Move one note to a path that must not already exist. Refuses rather than replacing the destination; delete it first if that is what you want. Folders are implicit in the path — no folder is created or removed." +
+      "Move one note to a path that must not already exist; delete the destination first to replace it. No folder is created or removed." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
@@ -360,6 +374,38 @@ function entryOf(files: Record<string, FileEntry>, path: string): FileEntry {
   );
 }
 
+/**
+ * An ISO 8601 bound from the arguments, or null.
+ *
+ * `Date.parse` reads a bare `2026-08-01` as UTC midnight, which is the rule the field
+ * description states rather than leaving the caller to discover a timezone.
+ */
+function when(args: Record<string, unknown>, key: string): number | null {
+  const raw = optional(args, key);
+  if (raw === undefined) return null;
+  const at = Date.parse(raw);
+  if (Number.isNaN(at)) {
+    throw new VaultError(
+      `"${key}" is not a date I can read: "${raw}". Use ISO 8601 — "2026-08-01" or "2026-08-01T12:00:00Z".`
+    );
+  }
+  return at;
+}
+
+/**
+ * Comparators for `list`, with **direction baked into the key**.
+ *
+ * `ls` priors: paths A-Z, `-t` newest first, `-S` largest first. A separate `order` flag would
+ * be the speculative knob the simplicity rule bans — reversing at most 1,000 returned rows is
+ * the caller's own business. Path is the tie-break everywhere, so the order is total and a
+ * listing never shuffles between identical calls.
+ */
+const SORTS: Record<string, (files: Record<string, FileEntry>) => (a: string, b: string) => number> = {
+  path: () => (a, b) => a.localeCompare(b),
+  modified: (files) => (a, b) => files[b].mtime - files[a].mtime || a.localeCompare(b),
+  size: (files) => (a, b) => files[b].size - files[a].size || a.localeCompare(b),
+};
+
 export async function callTool(
   name: string,
   args: Record<string, unknown>,
@@ -456,10 +502,22 @@ export async function callTool(
       const glob = optional(args, "glob");
       const max = Math.max(1, Math.min(asInt(args, "max_results", 200), 1000));
       const re = glob === undefined ? null : globToRegExp(glob);
+      const sort = optional(args, "sort") ?? "path";
+      if (!Object.hasOwn(SORTS, sort)) {
+        throw new VaultError(`"sort" must be one of ${Object.keys(SORTS).join(", ")}`);
+      }
+      // Half-open [after, before): `after` inclusive, `before` exclusive, so consecutive
+      // ranges tile with no overlap and no gap.
+      const after = when(args, "modified_after");
+      const before = when(args, "modified_before");
       const matched = Object.keys(files)
         .filter((p) => (folder === undefined || folder === "" ? true : p.startsWith(`${folder}/`)))
         .filter((p) => (re === null ? true : re.test(p)))
-        .sort();
+        .filter((p) => (after === null ? true : files[p].mtime >= after))
+        .filter((p) => (before === null ? true : files[p].mtime < before))
+        .sort(SORTS[sort](files));
+      // After the sort, never before: a cut listing is then a meaningful top-N rather than an
+      // arbitrary slice that happened to be alphabetically first.
       const shown = matched.slice(0, max);
       const rows = shown
         .map((p) => `${p}  (${files[p].size} B, ${new Date(files[p].mtime).toISOString().slice(0, 10)})`)

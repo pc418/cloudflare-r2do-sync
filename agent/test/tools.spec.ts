@@ -79,11 +79,11 @@ describe("tool surface", () => {
     const contracts: Record<string, RegExp> = {
       search: /substring by default, or regex with `regex: true`/,
       read: /numbered lines; the numbers are display only/,
-      append: /at the very end of a note, creating it if missing/,
-      list: /downloads no note content/,
+      append: /Append text to a note, creating if missing/,
+      list: /List note paths, sizes and times/,
       edit: /fails unless it appears exactly once/,
       recent: /notes changed in the last N days, newest first, no downloads/,
-      write: /replace an existing one entirely and without warning/,
+      write: /Create a note, or overwrite if exists/,
       move: /path that must not already exist/,
       delete: /Delete one note permanently/,
     };
@@ -99,19 +99,19 @@ describe("tool surface", () => {
   // Claude Desktop delivers no server instructions block at all, so a tool description is the
   // only carrier that survives. Claude Code does deliver them — clients differ, and the
   // surviving channel is the one to design for.
-  it("points at AGENT.md from every tool, below the truncation budget", () => {
-    const carriers = TOOLS.filter((t) => t.description.includes("`AGENT.md`"));
+  it("points at AGENTS.md from every tool, below the truncation budget", () => {
+    const carriers = TOOLS.filter((t) => t.description.includes("`AGENTS.md`"));
     // EVERY tool. Two carriers was a guess that a session opens with `search` or `list`;
     // Claude Desktop shows it can open with `recent`, `read` or `append` just as easily, and a
     // pointer the model never loads is no pointer at all.
     expect(carriers.map((t) => t.name).sort()).toEqual(TOOLS.map((t) => t.name).sort());
     for (const tool of carriers) {
-      // Never inside the truncated head: that budget belongs to the tool's own contract.
-      expect(tool.description.slice(0, TRUNCATION)).not.toContain("AGENT.md");
-      expect(tool.description).toMatch(/If the vault has a root note `AGENT\.md`/);
-      // Supersession, without which a mid-session rewrite leaves the model arbitrating between
-      // the note it just read and the copy its client cached at `initialize`.
-      expect(tool.description).toMatch(/replacing any vault conventions you were given earlier/);
+      // Always the trailing sentence, after the tool's own contract — the contract test above
+      // separately pins that the contract survives truncation with the pointer appended. (A
+      // contract short enough that the pointer also fits inside the catalog line is fine.)
+      // The supersession clause was traded for brevity (owner, 2026-08-31); "first" carries
+      // the priority, and a missing AGENTS.md costs one cheap fs-shaped "no note" answer.
+      expect(tool.description).toMatch(/Read `AGENTS\.md` first for conventions\.$/);
       // Scoped to vault conventions: a synced note must not read as authority over the chat.
       expect(tool.description).not.toMatch(/ignore|disregard|previous instructions/i);
     }
@@ -567,24 +567,24 @@ describe("the shared sync policy governs the agent too", () => {
   }
 
   // The standing-instructions note is read through the same scoped snapshot as everything
-  // else, which is the whole reason it is not a second read path: an AGENT.md the vault
+  // else, which is the whole reason it is not a second read path: an AGENTS.md the vault
   // excludes must be invisible to the agent exactly as any other excluded note is. Asserted at
   // the snapshot, not through a tool, because the tool layer is not what enforces it.
-  it("hides an excluded AGENT.md from the instructions the agent would serve", async () => {
+  it("hides an excluded AGENTS.md from the instructions the agent would serve", async () => {
     const { view } = await withPolicy(
-      { excludes: "AGENT.md" },
-      { "Welcome.md": "hello\n", "AGENT.md": "read Inbox.md first\n" }
+      { excludes: "AGENTS.md" },
+      { "Welcome.md": "hello\n", "AGENTS.md": "read Inbox.md first\n" }
     );
     const snapshot = await view.snapshot();
     // Carried in the snapshot, as every excluded path is — and absent from what may be read.
-    expect(Object.keys(snapshot.all)).toContain("AGENT.md");
-    expect(Object.keys(snapshot.files)).not.toContain("AGENT.md");
+    expect(Object.keys(snapshot.all)).toContain("AGENTS.md");
+    expect(Object.keys(snapshot.files)).not.toContain("AGENTS.md");
   });
 
-  it("serves an AGENT.md the policy allows", async () => {
-    const { view } = await withPolicy({}, { "AGENT.md": "read Inbox.md first\n" });
+  it("serves an AGENTS.md the policy allows", async () => {
+    const { view } = await withPolicy({}, { "AGENTS.md": "read Inbox.md first\n" });
     const snapshot = await view.snapshot();
-    expect(Object.keys(snapshot.files)).toContain("AGENT.md");
+    expect(Object.keys(snapshot.files)).toContain("AGENTS.md");
   });
 
   // The vault's excludes are what keep a credentials folder — real secrets — off synced devices.
@@ -909,5 +909,81 @@ describe("concurrency", () => {
 describe("fetchHttp", () => {
   it("is a structural passthrough of the platform Response", async () => {
     expect(typeof fetchHttp).toBe("function");
+  });
+});
+
+describe("list: sort and date range", () => {
+  const JUL = Date.parse("2026-07-01T00:00:00Z");
+  const AUG = Date.parse("2026-08-15T00:00:00Z");
+  const SEP = Date.parse("2026-09-15T00:00:00Z");
+
+  // Deliberately arranged so the three orders give three DIFFERENT answers — a fixture where
+  // path, modified and size agree cannot tell you the sort key is being read at all.
+  async function dated() {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(
+      vault,
+      crypto,
+      { "a.md": "x".repeat(500), "b.md": "s\n", "c.md": "middling content\n" },
+      { mtimes: { "a.md": JUL, "b.md": SEP, "c.md": AUG } }
+    );
+    const api = new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
+    const view = new VaultView({ api, crypto });
+    const ctx: ToolContext = { view, writable: false, enqueue: async () => ({ head: "", summary: "" }) };
+    return { ctx };
+  }
+  const paths = (out: string) =>
+    out.split("\n").filter((l) => l.includes(".md  (")).map((l) => l.split("  (")[0]);
+
+  it("bakes a direction into each sort key, `ls`-style", async () => {
+    const { ctx } = await dated();
+    expect(paths(await callTool("list", {}, ctx))).toEqual(["a.md", "b.md", "c.md"]);
+    // newest first, like `ls -t`
+    expect(paths(await callTool("list", { sort: "modified" }, ctx))).toEqual(["b.md", "c.md", "a.md"]);
+    // largest first, like `ls -S`
+    expect(paths(await callTool("list", { sort: "size" }, ctx))).toEqual(["a.md", "c.md", "b.md"]);
+    await expect(callTool("list", { sort: "sideways" }, ctx)).rejects.toThrow(/"sort" must be one of/);
+  });
+
+  // Half-open [after, before): consecutive ranges tile with no overlap and no gap.
+  it("treats the range as half-open, after inclusive and before exclusive", async () => {
+    const { ctx } = await dated();
+    // c.md is stamped exactly `after` (in); b.md exactly `before` (out); a.md is earlier (out).
+    expect(
+      paths(
+        await callTool(
+          "list",
+          { modified_after: "2026-08-15T00:00:00Z", modified_before: "2026-09-15T00:00:00Z" },
+          ctx
+        )
+      )
+    ).toEqual(["c.md"]);
+
+    // A date alone is UTC midnight, and August tiles onto September with nothing lost.
+    const august = paths(
+      await callTool("list", { modified_after: "2026-08-01", modified_before: "2026-09-01" }, ctx)
+    );
+    const september = paths(
+      await callTool("list", { modified_after: "2026-09-01", modified_before: "2026-10-01" }, ctx)
+    );
+    expect(august).toEqual(["c.md"]);
+    expect(september).toEqual(["b.md"]);
+    expect(august.filter((p) => september.includes(p))).toEqual([]);
+  });
+
+  it("fails loud on a date it cannot read", async () => {
+    const { ctx } = await dated();
+    await expect(callTool("list", { modified_after: "last tuesday" }, ctx)).rejects.toThrow(
+      /not a date I can read/
+    );
+  });
+
+  // Otherwise a cut listing is whatever sorted first alphabetically, which is not what
+  // "the single most recently modified note" means.
+  it("truncates after sorting, so a cut listing is a real top-N", async () => {
+    const { ctx } = await dated();
+    expect(paths(await callTool("list", { sort: "modified", max_results: 1 }, ctx))).toEqual(["b.md"]);
+    expect(paths(await callTool("list", { sort: "size", max_results: 1 }, ctx))).toEqual(["a.md"]);
   });
 });
