@@ -257,6 +257,8 @@ export class ButtonComponent {
   cta = false;
   /** Likewise: a button offered for something that cannot be done is a dead end. */
   disabled = false;
+  /** Recorded because a class is how a button is highlighted once `setCta` is not the mechanism. */
+  readonly classes: string[] = [];
   private clickHandler: (() => unknown) | null = null;
   setButtonText(v: string): this {
     this.text = v;
@@ -281,6 +283,10 @@ export class ButtonComponent {
   }
   setCta(): this {
     this.cta = true;
+    return this;
+  }
+  setClass(cls: string): this {
+    this.classes.push(cls);
     return this;
   }
   setDisabled(v = true): this {

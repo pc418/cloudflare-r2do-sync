@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach } from "vitest";
 import { ConflictReportModal } from "../src/main";
-import { App, Notice, type FakeElement } from "./obsidian-fake";
+import { App, Modal, Notice, type FakeElement } from "./obsidian-fake";
 import type { ConflictInfo } from "../src/sync";
 import type { ConflictChoice } from "../src/conflict-resolve";
 
@@ -50,6 +50,62 @@ function open(
   return { modal, resolved, el, texts: () => el.texts() };
 }
 
+/** One per conflict, so a distinct pair per entry rather than two rows over one file. */
+function pair(name: string): ConflictInfo {
+  return conflict({ path: `${name}.md`, copy: `${name}.conflict.md` });
+}
+
+interface BatchHarness {
+  resolved: Array<{ path: string; choice: ConflictChoice }>;
+  el: FakeElement;
+  texts: () => string[];
+}
+
+/**
+ * The batch row needs what the single-choice harness does not: which files are on disk (that
+ * is what makes a choice blocked), a per-conflict failure, and a resolution that can be held
+ * open mid-batch.
+ */
+function openBatch(
+  conflicts: ConflictInfo[],
+  opts: {
+    present?: ReadonlySet<string>;
+    fails?: (info: ConflictInfo) => string | null;
+    gate?: Promise<void>;
+  } = {}
+): BatchHarness {
+  const resolved: Array<{ path: string; choice: ConflictChoice }> = [];
+  const modal = new ConflictReportModal(
+    new App() as never,
+    conflicts,
+    {
+      readText: async () => null,
+      resolve: async (info, choice) => {
+        if (opts.gate !== undefined) await opts.gate;
+        const failure = opts.fails?.(info) ?? null;
+        if (failure !== null) throw new Error(failure);
+        resolved.push({ path: info.path, choice });
+      },
+    },
+    opts.present ?? new Set()
+  );
+  modal.open();
+  const el = contentOf(modal);
+  return { resolved, el, texts: () => el.texts() };
+}
+
+function rowNamed(el: FakeElement, name: string) {
+  return el.log.rows.filter((r) => r.rendered.name === name);
+}
+
+function batchButton(el: FakeElement, text: string) {
+  return rowNamed(el, "Resolve all").flatMap((r) => r.buttons).find((b) => b.text === text)!;
+}
+
+function bodyOf(modal: Modal): FakeElement {
+  return modal.contentEl as unknown as FakeElement;
+}
+
 /** The diff is drawn from an awaited read, so let those microtasks run. */
 const settle = async () => {
   for (let i = 0; i < 8; i++) await Promise.resolve();
@@ -57,6 +113,7 @@ const settle = async () => {
 
 beforeEach(() => {
   Notice.shown.length = 0;
+  Modal.shown.length = 0;
 });
 
 describe("conflict view", () => {
@@ -109,25 +166,30 @@ describe("conflict view", () => {
     expect(theirsNewer).toContain("LATEST");
   });
 
-  it("offers the newer side first, as the default button", () => {
-    const { el } = open([conflict()]);
-    const buttons = el.log.rows.flatMap((r) => r.buttons);
-    const labels = buttons.map((b) => b.text);
-    expect(labels.slice(0, 4)).toEqual([
-      "This device",
-      "Other device",
-      "Both files",
-      "Combine into one",
-    ]);
-    expect(buttons[0].cta).toBe(true);
-    expect(buttons[1].cta).toBe(false);
+  // A row whose buttons move between entries is a row where a click aimed at one choice lands
+  // on another — and the four here delete files.
+  it("keeps the buttons in the same position whichever side is newer", () => {
+    const fixed = ["This device", "Other device", "Both files", "Combine into one"];
+    for (const c of [
+      conflict(),
+      conflict({ ours: { mtime: 1, size: 1 }, theirs: { mtime: 9, size: 1 } }),
+    ]) {
+      const { el } = open([c]);
+      expect(rowNamed(el, "Keep")[0].buttons.map((b) => b.text)).toEqual(fixed);
+    }
   });
 
-  it("puts the other device first when it holds the newer edit", () => {
-    const { el } = open([conflict({ ours: { mtime: 1, size: 1 }, theirs: { mtime: 9, size: 1 } })]);
-    const buttons = el.log.rows.flatMap((r) => r.buttons);
-    expect(buttons.map((b) => b.text).slice(0, 2)).toEqual(["Other device", "This device"]);
-    expect(buttons[0].cta).toBe(true);
+  it("highlights the newer side in place", () => {
+    const mine = rowNamed(open([conflict()]).el, "Keep")[0].buttons;
+    expect(mine[0].classes).toContain("r2do-newer");
+    expect(mine[1].classes).not.toContain("r2do-newer");
+
+    const theirs = rowNamed(
+      open([conflict({ ours: { mtime: 1, size: 1 }, theirs: { mtime: 9, size: 1 } })]).el,
+      "Keep"
+    )[0].buttons;
+    expect(theirs[1].classes).toContain("r2do-newer");
+    expect(theirs[0].classes).not.toContain("r2do-newer");
   });
 
   it("draws the difference between the two versions", async () => {
@@ -239,6 +301,100 @@ describe("conflict view", () => {
     await settle();
 
     expect(calls).toEqual(["keep-mine"]);
+  });
+
+  it("offers batch resolution only when there is more than one conflict", () => {
+    expect(rowNamed(openBatch([pair("a")]).el, "Resolve all")).toEqual([]);
+
+    const many = openBatch([pair("a"), pair("b")]).el;
+    expect(rowNamed(many, "Resolve all")[0].buttons.map((b) => b.text)).toEqual([
+      "All this device",
+      "All other device",
+      "All keep both",
+    ]);
+  });
+
+  // Deleting one side of every conflict at once is exactly the press that has to be asked
+  // about, and the dialog names the files rather than counting them.
+  it("resolves every conflict with this device's version in one click", async () => {
+    const h = openBatch([pair("a"), pair("b")]);
+    await batchButton(h.el, "All this device").click();
+
+    const asked = bodyOf(Modal.shown.at(-1)!);
+    expect(asked.texts().join(" ")).toContain("a.md");
+    expect(asked.texts().join(" ")).toContain("b.md");
+    expect(h.resolved).toEqual([]);
+
+    const buttons = asked.log.rows.at(-1)!.buttons;
+    expect(buttons.map((b) => b.text)).toEqual(["Resolve all", "Cancel"]);
+    await buttons[0].click();
+    await settle();
+
+    expect(h.resolved).toEqual([
+      { path: "a.md", choice: "keep-mine" },
+      { path: "b.md", choice: "keep-mine" },
+    ]);
+    expect(h.texts().join(" ")).toContain("All resolved");
+  });
+
+  it("skips conflicts a batch choice cannot resolve and says so", async () => {
+    // "b.md" is gone, which is the side "keep this device" needs for that pair.
+    const h = openBatch([pair("a"), pair("b")], {
+      present: new Set(["a.md", "a.conflict.md", "b.conflict.md"]),
+    });
+    await batchButton(h.el, "All this device").click();
+    await bodyOf(Modal.shown.at(-1)!).log.rows.at(-1)!.buttons[0].click();
+    await settle();
+
+    expect(h.resolved).toEqual([{ path: "a.md", choice: "keep-mine" }]);
+    expect(Notice.shown.join(" ")).toContain("1 skipped");
+    expect(h.texts().join(" ")).toContain("b.md");
+  });
+
+  // One gone file must not be the reason the rest of the list stays outstanding.
+  it("keeps a conflict listed when its batch resolution fails and continues with the rest", async () => {
+    const h = openBatch([pair("a"), pair("b")], {
+      fails: (info) => (info.path === "a.md" ? "a.md is gone" : null),
+    });
+    await batchButton(h.el, "All keep both").click();
+    await settle();
+
+    expect(h.resolved).toEqual([{ path: "b.md", choice: "keep-both" }]);
+    const said = h.texts().join(" ");
+    expect(said).toContain("a.md");
+    expect(said).not.toContain("b.md");
+    expect(Notice.shown.join(" ")).toContain("1 failed");
+    expect(Notice.shown.join(" ")).toContain("a.md is gone");
+  });
+
+  it("ignores clicks while a batch is running", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const h = openBatch([pair("a"), pair("b")], { gate });
+
+    const running = batchButton(h.el, "All keep both").click() as Promise<void>;
+    const asked = Modal.shown.length;
+    await batchButton(h.el, "All this device").click();
+    // Not even the confirmation: a second batch queued behind the first would resolve pairs
+    // the first one has already taken off the list.
+    expect(Modal.shown.length).toBe(asked);
+
+    release();
+    await running;
+    await settle();
+    expect(h.resolved.map((r) => r.choice)).toEqual(["keep-both", "keep-both"]);
+  });
+
+  // Keeping both writes nothing away, so there is nothing to confirm.
+  it("asks nothing before keeping both everywhere, and clears the list", async () => {
+    const h = openBatch([pair("a"), pair("b")]);
+    const before = Modal.shown.length;
+    await batchButton(h.el, "All keep both").click();
+    await settle();
+
+    expect(Modal.shown.length).toBe(before);
+    expect(h.resolved.map((r) => r.path)).toEqual(["a.md", "b.md"]);
+    expect(h.texts().join(" ")).toContain("All resolved");
   });
 
   it("still lists every conflict when opened without the resolution actions", () => {

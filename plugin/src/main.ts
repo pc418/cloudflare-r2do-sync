@@ -3754,9 +3754,10 @@ function fmtBytes(n: number): string {
  * The conflict view: what disagreed, and what to do about it.
  *
  * A pass has already parked the losing version, so every choice offered here is reversible right
- * up to the moment it is taken and nothing is lost by looking first. The newer side is marked and
- * its button is the default, because "which of these did I write last" is the question a user
- * actually has.
+ * up to the moment it is taken and nothing is lost by looking first. "Which of these did I write
+ * last" is the question a user actually has, so the newer side is marked — but the four buttons
+ * stay in one order whichever side that is. A row whose buttons move between entries is a row
+ * where the click that was aimed at one choice lands on another.
  */
 export class ConflictReportModal extends Modal {
   /** Its own list: resolving one removes it here, and the plugin keeps its own record. */
@@ -3827,6 +3828,9 @@ export class ConflictReportModal extends Modal {
             "versions are on this device you can pick one, or combine them into a single " +
             "file; each entry says what it has.",
     });
+
+    // One conflict is a row's worth of work, so the batch only earns its space past that.
+    if (this.actions !== null && outstanding.length >= 2) this.#renderBatch(contentEl, outstanding);
 
     const now = Date.now();
     for (const c of outstanding) {
@@ -3909,7 +3913,7 @@ export class ConflictReportModal extends Modal {
 
   #renderChoices(box: HTMLElement, c: ConflictInfo, newer: "mine" | "theirs"): void {
     const row = new Setting(box).setName("Keep");
-    const button = (text: string, choice: ConflictChoice, cta: boolean) =>
+    const button = (text: string, choice: ConflictChoice, latest: boolean) =>
       row.addButton((b) => {
         const blocked = this.#blocked(c, choice);
         if (blocked !== null) b.setDisabled(true).setTooltip(blocked);
@@ -3950,18 +3954,142 @@ export class ConflictReportModal extends Modal {
             this.#busy = false;
           }
         });
-        if (cta) b.setCta();
+        // A highlight, not a position: the four choices sit in the same places on every row,
+        // so pressing one is muscle memory rather than a re-read of which side is which.
+        if (latest) b.setClass("r2do-newer");
       });
 
-    button(newer === "mine" ? "This device" : "Other device", newer === "mine" ? "keep-mine" : "keep-theirs", true);
-    button(newer === "mine" ? "Other device" : "This device", newer === "mine" ? "keep-theirs" : "keep-mine", false);
+    button("This device", "keep-mine", newer === "mine");
+    button("Other device", "keep-theirs", newer === "theirs");
     button("Both files", "keep-both", false);
     button("Combine into one", "combine", false);
+  }
+
+  /**
+   * The same three choices, applied to the whole list.
+   *
+   * The eligible set is fixed when the row is drawn, which is also what the confirmation lists:
+   * a batch has to say up front exactly which files it is about, and a set recomputed later
+   * would not be the set the user agreed to.
+   */
+  #renderBatch(container: HTMLElement, outstanding: readonly ConflictInfo[]): void {
+    const row = new Setting(container).setName("Resolve all");
+    const button = (text: string, choice: ConflictChoice, confirm: BatchConfirm | null) =>
+      row.addButton((b) => {
+        // `isResolvable` as well as `#blocked`: the disk check may never have run, and a pair
+        // whose loser an overwrite mode discarded offers no row buttons either.
+        const targets = outstanding.filter(
+          (c) => isResolvable(c) && this.#blocked(c, choice) === null
+        );
+        if (targets.length === 0) {
+          b.setDisabled(true).setTooltip(
+            "Nothing in this list can be resolved that way at the moment."
+          );
+        }
+        this.#choiceButtons.push(b);
+        b.setButtonText(text).onClick(async () => {
+          // The fake used in tests fires a disabled button's handler, and a batch that cannot
+          // touch anything must not report having resolved nothing.
+          if (targets.length === 0) return;
+          if (this.#busy) return;
+          if (confirm === null) {
+            await this.#runBatch(b, choice, targets);
+            return;
+          }
+          // Nothing is disabled and nothing is claimed yet: the window has to come back intact
+          // if this is refused, so `#busy` is taken inside `#runBatch` and only on approval.
+          new ConfirmModal(this.app, {
+            title: confirm.title,
+            body: confirm.body,
+            list: targets.map((c) => c.path),
+            confirmText: "Resolve all",
+            onConfirm: () => this.#runBatch(b, choice, targets),
+          }).open();
+        });
+      });
+
+    button("All this device", "keep-mine", {
+      title: "Keep this device's version of every conflict?",
+      body: [
+        "Every conflict listed here is resolved with the version from this device. The other " +
+          "device's version of each one is deleted from the vault.",
+        "Those versions stay in snapshot history until it is collected, but nothing is undone " +
+          "for you.",
+      ],
+    });
+    button("All other device", "keep-theirs", {
+      title: "Keep the other device's version of every conflict?",
+      body: [
+        "Every conflict listed here is resolved with the version from the other device. This " +
+          "device's version of each one is deleted from the vault.",
+        "An edit made here that was never synced exists nowhere else, so it cannot be brought " +
+          "back from history.",
+      ],
+    });
+    button("All keep both", "keep-both", null);
+  }
+
+  /**
+   * Runs one choice across the list, one conflict at a time.
+   *
+   * Sequential on purpose: each resolution queues on the plugin's exclusive lane anyway, and a
+   * failure part-way has to leave the conflicts it did not reach exactly as they were. A single
+   * failure is counted and the loop carries on — stopping would make one gone file the reason
+   * the other eleven stayed listed.
+   */
+  async #runBatch(
+    pressed: ButtonComponent,
+    choice: ConflictChoice,
+    targets: readonly ConflictInfo[]
+  ): Promise<void> {
+    if (this.#busy) return;
+    this.#busy = true;
+    // Synchronously, in the same tick as the click that got here: the first resolution can wait
+    // on a whole sync pass, and a window unchanged after a press reads as a dead button.
+    for (const other of this.#choiceButtons) other.setDisabled(true);
+    const skipped = this.#conflicts.length - targets.length;
+    let resolved = 0;
+    let failed = 0;
+    let firstFailure: string | null = null;
+    try {
+      let attempt = 0;
+      for (const c of targets) {
+        attempt += 1;
+        pressed.setButtonText(`Resolving ${attempt}/${targets.length}…`);
+        try {
+          await this.actions!.resolve(c, choice);
+          this.#conflicts = this.#conflicts.filter((other) => other !== c);
+          resolved += 1;
+        } catch (e) {
+          failed += 1;
+          firstFailure ??= message(e);
+        }
+      }
+      const parts = [`${resolved} resolved`];
+      if (skipped > 0) parts.push(`${skipped} skipped`);
+      if (failed > 0) parts.push(`${failed} failed`);
+      new Notice(
+        `R2DO Sync: ${parts.join(", ")}.` +
+          (firstFailure === null ? "" : ` First failure: ${firstFailure}`),
+        failed > 0 || skipped > 0 ? 10_000 : 8000
+      );
+    } finally {
+      this.#busy = false;
+      // Rebuilt rather than re-enabled: `#render` is what decides which choices are possible at
+      // all, and the ones that just succeeded are gone from the list.
+      this.#render();
+    }
   }
 
   onClose(): void {
     this.contentEl.empty();
   }
+}
+
+/** What a batch that deletes one side's files has to say before it runs. */
+interface BatchConfirm {
+  title: string;
+  body: readonly string[];
 }
 
 /**

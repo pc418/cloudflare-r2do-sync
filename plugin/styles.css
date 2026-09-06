@@ -51,6 +51,16 @@
 }
 
 /*
+ * Which side was edited last, said in colour. Owner-specified purple, and a highlight rather
+ * than an order: the four choice buttons keep the same positions on every conflict, so only
+ * the colour moves between them.
+ */
+.r2do-newer {
+  background-color: var(--color-purple);
+  color: var(--text-on-accent);
+}
+
+/*
  * The self-hosting disclaimer on the first-run panel. Muted and set apart, because it has to
  * be readable without competing with the two setup routes it sits under.
  */
