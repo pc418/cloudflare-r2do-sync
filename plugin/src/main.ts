@@ -3299,6 +3299,10 @@ export class HistoryModal extends Modal {
     const list = this.#listEl;
     if (list === null) return;
     const generation = ++this.#generation;
+    // Dropped before the request, not after: a filter keystroke while this fetch is in flight
+    // must keep "Loading…" rather than redraw a listing the controls no longer describe — and
+    // a redraw here would detach `status`, leaving a failure with nowhere visible to land.
+    this.#last = null;
     list.empty();
     const status = list.createEl("p", { text: "Loading…" });
 
@@ -3398,12 +3402,20 @@ export class HistoryModal extends Modal {
       unsearchable === 0
         ? ""
         : ` ${unsearchable} row(s) could not be searched — their changes are unknown.`;
+    // With unsearchable rows in the list, "no listed row changed it" would judge exactly the
+    // rows nobody could read. The claim shrinks to the rows that were actually searched.
+    const searched =
+      unsearchable === 0
+        ? `listed row(s)`
+        : `row(s) that could be searched`;
     const head =
       matched.length === 0
-        ? `No listed row changed a file whose path contains “${this.#filter}”.`
-        : `${matched.length} of ${listing.rows.length} listed row(s) changed a file whose ` +
-          `path contains “${this.#filter}”.`;
-    return head + scope + unknown;
+        ? `${unsearchable === 0 ? "No listed row" : "None of the rows that could be searched"} ` +
+          `changed a file whose path contains “${this.#filter}”.`
+        : `${matched.length} of ${listing.rows.length - unsearchable} ${searched} changed a ` +
+          `file whose path contains “${this.#filter}”.`;
+    const note = this.#fallbackNote(listing);
+    return head + scope + unknown + (note === null ? "" : ` ${note}`);
   }
 
   /** Why a listing came back with nothing, distinguishing the reasons rather than guessing. */
@@ -3437,26 +3449,33 @@ export class HistoryModal extends Modal {
     const retention =
       " Older snapshots are removed by the server's retention policy, so this list can be " +
       "shorter than the vault's full history.";
+    const note = this.#fallbackNote(listing);
+    return note === null ? unit + retention : `${unit} ${note}${retention}`;
+  }
+
+  /**
+   * What the listing could not do, said the same way whether or not a filter is on. Filtering
+   * must not swallow this: rows drawn flat under a Day/Week control, or dates that were never
+   * searched, need explaining exactly as much once a filter narrows them.
+   */
+  #fallbackNote(listing: HistoryListing): string | null {
     if (listing.fallback === "no-range") {
       return (
-        `${unit} This vault's history index cannot be read, so dates could not be searched: ` +
-        `only the most recent syncs were looked at, and anything older than those is not shown ` +
-        `whether or not it falls in the range.${retention}`
+        "This vault's history index cannot be read, so dates could not be searched: " +
+        "only the most recent syncs were looked at, and anything older than those is not shown " +
+        "whether or not it falls in the range."
       );
     }
     if (listing.fallback === "no-index") {
       return (
-        `${unit} Grouping needs the server's history index, which this vault has not finished ` +
-        `building, so every sync is listed instead.${retention}`
+        "Grouping needs the server's history index, which this vault has not finished " +
+        "building, so every sync is listed instead."
       );
     }
     if (listing.fallback === "no-cursor") {
-      return (
-        `${unit} This server is too old to page further back, so the list stops at its first ` +
-        `page.${retention}`
-      );
+      return "This server is too old to page further back, so the list stops at its first page.";
     }
-    return unit + retention;
+    return null;
   }
 
   #renderRow(list: HTMLElement, snap: SnapshotInfo): void {

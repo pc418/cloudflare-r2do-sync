@@ -636,6 +636,88 @@ describe("the history window", () => {
     expect(names[0]).toContain("laptop");
   });
 
+  // The cache is dropped when a fetch starts: a keystroke mid-fetch redrawing the previous
+  // listing would show rows the controls no longer describe, and detach the element the
+  // fetch's failure would land on — stale rows shown, error invisible.
+  it("holds the loading state instead of redrawing rows the controls no longer describe", async () => {
+    let calls = 0;
+    let reject: (e: Error) => void = () => {};
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async () => {
+          calls++;
+          if (calls === 1) {
+            return listing([snapshot({ changes: changedFiles(["Recipes/soup.md"]) })]);
+          }
+          return await new Promise<HistoryListing>((_resolve, rej) => {
+            reject = rej;
+          });
+        },
+      })
+    );
+    modal.open();
+    await settle();
+
+    const mark = rowsMark(modal);
+    controlOf(modal, "Group by").dropdowns[0].change("week");
+    await settle();
+    controlOf(modal, "Changed file").texts[0].change("recipes");
+    await settle();
+
+    expect(rowsSince(modal, mark)).toHaveLength(0);
+    expect(contentOf(modal).texts().join(" ")).toContain("Loading…");
+
+    reject(new Error("offline"));
+    await settle();
+    expect(contentOf(modal).texts().join(" ")).toContain("Could not read history: offline");
+  });
+
+  it("keeps saying why the rows are not grouped while a filter is on", async () => {
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async () =>
+          listing([snapshot({ changes: changedFiles(["Recipes/soup.md"]) })], {
+            fallback: "no-index",
+          }),
+      })
+    );
+    modal.open();
+    await settle();
+
+    controlOf(modal, "Changed file").texts[0].change("recipes");
+    await settle();
+
+    // Flat sync rows under a Day/Week control still need their explanation; a filter narrows
+    // the rows, not the listing's confession of what it could not do.
+    expect(contentOf(modal).texts().join(" ")).toContain("Grouping needs the server's history index");
+  });
+
+  it("does not judge unsearchable rows when nothing searchable matched", async () => {
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async () =>
+          listing([
+            snapshot({ id: "01A", changes: changedFiles(["Journal/2026.md"]) }),
+            snapshot({ id: "01B", device: "phone", changes: { unknown: "parent-missing" } }),
+          ]),
+      })
+    );
+    modal.open();
+    await settle();
+
+    controlOf(modal, "Changed file").texts[0].change("recipes");
+    await settle();
+
+    const texts = contentOf(modal).texts().join(" ");
+    // "No listed row changed it" would judge exactly the row nobody could read.
+    expect(texts).toContain("None of the rows that could be searched");
+    expect(texts).not.toContain("No listed row");
+    expect(texts).toContain("1 row(s) could not be searched");
+  });
+
   it("asks where to put a file whose own path may not be written to", async () => {
     const calls: Calls = { restore: [], restoreAll: [], syncs: 0, granularity: [] };
     const modal = new SnapshotModal(new App() as never, deps({
