@@ -12,6 +12,7 @@ import type {
   HistoryListing,
   RestoreInspection,
   RestoreOutcome,
+  SnapshotChanges,
   SnapshotInfo,
 } from "../src/sync";
 import type { HistoryGranularity } from "../src/history-groups";
@@ -23,10 +24,24 @@ function contentOf(modal: object): FakeElement {
 }
 
 /** The window's controls sit in the same render log as its rows; these are the controls. */
-const CONTROLS = new Set(["Group by", "Between"]);
+const CONTROLS = new Set(["Group by", "Between", "Changed file"]);
 
 function rowsOf(modal: object): Setting[] {
   return contentOf(modal).log.rows.filter((r) => !CONTROLS.has(r.rendered.name));
+}
+
+/**
+ * Rows drawn since a mark taken from `rowsMark`. The list is a nested div, so emptying it to
+ * redraw does not clear the render log — every redraw appends, and only the tail is on screen.
+ */
+function rowsMark(modal: object): number {
+  return contentOf(modal).log.rows.length;
+}
+
+function rowsSince(modal: object, mark: number): Setting[] {
+  return contentOf(modal)
+    .log.rows.slice(mark)
+    .filter((r) => !CONTROLS.has(r.rendered.name));
 }
 
 function controlOf(modal: object, name: string): Setting {
@@ -58,6 +73,21 @@ function snapshot(over: Partial<SnapshotInfo> = {}): SnapshotInfo {
     fileCount: 3,
     readable: true,
     ...over,
+  };
+}
+
+/** A snapshot that changed exactly these paths; the totals are whatever makes them consistent. */
+function changedFiles(paths: string[]): SnapshotChanges {
+  return {
+    files: paths.map((path) => ({ path, kind: "modified", bytes: 10, lines: 2 })),
+    added: 0,
+    removed: 0,
+    modified: paths.length,
+    bytes: 10 * paths.length,
+    linesAdded: 2 * paths.length,
+    linesRemoved: 0,
+    linesUnknown: 0,
+    initial: false,
   };
 }
 
@@ -443,6 +473,167 @@ describe("the history window", () => {
     const texts = contentOf(modal).texts().join(" ");
     expect(texts).toContain("No snapshots in that range");
     expect(texts).not.toContain("no snapshots yet");
+  });
+
+  it("greps the listed rows by changed filename without asking the server again", async () => {
+    let calls = 0;
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async () => {
+          calls++;
+          return listing([
+            snapshot({ id: "01A", device: "laptop", changes: changedFiles(["Recipes/soup.md"]) }),
+            snapshot({ id: "01B", device: "phone", changes: changedFiles(["Journal/2026.md"]) }),
+          ]);
+        },
+      })
+    );
+    modal.open();
+    await settle();
+    expect(rowsOf(modal)).toHaveLength(2);
+
+    const mark = rowsMark(modal);
+    // The padding and the capitals are the typist's; neither is part of any path.
+    controlOf(modal, "Changed file").texts[0].change("  ReCiPeS  ");
+    await settle();
+
+    const names = rowsSince(modal, mark).map((r) => r.rendered.name);
+    expect(names).toHaveLength(1);
+    expect(names[0]).toContain("laptop");
+    // Filtering is a question about the rows already in hand, never a second request.
+    expect(calls).toBe(1);
+  });
+
+  it("clears the filter back to the full list without a new fetch", async () => {
+    let calls = 0;
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async () => {
+          calls++;
+          return listing([
+            snapshot({ id: "01A", device: "laptop", changes: changedFiles(["Recipes/soup.md"]) }),
+            snapshot({ id: "01B", device: "phone", changes: changedFiles(["Journal/2026.md"]) }),
+          ]);
+        },
+      })
+    );
+    modal.open();
+    await settle();
+
+    const filter = controlOf(modal, "Changed file").texts[0];
+    filter.change("recipes");
+    await settle();
+
+    const mark = rowsMark(modal);
+    filter.change("");
+    await settle();
+
+    expect(rowsSince(modal, mark)).toHaveLength(2);
+    expect(calls).toBe(1);
+  });
+
+  it("does not claim an unsearchable row did not match", async () => {
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async () =>
+          listing([
+            snapshot({ id: "01A", device: "laptop", changes: changedFiles(["Recipes/soup.md"]) }),
+            snapshot({ id: "01B", device: "phone", changes: { unknown: "parent-missing" } }),
+          ]),
+      })
+    );
+    modal.open();
+    await settle();
+
+    const mark = rowsMark(modal);
+    controlOf(modal, "Changed file").texts[0].change("recipes");
+    await settle();
+
+    const names = rowsSince(modal, mark).map((r) => r.rendered.name);
+    expect(names).toHaveLength(1);
+    expect(names[0]).toContain("laptop");
+    // Dropping the row is fine; letting it read as a row that held no such file is not.
+    expect(contentOf(modal).texts().join(" ")).toContain("1 row(s) could not be searched");
+  });
+
+  it("surfaces the matching file in the preview past the cap", async () => {
+    const paths = ["a.md", "b.md", "c.md", "d.md", "e.md", "f.md", "Recipes/soup.md"];
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async () => listing([snapshot({ changes: changedFiles(paths) })]),
+      })
+    );
+    modal.open();
+    await settle();
+    // Seventh of seven, well past the preview cap: unfiltered, it is not on screen.
+    expect(contentOf(modal).texts().join(" ")).not.toContain("Recipes/soup.md");
+
+    controlOf(modal, "Changed file").texts[0].change("recipes");
+    await settle();
+
+    const texts = contentOf(modal).texts().join(" ");
+    // The file the row was kept for has to be the one the row shows.
+    expect(texts).toContain("Recipes/soup.md");
+    expect(texts).toContain("…and 2 more");
+  });
+
+  it("says no listed rows matched rather than that the vault has none", async () => {
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async () =>
+          listing([snapshot({ changes: changedFiles(["Journal/2026.md"]) })], { more: true }),
+      })
+    );
+    modal.open();
+    await settle();
+
+    controlOf(modal, "Changed file").texts[0].change("recipes");
+    await settle();
+
+    const texts = contentOf(modal).texts().join(" ");
+    expect(texts).toContain("No listed row changed a file");
+    // A miss in a list cut short is not a miss in the vault, and must not read as one.
+    expect(texts).toContain("Only the rows listed here were searched");
+    expect(texts).not.toContain("no snapshots");
+  });
+
+  it("keeps the filter across a granularity change", async () => {
+    let calls = 0;
+    const modal = new HistoryModal(
+      new App() as never,
+      deps({
+        listHistory: async (_limit, opts) => {
+          calls++;
+          const granularity = opts?.granularity ?? "sync";
+          return listing(
+            [
+              snapshot({ id: "01A", device: "laptop", changes: changedFiles(["Recipes/soup.md"]) }),
+              snapshot({ id: "01B", device: "phone", changes: changedFiles(["Journal/2026.md"]) }),
+            ],
+            { granularity }
+          );
+        },
+      })
+    );
+    modal.open();
+    await settle();
+
+    controlOf(modal, "Changed file").texts[0].change("recipes");
+    await settle();
+
+    const mark = rowsMark(modal);
+    controlOf(modal, "Group by").dropdowns[0].change("week");
+    await settle();
+
+    expect(calls).toBe(2);
+    const names = rowsSince(modal, mark).map((r) => r.rendered.name);
+    expect(names).toHaveLength(1);
+    expect(names[0]).toContain("laptop");
   });
 
   it("asks where to put a file whose own path may not be written to", async () => {

@@ -3195,10 +3195,17 @@ export class HistoryModal extends Modal {
   #granularity: HistoryGranularity;
   #from = "";
   #to = "";
+  /** Lower-cased and trimmed, so it is compared the way the paths it is matched against are. */
+  #filter = "";
   /** Redrawn on every control change; the controls above it are built once and left alone. */
   #listEl: HTMLElement | null = null;
   /** Guards against a slow listing landing after a newer one the user asked for. */
   #generation = 0;
+  /**
+   * What the server last answered, kept so filtering redraws the rows already in hand. The
+   * filter is a question about this list, not a different one to ask the server.
+   */
+  #last: { listing: HistoryListing; ranged: boolean } | { error: string } | null = null;
 
   constructor(
     app: App,
@@ -3214,7 +3221,7 @@ export class HistoryModal extends Modal {
     contentEl.createEl("h2", { text: "Snapshot history" });
     this.#renderControls(contentEl);
     this.#listEl = contentEl.createDiv();
-    await this.#renderList();
+    await this.#fetchList();
   }
 
   #renderControls(contentEl: HTMLElement): void {
@@ -3233,7 +3240,7 @@ export class HistoryModal extends Modal {
           if (!isHistoryGranularity(value)) return;
           this.#granularity = value;
           this.deps.rememberGranularity(value);
-          void this.#renderList();
+          void this.#fetchList();
         });
       });
 
@@ -3256,6 +3263,20 @@ export class HistoryModal extends Modal {
           this.#setRange("to", value);
         });
       });
+
+    new Setting(contentEl)
+      .setName("Changed file")
+      .setDesc(
+        "Keeps only the rows that changed a file whose path contains this. It searches the " +
+          "rows listed below, not the whole history."
+      )
+      .addText((t) => {
+        t.setPlaceholder("Path contains…");
+        t.onChange((v) => {
+          this.#filter = v.trim().toLowerCase();
+          this.#draw();
+        });
+      });
   }
 
   /**
@@ -3270,10 +3291,11 @@ export class HistoryModal extends Modal {
     if (which === "from") this.#from = value;
     else this.#to = value;
     if (parseDateField(value) === before) return;
-    void this.#renderList();
+    void this.#fetchList();
   }
 
-  async #renderList(): Promise<void> {
+  /** Asks the server for a listing and draws it. Only the granularity and the dates get here. */
+  async #fetchList(): Promise<void> {
     const list = this.#listEl;
     if (list === null) return;
     const generation = ++this.#generation;
@@ -3292,6 +3314,7 @@ export class HistoryModal extends Modal {
       listing = await this.deps.listHistory(this.deps.historyLimit, opts);
     } catch (e) {
       if (generation !== this.#generation) return;
+      this.#last = { error: `Could not read history: ${message(e)}` };
       status.setText(`Could not read history: ${message(e)}`);
       return;
     }
@@ -3299,15 +3322,36 @@ export class HistoryModal extends Modal {
     // navigated away from, under controls that no longer describe it.
     if (generation !== this.#generation) return;
 
+    this.#last = { listing, ranged: from !== null || to !== null };
+    this.#draw();
+  }
+
+  /** Draws the last listing under the filter as it stands now. Never asks the server anything. */
+  #draw(): void {
+    const list = this.#listEl;
+    const last = this.#last;
+    if (list === null || last === null) return;
+    list.empty();
+    if ("error" in last) {
+      list.createEl("p", { text: last.error });
+      return;
+    }
+
+    const { listing, ranged } = last;
+    const status = list.createEl("p", { text: "" });
+    const rows = this.#filter === "" ? listing.rows : this.#matches(listing.rows);
+
     if (listing.rows.length === 0) {
       // Three different truths, and only one of them is "this vault is new". Saying that for
       // either of the others would tell someone their history is gone when it is not.
-      status.setText(this.#emptyLine(listing, from !== null || to !== null));
+      status.setText(this.#emptyLine(listing, ranged));
       return;
     }
-    status.setText(this.#summaryLine(listing));
+    status.setText(
+      this.#filter === "" ? this.#summaryLine(listing) : this.#filteredLine(listing, rows)
+    );
 
-    for (const snap of listing.rows) this.#renderRow(list, snap);
+    for (const snap of rows) this.#renderRow(list, snap);
 
     if (listing.more) {
       list.createEl("p", {
@@ -3316,6 +3360,50 @@ export class HistoryModal extends Modal {
           "or narrow the dates, to reach them.",
       });
     }
+  }
+
+  /**
+   * What a row lists as changed, or null when that cannot be known — an unreadable snapshot,
+   * a diff that could not be computed, or a listing fetched without diffs at all.
+   */
+  #searchable(snap: SnapshotInfo): SnapshotChanges | null {
+    const changes = snap.changes;
+    if (!snap.readable || changes === undefined || "unknown" in changes) return null;
+    return changes;
+  }
+
+  /** Rows that changed a matching path. A row nothing can be told about is not one of them. */
+  #matches(rows: SnapshotInfo[]): SnapshotInfo[] {
+    return rows.filter((snap) => {
+      const changes = this.#searchable(snap);
+      if (changes === null) return false;
+      return changes.files.some((f) => f.path.toLowerCase().includes(this.#filter));
+    });
+  }
+
+  /**
+   * What a filtered list is, and what it could not look at.
+   *
+   * A row whose changes are unknown is dropped without being judged: counting it as a
+   * non-match would say a file is absent from a snapshot nobody could read.
+   */
+  #filteredLine(listing: HistoryListing, matched: SnapshotInfo[]): string {
+    const unsearchable = listing.rows.filter((snap) => this.#searchable(snap) === null).length;
+    // A listing cut short searched only what it holds, so a miss here is not a miss in the vault.
+    const scope =
+      listing.more || listing.fallback !== undefined
+        ? " Only the rows listed here were searched; older snapshots were not."
+        : "";
+    const unknown =
+      unsearchable === 0
+        ? ""
+        : ` ${unsearchable} row(s) could not be searched — their changes are unknown.`;
+    const head =
+      matched.length === 0
+        ? `No listed row changed a file whose path contains “${this.#filter}”.`
+        : `${matched.length} of ${listing.rows.length} listed row(s) changed a file whose ` +
+          `path contains “${this.#filter}”.`;
+    return head + scope + unknown;
   }
 
   /** Why a listing came back with nothing, distinguishing the reasons rather than guessing. */
@@ -3397,7 +3485,7 @@ export class HistoryModal extends Modal {
     const changes = snap.changes;
     if (changes === undefined || "unknown" in changes || changes.files.length === 0) return;
     const files = list.createDiv();
-    for (const change of changes.files.slice(0, CHANGE_PREVIEW)) {
+    for (const change of this.#previewOrder(changes.files).slice(0, CHANGE_PREVIEW)) {
       files.createEl("p", { text: describeChangedFile(change) });
     }
     if (changes.files.length > CHANGE_PREVIEW) {
@@ -3405,6 +3493,16 @@ export class HistoryModal extends Modal {
         text: `…and ${changes.files.length - CHANGE_PREVIEW} more — Browse to see them all.`,
       });
     }
+  }
+
+  /**
+   * Under a filter, the matching paths lead. The preview is capped, so otherwise a row could
+   * be listed for a file the cap hides, leaving nothing on screen to explain why it is there.
+   */
+  #previewOrder(files: SnapshotChange[]): SnapshotChange[] {
+    if (this.#filter === "") return files;
+    const hit = (f: SnapshotChange): boolean => f.path.toLowerCase().includes(this.#filter);
+    return [...files.filter(hit), ...files.filter((f) => !hit(f))];
   }
 
   onClose(): void {
