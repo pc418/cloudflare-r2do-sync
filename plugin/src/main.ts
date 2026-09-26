@@ -544,6 +544,21 @@ export default class LogSyncPlugin extends Plugin {
   /** The live periodic-sync timer and the interval it was built from, so a change can replace it. */
   #autoSyncTimer: number | null = null;
   #autoSyncMinutes = 0;
+  /**
+   * Whether Obsidian's layout is ready, which is when automatic sync may start.
+   *
+   * Before it, the vault is still loading and fires `create` for every existing file (see
+   * `Vault.on("create")` in obsidian.d.ts), so a vault event is not evidence of an edit. Those
+   * events used to schedule an ordinary debounced pass, which then ran in the middle of the
+   * app's own startup whenever layout took longer than the debounce — and ran with "Sync on
+   * startup" off. Only automatic triggers wait for this; a sync the user starts does not.
+   */
+  #layoutReady = false;
+  /**
+   * A vault event arrived before layout-ready. It cannot be told apart from the load burst, so
+   * instead of a pass it leaves a full audit owed, which the next pass of any kind pays.
+   */
+  #auditOwedBeforeReady = false;
 
   #log: SyncLogEntry[] = [];
   #lastSuccessAt: number | undefined;
@@ -704,6 +719,10 @@ export default class LogSyncPlugin extends Plugin {
       // While a decision is pending, an automatic pass would re-run the whole plan and
       // silently re-park it. Manual syncs still work — that is how the user answers.
       if (this.#phase === "decision") return;
+      if (!this.#layoutReady) {
+        this.#auditOwedBeforeReady = true;
+        return;
+      }
       this.#engine?.markDirty(paths, { fullScan });
       this.#scheduler?.notifyChange();
     };
@@ -720,9 +739,19 @@ export default class LogSyncPlugin extends Plugin {
 
     this.#restartAutoSyncTimer();
 
-    if (this.settings.syncOnStartup) {
-      this.app.workspace.onLayoutReady(() => void this.#autoSync());
-    }
+    // One callback for the gate and the startup pass, in that order: the pass is the first
+    // automatic work the gate admits. `syncOnStartup` is read here, at layout-ready, so the
+    // user's choice is the one in force when the pass would start.
+    this.app.workspace.onLayoutReady(() => {
+      this.#layoutReady = true;
+      if (this.#auditOwedBeforeReady) {
+        this.#auditOwedBeforeReady = false;
+        // Not scheduled, only owed: with "Sync on startup" off nothing may start here, and
+        // with it on the startup pass below is already a full audit and pays this.
+        this.#engine?.markDirty([], { fullScan: true });
+      }
+      if (this.settings.syncOnStartup) void this.#autoSync();
+    });
 
     // Deferred to layout-ready: the status bar and the mobile nav bar are both Obsidian's own
     // chrome, and neither is in the DOM while `onload` runs.
@@ -792,6 +821,9 @@ export default class LogSyncPlugin extends Plugin {
    * a notice instead, and waits for a manual sync.
    */
   async #autoSync(): Promise<void> {
+    // The periodic timer and the mobile resume are registered during `onload`, so they can
+    // fire before layout-ready too; the startup pass above is what runs once it arrives.
+    if (!this.#layoutReady) return;
     if (!this.#scheduler || this.#phase === "decision") return;
     // The first-sync gate needs an answer, and an unattended pass has nobody to give one.
     if (

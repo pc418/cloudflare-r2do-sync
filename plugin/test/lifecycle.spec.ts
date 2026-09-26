@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import LogSyncPlugin, {
   continuityBody,
   DEFAULT_SETTINGS,
@@ -629,12 +629,25 @@ describe("registration and teardown", () => {
     );
     emptyVault(app);
     okServer();
+    // Resuming is something a running app does, so layout is ready and — with startup sync on
+    // — the startup pass has already run. The gap is measured from that pass, so the clock is
+    // moved on by exactly the time the caller says has passed since `lastPassAt`.
+    const sinceLastPass = Date.now() - lastPassAt;
     await plugin.onload();
-    requestUrlMock.calls.length = 0;
-    resumeHandler(plugin)();
+    layoutReady(app);
     await flush();
     await flush();
-    return requestUrlMock.calls.length;
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + sinceLastPass);
+    try {
+      requestUrlMock.calls.length = 0;
+      resumeHandler(plugin)();
+      await flush();
+      await flush();
+      return requestUrlMock.calls.length;
+    } finally {
+      clock.mockRestore();
+    }
   };
 
   it("registers the mobile resume handler only on mobile, and it respects its own gap", async () => {
@@ -716,7 +729,7 @@ function unrelatedHistoryServer(): void {
 }
 
 describe("continuity gate", () => {
-  const configured = () =>
+  const configured = (over: Partial<Settings> = {}) =>
     makePlugin(
       persisted({
         settings: {
@@ -724,15 +737,22 @@ describe("continuity gate", () => {
           firstSyncAcknowledged: true,
           retryAttempts: 0,
           intervalMinutes: 5,
+          ...over,
         },
       })
     );
 
   it("a timer pass answers nothing, changes nothing, and says so", async () => {
-    const { plugin, app } = configured();
+    // Startup sync off, so the tick is the first pass to meet the gap: a startup pass would
+    // have parked the question already, and the tick would rightly stay out of its way.
+    const { plugin, app } = configured({ syncOnStartup: false });
     emptyVault(app);
     unrelatedHistoryServer();
     await plugin.onload();
+    // A timer tick comes minutes into a running app, long after layout-ready.
+    layoutReady(app);
+    await flush();
+    await flush();
     Notice.shown.length = 0;
     Modal.shown.length = 0;
 
@@ -2025,5 +2045,274 @@ describe("applySetup called programmatically", () => {
     expect(plugin.settings.accessToken).toBe(CONFIGURED.accessToken);
     expect(plugin.settings.firstSyncAcknowledged).toBe(ackBefore);
     expect((plugin as unknown as { syncState: unknown }).syncState).toBe(stateBefore);
+  });
+});
+
+// --- startup readiness gate ---------------------------------------------------------------
+//
+// Obsidian fires `create` once for EVERY existing file while the vault loads, and it does so
+// after `onload()` has registered its listeners but before layout-ready (see the `Vault.on`
+// docs in obsidian.d.ts). Those are not edits. Before this gate they scheduled an ordinary
+// debounced pass, which ran whenever layout-ready came later than the debounce window — on a
+// phone, in the middle of Obsidian's own startup — and ran even with "Sync on startup" off.
+// PIN (lead assignment 2026-09-25, iPhone startup memory): automatic passes wait for
+// layout-ready; pre-ready vault events leave a full audit owed rather than scheduling one;
+// manual actions are not gated.
+
+describe("startup readiness gate", () => {
+  const PATHS = ["n0.md", "n1.md", "n2.md", "n3.md"];
+  const text = (path: string, version = 1) => new TextEncoder().encode(`${path} v${version}\n`);
+
+  interface CountingVault {
+    lists: number;
+    reads: string[];
+    content: Map<string, Uint8Array>;
+  }
+
+  /** A synthetic vault that records every listing and read a pass makes. */
+  function countingVault(app: LifecycleApp): CountingVault {
+    const vault: CountingVault = {
+      lists: 0,
+      reads: [],
+      content: new Map(PATHS.map((p) => [p, text(p)])),
+    };
+    app.vault.adapter = {
+      list: async () => {
+        vault.lists++;
+        return { files: [...vault.content.keys()], folders: [] };
+      },
+      stat: async (path: string) => {
+        const bytes = vault.content.get(path);
+        return bytes === undefined ? null : { type: "file", size: bytes.byteLength, mtime: 1 };
+      },
+      readBinary: async (path: string) => {
+        vault.reads.push(path);
+        return vault.content.get(path)!.slice().buffer;
+      },
+    } as never;
+    return vault;
+  }
+
+  /**
+   * Serves only this device's own commits, so a pass never has anything to pull: the head is
+   * the one this device last absorbed, and each commit moves it.
+   */
+  function steadyServer(): void {
+    let head = "01HEAD";
+    let commits = 0;
+    requestUrlMock.impl = async (req) => {
+      const url = (req as { url: string }).url;
+      if (url.endsWith("/api/head")) return { status: 200, text: "", json: { head } };
+      if (url.endsWith("/api/settings")) {
+        return { status: 404, text: "{}", json: { error: { code: "not_found", message: "none" } } };
+      }
+      if (url.endsWith("/api/blobs/check")) return { status: 200, text: "", json: { missing: [] } };
+      if (url.endsWith("/api/commit")) {
+        head = `01NEXT${++commits}`;
+        return { status: 200, text: "", json: { head } };
+      }
+      throw new Error(`unexpected request in a steady-state test: ${url}`);
+    };
+  }
+
+  const headCalls = () =>
+    requestUrlMock.calls.filter((c) => (c as { url: string }).url.endsWith("/api/head")).length;
+
+  /** Outcomes of the passes that ran, oldest first, from what the device persisted. */
+  const outcomes = (plugin: LogSyncPlugin): string[] =>
+    ((lastSave(plugin) as { log?: { status: string }[] } | undefined)?.log ?? [])
+      .map((e) => e.status)
+      .reverse();
+
+  /** Every event the vault fires for its existing files while it loads. */
+  function vaultLoadBurst(app: LifecycleApp): void {
+    for (const path of PATHS) app.vault.fire("create", { path });
+  }
+
+  /** Runs the scheduler's debounce and whatever pass it starts to completion. */
+  async function elapse(ms: number): Promise<void> {
+    await vi.advanceTimersByTimeAsync(ms);
+    for (let i = 0; i < 20; i++) await vi.advanceTimersByTimeAsync(1);
+  }
+
+  const DEBOUNCE_MS = 5000;
+
+  function startup(over: Partial<Settings>, state?: unknown) {
+    const { plugin, app } = makePlugin(
+      persisted({
+        settings: {
+          ...CONFIGURED,
+          firstSyncAcknowledged: true,
+          retryAttempts: 0,
+          syncSettings: false,
+          debounceSeconds: DEBOUNCE_MS / 1000,
+          intervalMinutes: 0,
+          ...over,
+        },
+        ...(state === undefined ? {} : { state }),
+      })
+    );
+    const vault = countingVault(app);
+    steadyServer();
+    return { plugin, app, vault };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("runs no pass for the vault-load burst while layout is not ready, with startup sync off", async () => {
+    const { plugin, app, vault } = startup({ syncOnStartup: false });
+    await plugin.onload();
+
+    vaultLoadBurst(app);
+    await elapse(DEBOUNCE_MS * 4);
+
+    expect(headCalls()).toBe(0);
+    expect(vault.reads).toEqual([]);
+    expect(vault.lists).toBe(0);
+
+    // Layout-ready does not start one either: "Sync on startup" off is the user's answer.
+    layoutReady(app);
+    await elapse(DEBOUNCE_MS * 4);
+    expect(headCalls()).toBe(0);
+    expect(vault.reads).toEqual([]);
+  });
+
+  it("runs exactly one full startup pass, at layout-ready, however long layout takes", async () => {
+    const { plugin, app, vault } = startup({ syncOnStartup: true });
+    await plugin.onload();
+
+    vaultLoadBurst(app);
+    await elapse(DEBOUNCE_MS * 4);
+    expect(headCalls()).toBe(0);
+    expect(vault.reads).toEqual([]);
+
+    layoutReady(app);
+    await elapse(DEBOUNCE_MS * 4);
+
+    // One pass, and it is the full audit: the vault was listed and every file read once.
+    expect(headCalls()).toBe(1);
+    expect(vault.lists).toBe(1);
+    expect([...vault.reads].sort()).toEqual(PATHS);
+    expect(outcomes(plugin)).toEqual(["committed"]);
+  });
+
+  it("owes a full audit for a change seen before layout-ready, and the next pass pays it", async () => {
+    // A state with a discovery inventory, so an ordinary edit could be handled incrementally.
+    const state = {
+      lastSyncedHead: "01HEAD",
+      keyId: null,
+      files: Object.fromEntries(
+        PATHS.map((p) => [p, { h: "0".repeat(64), size: text(p).byteLength, mtime: 1 }])
+      ),
+      lines: {},
+      inventory: Object.fromEntries(
+        PATHS.map((p) => [p, { path: p, size: text(p).byteLength, mtime: 1 }])
+      ),
+    };
+    const { plugin, app, vault } = startup({ syncOnStartup: false }, state);
+    await plugin.onload();
+
+    // A real change during startup, indistinguishable from the load burst around it.
+    vault.content.set("n3.md", text("n3.md", 2));
+    vaultLoadBurst(app);
+    app.vault.fire("modify", { path: "n3.md" });
+    await elapse(DEBOUNCE_MS * 4);
+    layoutReady(app);
+    await elapse(DEBOUNCE_MS * 4);
+    expect(headCalls()).toBe(0);
+
+    // The first edit after layout-ready runs a pass, and that pass audits the whole vault —
+    // including the startup change nobody journaled for it.
+    vault.content.set("n0.md", text("n0.md", 2));
+    app.vault.fire("modify", { path: "n0.md" });
+    await elapse(DEBOUNCE_MS * 2);
+
+    expect(headCalls()).toBe(1);
+    expect(vault.lists).toBe(1);
+    expect(vault.reads).toContain("n3.md");
+    expect(outcomes(plugin)).toEqual(["committed"]);
+
+    // Paid once: a later edit is incremental again and reads only what it names.
+    vault.reads.length = 0;
+    vault.content.set("n1.md", text("n1.md", 2));
+    app.vault.fire("modify", { path: "n1.md" });
+    await elapse(DEBOUNCE_MS * 2);
+    expect(headCalls()).toBe(2);
+    expect(vault.lists).toBe(1);
+    expect(vault.reads).toEqual(["n1.md"]);
+    expect(outcomes(plugin)).toEqual(["committed", "committed"]);
+  });
+
+  it("keeps the periodic timer and the mobile resume from starting a pass before layout-ready", async () => {
+    Platform.isMobile = true;
+    const { plugin, app } = makePlugin(
+      persisted({
+        settings: {
+          ...CONFIGURED,
+          firstSyncAcknowledged: true,
+          retryAttempts: 0,
+          syncSettings: false,
+          syncOnStartup: true,
+          intervalMinutes: 3,
+          resumeSyncMinutes: 1,
+          mobileStatusBar: false,
+        },
+        lastSuccessAt: Date.now() - 60 * 60_000,
+      })
+    );
+    countingVault(app);
+    steadyServer();
+    await plugin.onload();
+
+    const tick = live("interval").find((t) => t.ms === 3 * 60_000);
+    expect(tick).toBeDefined();
+    tick!.fn();
+    const resume = (plugin as unknown as { domEvents: { type: string; handler: () => void }[] })
+      .domEvents.find((e) => e.type === "visibilitychange");
+    expect(resume).toBeDefined();
+    resume!.handler();
+    await elapse(DEBOUNCE_MS);
+    expect(headCalls()).toBe(0);
+
+    layoutReady(app);
+    await elapse(DEBOUNCE_MS);
+    expect(headCalls()).toBe(1);
+
+    // Once ready, the timer is an ordinary trigger again.
+    tick!.fn();
+    await elapse(DEBOUNCE_MS);
+    expect(headCalls()).toBe(2);
+  });
+
+  it("still runs a sync the user starts before layout-ready", async () => {
+    const { plugin, vault } = startup({ syncOnStartup: false });
+    await plugin.onload();
+
+    const pass = plugin.syncNow();
+    await elapse(10);
+    await pass;
+
+    expect(headCalls()).toBe(1);
+    expect([...vault.reads].sort()).toEqual(PATHS);
+  });
+
+  it("does nothing at layout-ready or on a vault event once the plugin has unloaded", async () => {
+    const { plugin, app, vault } = startup({ syncOnStartup: true });
+    await plugin.onload();
+    vaultLoadBurst(app);
+
+    plugin.onunload();
+    layoutReady(app);
+    app.vault.fire("modify", { path: "n0.md" });
+    await elapse(DEBOUNCE_MS * 4);
+
+    expect(headCalls()).toBe(0);
+    expect(vault.reads).toEqual([]);
   });
 });
