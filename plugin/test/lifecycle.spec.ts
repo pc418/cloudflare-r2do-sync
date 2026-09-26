@@ -2302,6 +2302,44 @@ describe("startup readiness gate", () => {
     expect([...vault.reads].sort()).toEqual(PATHS);
   });
 
+  it.each(["create", "modify", "delete", "rename"])(
+    "does not let a %s event bypass first-sync consent after layout-ready",
+    async (event) => {
+      const { plugin, app, vault } = startup(
+        { syncOnStartup: true, firstSyncAcknowledged: false },
+        null
+      );
+      await plugin.onload();
+      layoutReady(app);
+      app.vault.fire(event, { path: "n0.md" }, "old.md");
+      await elapse(DEBOUNCE_MS * 2);
+
+      expect(requestUrlMock.calls).toEqual([]);
+      expect(vault.reads).toEqual([]);
+      expect(vault.lists).toBe(0);
+      expect(plugin.settings.firstSyncAcknowledged).toBe(false);
+      expect(Modal.shown).toEqual([]);
+    }
+  );
+
+  it("starts normally when enabled after the workspace is already ready", async () => {
+    const { plugin, app, vault } = startup({ syncOnStartup: true });
+    // The real API invokes immediately in a running vault, not at a future event.
+    app.workspace.onLayoutReady = (callback) => { callback(); };
+    await plugin.onload();
+    await elapse(DEBOUNCE_MS * 2);
+
+    expect(headCalls()).toBe(1);
+    expect([...vault.reads].sort()).toEqual(PATHS);
+    expect(outcomes(plugin)).toEqual(["committed"]);
+
+    vault.content.set("n0.md", text("n0.md", 2));
+    app.vault.fire("modify", { path: "n0.md" });
+    await elapse(DEBOUNCE_MS * 2);
+    expect(headCalls()).toBe(2);
+    expect(outcomes(plugin)).toEqual(["committed", "committed"]);
+  });
+
   it("does nothing at layout-ready or on a vault event once the plugin has unloaded", async () => {
     const { plugin, app, vault } = startup({ syncOnStartup: true });
     await plugin.onload();

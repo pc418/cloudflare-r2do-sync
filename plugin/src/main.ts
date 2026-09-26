@@ -724,6 +724,14 @@ export default class LogSyncPlugin extends Plugin {
         return;
       }
       this.#engine?.markDirty(paths, { fullScan });
+      // File events are automatic work too. Keep the journal, but never let an edit
+      // publish a fresh device's files before the same consent startup/timer sync needs.
+      if (
+        needsFirstSyncConsent({
+          acknowledged: this.settings.firstSyncAcknowledged,
+          hasSyncedSnapshot: this.hasSyncedSnapshot,
+        })
+      ) return;
       this.#scheduler?.notifyChange();
     };
     const onChange = (file: TAbstractFile) =>
