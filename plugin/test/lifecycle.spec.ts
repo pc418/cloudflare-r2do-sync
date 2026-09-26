@@ -2135,6 +2135,14 @@ describe("startup readiness gate", () => {
     for (let i = 0; i < 20; i++) await vi.advanceTimersByTimeAsync(1);
   }
 
+  /** A request can finish before the scheduler's asynchronous result is persisted. */
+  async function awaitRecordedPasses(plugin: LogSyncPlugin, count: number): Promise<void> {
+    for (let i = 0; i < 100 && outcomes(plugin).length < count; i++) {
+      await vi.advanceTimersByTimeAsync(1);
+    }
+    expect(outcomes(plugin)).toHaveLength(count);
+  }
+
   const DEBOUNCE_MS = 5000;
 
   function startup(over: Partial<Settings>, state?: unknown) {
@@ -2236,6 +2244,7 @@ describe("startup readiness gate", () => {
     expect(headCalls()).toBe(1);
     expect(vault.lists).toBe(1);
     expect(vault.reads).toContain("n3.md");
+    await awaitRecordedPasses(plugin, 1);
     expect(outcomes(plugin)).toEqual(["committed"]);
 
     // Paid once: a later edit is incremental again and reads only what it names.
@@ -2246,6 +2255,7 @@ describe("startup readiness gate", () => {
     expect(headCalls()).toBe(2);
     expect(vault.lists).toBe(1);
     expect(vault.reads).toEqual(["n1.md"]);
+    await awaitRecordedPasses(plugin, 2);
     expect(outcomes(plugin)).toEqual(["committed", "committed"]);
   });
 
