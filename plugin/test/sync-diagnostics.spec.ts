@@ -115,6 +115,18 @@ describe("SyncDiagnostics", () => {
     expect(diagnostics.blocksAutomatic).toBe(true);
   });
 
+  it("does not turn a failed marker write into a phantom interrupted pass on resume", async () => {
+    const { diagnostics, storage } = make();
+    await diagnostics.load();
+    storage.failWrite = new Error("disk full");
+    await expect(diagnostics.beginPass()).rejects.toBeInstanceOf(DiagnosticWriteError);
+    storage.failWrite = null;
+    expect(await diagnostics.resume()).toBe(true);
+    expect(storage.record().active).toBeNull();
+    const next = make(storage);
+    expect(await next.diagnostics.load()).toEqual({ paused: false, failure: null });
+  });
+
   it("keeps the pause when a resume cannot be persisted", async () => {
     const storage = new MemoryStorage();
     storage.files.set(
@@ -151,6 +163,7 @@ describe("SyncDiagnostics", () => {
     await diagnostics.finishPass(pass, { result: RESULT });
     expect(storage.writes.length).toBe(writes);
     expect(storage.record().active).not.toBeNull();
+    await expect(diagnostics.beginPass()).rejects.toBeInstanceOf(DiagnosticWriteError);
   });
 
   it("bounds the trace and the stored record", async () => {

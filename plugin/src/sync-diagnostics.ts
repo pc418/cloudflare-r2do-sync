@@ -297,7 +297,12 @@ export class SyncDiagnostics {
       await this.#write();
     } catch (e) {
       this.#fail("write", e);
-      if (this.#current === token) this.#current = null;
+      if (this.#current === token) {
+        this.#current = null;
+        // No engine work started. A later successful resume must not persist a
+        // phantom active pass and pause the following launch again.
+        this.#record.active = null;
+      }
       throw new DiagnosticWriteError({ cause: e });
     }
     return token;
@@ -389,7 +394,7 @@ export class SyncDiagnostics {
 
   #write(): Promise<void> {
     const write = this.#chain.then(async () => {
-      if (this.#retired) return;
+      if (this.#retired) throw new Error("recovery logging retired with the plugin");
       await this.#storage.write(this.#path, `${JSON.stringify(this.#record, null, 2)}\n`);
     });
     this.#chain = write.catch(() => {});
