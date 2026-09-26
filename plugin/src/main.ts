@@ -522,7 +522,6 @@ export const RESUME_AUTOMATIC_LABEL = "Resume automatic sync";
 export const RESUME_AUTOMATIC_DESC =
   "Automatic sync was paused after an interrupted sync. Manual Sync now still runs one pass; " +
   "resuming allows startup, timer and file-change sync again.";
-// Worker-drafted, pending lead wording: the contract asks for a visible explanation but gave no text.
 export const RECOVERY_LOG_FAILED_NOTICE =
   "R2DO Sync: recovery logging failed, so automatic sync is stopped.";
 
