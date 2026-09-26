@@ -59,6 +59,14 @@ import {
 } from "./hotkeys";
 import { ObsidianVault } from "./obsidian-vault";
 import {
+  describeProblems,
+  describeRenamed,
+  isMarkdownPath,
+  obsidianRenameFs,
+  renameLargeMarkdown,
+  type RenameOutcome,
+} from "./large-markdown";
+import {
   SyncEngine,
   type ChangesUnknown,
   type ConflictInfo,
@@ -256,6 +264,11 @@ export interface Settings {
    * each device reconciles its own copy exactly once.
    */
   firstSyncAcknowledged: boolean;
+  /**
+   * Rename Markdown over 1.5 MiB to `.txt` automatically (`large-markdown.ts`). Device-local,
+   * because it relieves this device's indexer. The explicit rename button ignores it.
+   */
+  largeMarkdownAsText: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -305,6 +318,7 @@ export const DEFAULT_SETTINGS: Settings = {
   mobileStatusBar: false,
   syncSettings: true,
   firstSyncAcknowledged: false,
+  largeMarkdownAsText: true,
 };
 
 /**
@@ -487,6 +501,17 @@ const QUEUED_LABEL = "Waiting for the current sync…";
 const RESOLVING_LABEL = "Resolving…";
 
 const SYNC_COMMAND = "sync-now";
+/** Private provenance on scheduler requests; UI state is not a reliable pass origin. */
+const MANUAL_SYNC = Symbol("manual-sync");
+
+function isManualSync(opts?: SyncPassOptions): boolean {
+  return opts !== undefined && MANUAL_SYNC in opts;
+}
+
+function manualPass(opts: SyncPassOptions): SyncPassOptions {
+  const marked = { ...opts, [MANUAL_SYNC]: true };
+  return marked;
+}
 
 // Recovery pause prose, lead-authored and used verbatim (docs/260925-fix-IPHONE_SYNC_RECOVERY_PLAN.md).
 export const RECOVERY_PAUSED_NOTICE =
@@ -523,6 +548,12 @@ function platformLabel(): string {
             : "other";
   return `${os}-${Platform.isMobile ? "mobile" : "desktop"}`;
 }
+/** The oversized-Markdown rename, in the lead-authored wording. */
+const LARGE_MD_WORKING = "R2DO Sync: looking for Markdown files larger than 1.5 MiB…";
+const LARGE_MD_NONE = "R2DO Sync: no oversized Markdown files to rename";
+const LARGE_MD_RENAMED = "R2DO Sync: renamed ";
+const LARGE_MD_FAILED = "R2DO Sync could not rename oversized Markdown: ";
+const LARGE_MD_BUTTON = "Rename existing large Markdown";
 
 /**
  * The one shared-settings failure with a specific cure: this device holds a key the vault
@@ -607,6 +638,22 @@ export default class LogSyncPlugin extends Plugin {
    * that never settled leaves behind. Loaded before any automatic trigger is registered.
    */
   #diagnostics: SyncDiagnostics | null = null;
+  /** Markdown paths from vault events and pulls, owed an oversized-Markdown check. */
+  readonly #largeMdPending = new Set<string>();
+  /** The one whole-vault sweep a load owes, paid once layout is ready and automation allows. */
+  #largeMdFullOwed = true;
+  /** A drain is already queued, so further events only add paths for it to take. */
+  #largeMdDrainQueued = false;
+  /** A rename happened with no engine to journal it, so the next engine owes a full audit. */
+  #largeMdAuditOwed = false;
+  /** Destinations and matching sources of our renames; an unrelated event must not be hidden. */
+  readonly #ownRenames = new Map<string, string>();
+  /**
+   * Maintenance that started while no scheduler existed. Every pass, and every maintenance
+   * entry in a scheduler's lane, waits for it first, so the two lanes never overlap.
+   */
+  #localMaintenance: Promise<void> = Promise.resolve();
+  #unloaded = false;
 
   #log: SyncLogEntry[] = [];
   #lastSuccessAt: number | undefined;
@@ -653,6 +700,9 @@ export default class LogSyncPlugin extends Plugin {
     // alone it would fall through to weeks and silently show a history nobody asked for.
     if (!isHistoryGranularity(this.settings.historyGranularity)) {
       this.settings.historyGranularity = DEFAULT_SETTINGS.historyGranularity;
+    }
+    if (typeof this.settings.largeMarkdownAsText !== "boolean") {
+      this.settings.largeMarkdownAsText = DEFAULT_SETTINGS.largeMarkdownAsText;
     }
     // The five per-category notice booleans became one level in 0.7.2. Resolved from the SAVED
     // object rather than from `this.settings`, because the spread above has already merged the
@@ -759,6 +809,11 @@ export default class LogSyncPlugin extends Plugin {
       name: "Apply a setup link (paste)",
       callback: () => new PasteSetupModal(this.app, this).open(),
     });
+    this.addCommand({
+      id: "rename-large-markdown",
+      name: LARGE_MD_BUTTON,
+      callback: () => void this.renameLargeMarkdownNow(),
+    });
 
     // The phone's own camera app opens this URI, so no scanner ships in the plugin.
     this.registerObsidianProtocolHandler(SETUP_ACTION, (params) => {
@@ -775,36 +830,28 @@ export default class LogSyncPlugin extends Plugin {
       await this.#resumeEncryptionTransition();
     }
 
-    const scheduleChanged = (paths: readonly string[], fullScan: boolean) => {
-      // While a decision is pending, an automatic pass would re-run the whole plan and
-      // silently re-park it. Manual syncs still work — that is how the user answers.
-      if (this.#phase === "decision") return;
-      if (!this.#layoutReady) {
-        this.#auditOwedBeforeReady = true;
-        return;
-      }
-      this.#engine?.markDirty(paths, { fullScan });
-      // Journaled above either way, so a manual pass or a resume still sees the edit.
-      if (this.automaticSyncPaused) return;
-      // File events are automatic work too. Keep the journal, but never let an edit
-      // publish a fresh device's files before the same consent startup/timer sync needs.
-      if (
-        needsFirstSyncConsent({
-          acknowledged: this.settings.firstSyncAcknowledged,
-          hasSyncedSnapshot: this.hasSyncedSnapshot,
-        })
-      ) return;
-      this.#scheduler?.notifyChange();
+    const onChange = (file: TAbstractFile) => {
+      this.#scheduleChanged([file.path], file instanceof TFolder);
+      this.#noteLargeMarkdown(file);
     };
-    const onChange = (file: TAbstractFile) =>
-      scheduleChanged([file.path], file instanceof TFolder);
     this.registerEvent(this.app.vault.on("create", onChange));
     this.registerEvent(this.app.vault.on("modify", onChange));
-    this.registerEvent(this.app.vault.on("delete", onChange));
     this.registerEvent(
-      this.app.vault.on("rename", (file, oldPath) =>
-        scheduleChanged([oldPath, file.path], file instanceof TFolder)
+      this.app.vault.on("delete", (file) =>
+        this.#scheduleChanged([file.path], file instanceof TFolder)
       )
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        // One of our own oversized-Markdown renames: `#journalRename` has already journaled
+        // it and decided whether it may schedule a pass.
+        if (this.#ownRenames.get(file.path) === oldPath) {
+          this.#ownRenames.delete(file.path);
+          return;
+        }
+        this.#scheduleChanged([oldPath, file.path], file instanceof TFolder);
+        this.#noteLargeMarkdown(file);
+      })
     );
 
     this.#restartAutoSyncTimer();
@@ -820,6 +867,9 @@ export default class LogSyncPlugin extends Plugin {
         // with it on the startup pass below is already a full audit and pays this.
         this.#engine?.markDirty([], { fullScan: true });
       }
+      // The load's one oversized-Markdown sweep. Queued before the startup pass, so it holds
+      // the lane first; it schedules nothing, so "Sync on startup" off stays off.
+      this.#requestLargeMarkdownDrain();
       if (this.settings.syncOnStartup) void this.#autoSync();
     });
 
@@ -858,6 +908,28 @@ export default class LogSyncPlugin extends Plugin {
         void this.#autoSync();
       });
     }
+  }
+
+  /** A vault event: journal it, and schedule an automatic pass if one is allowed. */
+  #scheduleChanged(paths: readonly string[], fullScan: boolean): void {
+    // While a decision is pending, an automatic pass would re-run the whole plan and
+    // silently re-park it. Manual syncs still work — that is how the user answers.
+    if (this.#phase === "decision") return;
+    if (!this.#layoutReady) {
+      this.#auditOwedBeforeReady = true;
+      return;
+    }
+    this.#engine?.markDirty(paths, { fullScan });
+    if (this.automaticSyncPaused) return;
+    // File events are automatic work too. Keep the journal, but never let an edit
+    // publish a fresh device's files before the same consent startup/timer sync needs.
+    if (
+      needsFirstSyncConsent({
+        acknowledged: this.settings.firstSyncAcknowledged,
+        hasSyncedSnapshot: this.hasSyncedSnapshot,
+      })
+    ) return;
+    this.#scheduler?.notifyChange();
   }
 
   /**
@@ -923,6 +995,7 @@ export default class LogSyncPlugin extends Plugin {
   }
 
   onunload(): void {
+    this.#unloaded = true;
     if (this.#settingsPushTimer !== null) window.clearTimeout(this.#settingsPushTimer);
     if (this.#autoSyncTimer !== null) window.clearInterval(this.#autoSyncTimer);
     // Obsidian's own layout, put back as it was. A disabled plugin that leaves the status bar
@@ -1359,20 +1432,34 @@ export default class LogSyncPlugin extends Plugin {
     // scheduler's serialisation. The marker is on disk before the engine does any work, and is
     // cleared only once the pass settles; a process killed in between leaves it for the next load.
     const engine = this.#engine;
+    if (this.#largeMdAuditOwed) {
+      this.#largeMdAuditOwed = false;
+      engine.markDirty([], { fullScan: true });
+    }
     const marked = {
       sync: async (opts?: SyncPassOptions): Promise<SyncResult> => {
-        if (diagnostics === null) return await engine.sync(opts);
-        if (diagnostics.blocksAutomatic && this.#interactive === 0) {
+        if (diagnostics?.blocksAutomatic && !isManualSync(opts)) {
           throw new AutomaticSyncBlockedError("automatic sync is paused");
         }
-        const token = await diagnostics.beginPass();
+        await this.#localMaintenance;
+        // An automatic request can wait behind pre-existing maintenance while a manual
+        // pass fails and activates recovery pause. Check again at the engine boundary.
+        if (diagnostics?.blocksAutomatic && !isManualSync(opts)) {
+          throw new AutomaticSyncBlockedError("automatic sync is paused");
+        }
+        const token = await diagnostics?.beginPass() ?? null;
         pass = token;
         try {
+          // A forced publish ships what the user previewed, so it is not changed underneath.
+          if (opts?.keepLocal !== true && opts?.reroot === undefined) {
+            await this.#largeMarkdownInPass(generation);
+          }
           const result = await engine.sync(opts);
-          await diagnostics.finishPass(token, { result });
+          await this.#largeMarkdownInPass(generation, result);
+          if (token !== null) await diagnostics?.finishPass(token, { result });
           return result;
         } catch (error) {
-          await diagnostics.finishPass(token, { error });
+          if (token !== null) await diagnostics?.finishPass(token, { error });
           throw error;
         } finally {
           if (pass === token) pass = null;
@@ -1405,6 +1492,8 @@ export default class LogSyncPlugin extends Plugin {
       ? "first-sync"
       : "idle";
     this.#renderStatus();
+    // Work that a retired scheduler dropped, or that a settings change just switched on.
+    this.#requestLargeMarkdownDrain();
   }
 
   /**
@@ -1546,7 +1635,7 @@ export default class LogSyncPlugin extends Plugin {
       if (!this.#scheduler) return;
       // `pullOnly` is set only for the first pass of a device with nothing of its own to
       // publish, and `firstSyncAcknowledged` is true by now, so it can never repeat.
-      await this.#scheduler.syncNow({ fullScan: true, pullOnly: consent.pullOnly });
+      await this.#scheduler.syncNow(manualPass({ fullScan: true, pullOnly: consent.pullOnly }));
     } catch {
       // reported through onError
     } finally {
@@ -1588,6 +1677,248 @@ export default class LogSyncPlugin extends Plugin {
     } finally {
       notice.hide();
     }
+  }
+
+  // --- oversized Markdown ---------------------------------------------------------------
+  //
+  // Markdown over 1.5 MiB is renamed to `.txt` (`large-markdown.ts`). Every trigger — the
+  // load's sweep, vault events, the passes' own slots and the button — goes through
+  // `#convertLargeMarkdown`, and every one runs in the maintenance lane or inside a pass.
+
+  /**
+   * Whether conversion may run without being asked: switched on, and on a device that has
+   * already synced. Before its first sync a device's files are still to be reconciled with
+   * the vault's, and renaming them first would turn identical copies into a collision.
+   */
+  #largeMarkdownAutomatic(): boolean {
+    return (
+      !this.#unloaded &&
+      this.settings.largeMarkdownAsText &&
+      !isUnconfigured(this.settings) &&
+      this.hasSyncedSnapshot
+    );
+  }
+
+  /** A created, modified or renamed file. Before layout-ready the load's sweep covers it. */
+  #noteLargeMarkdown(file: TAbstractFile): void {
+    if (!this.#layoutReady || this.#unloaded || !this.settings.largeMarkdownAsText) return;
+    if (file instanceof TFolder || !isMarkdownPath(file.path)) return;
+    this.#largeMdPending.add(file.path);
+    this.#requestLargeMarkdownDrain();
+  }
+
+  /** Queues one drain of whatever is owed. A burst of events shares the queued one. */
+  #requestLargeMarkdownDrain(): void {
+    if (this.#largeMdDrainQueued || this.#vaultRewrite !== null) return;
+    if (!this.#largeMarkdownAutomatic()) return;
+    if (this.#largeMdPending.size === 0 && !(this.#largeMdFullOwed && this.#layoutReady)) return;
+    this.#largeMdDrainQueued = true;
+    const changed = this.#configurationChanged();
+    this.#runMaintenance(async () => {
+      this.#largeMdDrainQueued = false;
+      await this.#drainLargeMarkdown("idle", changed);
+    }).catch((e: unknown) => {
+      this.#largeMdDrainQueued = false;
+      // A retired scheduler drops queued work. What it would have checked is still owed, and
+      // the replacement's rebuild asks again.
+      console.warn(`R2DO Sync: oversized Markdown check deferred: ${message(e)}`);
+    });
+  }
+
+  /** The pass's own slot: `result` is absent before the engine runs and present after. */
+  async #largeMarkdownInPass(generation: number, result?: SyncResult): Promise<void> {
+    if (generation !== this.#generation) return;
+    if (result !== undefined && this.settings.largeMarkdownAsText) {
+      for (const change of result.pulledChanges) {
+        if (change.action !== "delete" && isMarkdownPath(change.path)) {
+          this.#largeMdPending.add(change.path);
+        }
+      }
+      for (const copy of result.conflicts) {
+        if (isMarkdownPath(copy)) this.#largeMdPending.add(copy);
+      }
+    }
+    await this.#drainLargeMarkdown(
+      result === undefined ? "pre" : "post",
+      this.#configurationChanged(generation)
+    );
+  }
+
+  /**
+   * A stop condition for a run that began under this configuration. A settings change can
+   * move the scope a run was planned against — a new exclude — so it stops rather than
+   * carrying on under rules that no longer hold; `#finishRebuild` asks again under the new.
+   */
+  #configurationChanged(generation = this.#generation): () => string | null {
+    return () => (generation === this.#generation ? null : "sync configuration changed");
+  }
+
+  /**
+   * Converts what is owed: the pending paths, plus the whole vault once per load. Never
+   * throws — it runs inside passes, and a rename problem must not fail or retry a sync.
+   *
+   * Only a run after a pass, or one started by a vault event, schedules a later pass for its
+   * renames. The load's sweep does not, so "Sync on startup" off still means no startup pass;
+   * a pre-pass run needs none, because the pass it precedes publishes it.
+   */
+  async #drainLargeMarkdown(
+    phase: "pre" | "post" | "idle",
+    stop: () => string | null
+  ): Promise<void> {
+    if (!this.#largeMarkdownAutomatic()) return;
+    const owed = this.#largeMdPending.size > 0 || this.#largeMdFullOwed;
+    if (this.#vaultRewrite !== null) {
+      // Deferred, not dropped: the rewrite's end asks again.
+      if (owed) console.warn("R2DO Sync: oversized Markdown check deferred during a vault rewrite");
+      return;
+    }
+    const full = this.#largeMdFullOwed && this.#layoutReady;
+    const paths = new Set(this.#largeMdPending);
+    this.#largeMdPending.clear();
+    if (full) this.#largeMdFullOwed = false;
+    const inPass = phase !== "idle";
+    try {
+      if (full) for (const file of this.app.vault.getFiles()) paths.add(file.path);
+      if (paths.size === 0) return;
+      const schedule = phase === "post" || (phase === "idle" && !full);
+      const outcome = await this.#convertLargeMarkdown(paths, schedule, stop);
+      if (outcome.stopped !== null) {
+        for (const path of outcome.notAttempted) this.#largeMdPending.add(path);
+        console.warn(`R2DO Sync: oversized Markdown check paused: ${outcome.stopped}`);
+      }
+      this.#reportLargeMarkdownAuto(outcome, inPass);
+    } catch (e) {
+      for (const path of paths) this.#largeMdPending.add(path);
+      if (full) this.#largeMdFullOwed = true;
+      console.error("R2DO Sync: oversized Markdown check failed", e);
+      const say = inPass ? this.#say.bind(this) : this.#sayUnwatched.bind(this);
+      say("problems", `could not rename oversized Markdown: ${message(e)}`, 15_000);
+    }
+  }
+
+  /** What an automatic run did, through the notice policy like any other unasked change. */
+  #reportLargeMarkdownAuto(outcome: RenameOutcome, inPass: boolean): void {
+    const say = inPass ? this.#say.bind(this) : this.#sayUnwatched.bind(this);
+    if (outcome.renamed.length > 0) {
+      say("changes", `renamed ${describeRenamed(outcome.renamed)}`, 10_000);
+    }
+    if (outcome.failed.length > 0) {
+      // Only the refusals: a stop is a deferral, and the files it did not reach are still owed.
+      const problems = describeProblems({ ...outcome, stopped: null });
+      console.error(`R2DO Sync: could not rename oversized Markdown: ${problems}`);
+      say("problems", `could not rename oversized Markdown: ${problems}`, 15_000);
+    }
+  }
+
+  /**
+   * The one conversion every trigger uses. Each rename is journaled for the engine as it
+   * happens, so the next ordinary pass publishes a real move: old path gone, new path added.
+   */
+  async #convertLargeMarkdown(
+    paths: Iterable<string>,
+    schedule: boolean,
+    stop: () => string | null
+  ): Promise<RenameOutcome> {
+    return await renameLargeMarkdown(
+      paths,
+      obsidianRenameFs(this.app, this.#ownRenames),
+      {
+        rules: {
+          excludes: parseGlobs(this.settings.excludes),
+          onlyPaths: parseGlobs(this.settings.onlyPaths),
+          syncConfigDir: this.settings.syncConfigDir,
+          configDir: configDirOf(this.app),
+        },
+        shouldStop: () => {
+          if (this.#unloaded) return "the plugin was unloaded";
+          if (this.#vaultRewrite !== null) return "the vault is being rewritten";
+          return stop();
+        },
+        onRenamed: (from, to) => this.#journalRename(from, to, schedule),
+      }
+    );
+  }
+
+  /** Journals one of our renames, and asks for a pass through the ordinary event gates. */
+  #journalRename(from: string, to: string, schedule: boolean): void {
+    const engine = this.#engine;
+    if (engine !== null) engine.markDirty([from, to]);
+    else this.#largeMdAuditOwed = true;
+    if (schedule) this.#scheduleChanged([from, to], false);
+  }
+
+  /**
+   * Runs maintenance serialized with sync passes: in the scheduler's lane when there is one,
+   * otherwise in a local lane every later pass waits for. Queued work never waits for a
+   * scheduler created after it, and a pass never waits for maintenance queued after it
+   * started, so neither can end up waiting on the other.
+   */
+  #runMaintenance<T>(op: () => Promise<T>): Promise<T> {
+    if (this.#unloaded) return Promise.reject(new Error("the plugin was unloaded"));
+    const local = this.#localMaintenance;
+    const scheduler = this.#scheduler;
+    if (scheduler !== null) {
+      return scheduler.runExclusive(async () => {
+        await local;
+        return await op();
+      });
+    }
+    // A rebuild hides its scheduler before the old pass has drained; wait for that pass.
+    const drain = this.#schedulerDrain;
+    const run = local.then(async () => {
+      await drain;
+      if (this.#unloaded) throw new Error("the plugin was unloaded");
+      return await op();
+    });
+    this.#localMaintenance = run.then(
+      () => {},
+      () => {}
+    );
+    return run;
+  }
+
+  /** Switches automatic conversion; switching it on owes the whole-vault sweep again. */
+  async setLargeMarkdownAsText(on: boolean): Promise<void> {
+    this.settings.largeMarkdownAsText = on;
+    if (on) this.#largeMdFullOwed = true;
+    await this.saveSettings();
+  }
+
+  /**
+   * The button and command: renames every oversized Markdown file in scope now. Works with
+   * the automatic setting off and on a device with no server, because it was asked for.
+   */
+  async renameLargeMarkdownNow(): Promise<void> {
+    if (this.#vaultRewrite !== null) {
+      new Notice(
+        `${LARGE_MD_FAILED}this vault is being rewritten. Wait for that to finish, then try again.`,
+        10_000
+      );
+      return;
+    }
+    const working = new Notice(LARGE_MD_WORKING, 0);
+    let outcome: RenameOutcome;
+    const changed = this.#configurationChanged();
+    try {
+      outcome = await this.#runMaintenance(async () => {
+        const paths = this.app.vault.getFiles().map((file) => file.path);
+        return await this.#convertLargeMarkdown(paths, true, changed);
+      });
+    } catch (e) {
+      new Notice(`${LARGE_MD_FAILED}${message(e)}`, 0);
+      return;
+    } finally {
+      working.hide();
+    }
+    const problems = outcome.failed.length > 0 || outcome.stopped !== null;
+    if (outcome.renamed.length === 0 && !problems) {
+      new Notice(LARGE_MD_NONE, 5_000);
+      return;
+    }
+    if (outcome.renamed.length > 0) {
+      new Notice(`${LARGE_MD_RENAMED}${describeRenamed(outcome.renamed)}`, 10_000);
+    }
+    if (problems) new Notice(`${LARGE_MD_FAILED}${describeProblems(outcome)}`, 0);
   }
 
   /**
@@ -1876,7 +2207,7 @@ export default class LogSyncPlugin extends Plugin {
         try {
           // A full audit, like the preview that produced `summary`. Publishing one direction
           // over the other from an event journal would push a vault the operator never saw.
-          await scheduler.syncNow({ keepLocal: true, previewedHead: summary.head, fullScan: true });
+          await scheduler.syncNow(manualPass({ keepLocal: true, previewedHead: summary.head, fullScan: true }));
         } catch (e) {
           await this.#reportUnlessReported(e);
         } finally {
@@ -1956,7 +2287,7 @@ export default class LogSyncPlugin extends Plugin {
           // Pinned to the head the confirmation just described. A snapshot published
           // since then has never been reviewed, and this is the one action that would
           // delete it rather than merge it.
-          await scheduler.syncNow({ reroot: { previewedHead: summary.head }, fullScan: true });
+          await scheduler.syncNow(manualPass({ reroot: { previewedHead: summary.head }, fullScan: true }));
         } catch (e) {
           await this.#reportUnlessReported(e);
         } finally {
@@ -2602,6 +2933,8 @@ export default class LogSyncPlugin extends Plugin {
       return await run();
     } finally {
       this.#vaultRewrite = previous;
+      // Oversized-Markdown work deferred by the rewrite is owed now.
+      if (previous === null) this.#requestLargeMarkdownDrain();
     }
   }
 
@@ -6462,6 +6795,23 @@ export class LogSyncSettingTab extends PluginSettingTab {
       )
       .addButton((b) =>
         b.setButtonText("Find empty folders").onClick(() => void this.plugin.removeEmptyFolders())
+      );
+
+    // One row: the button is the same conversion on demand, and works with the switch off.
+    new Setting(containerEl)
+      .setName("Store large Markdown as text")
+      .setDesc(
+        "Automatically rename Markdown files larger than 1.5 MiB to .txt to reduce Obsidian " +
+          "indexing pressure. Contents are unchanged, but Markdown rendering and links to the " +
+          "old filename may be affected. Renames are included in normal sync."
+      )
+      .addToggle((t) =>
+        t
+          .setValue(this.plugin.settings.largeMarkdownAsText)
+          .onChange(async (v) => await this.plugin.setLargeMarkdownAsText(v))
+      )
+      .addButton((b) =>
+        b.setButtonText(LARGE_MD_BUTTON).onClick(() => void this.plugin.renameLargeMarkdownNow())
       );
   }
 

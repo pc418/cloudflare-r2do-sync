@@ -76,6 +76,15 @@ function fakePlugin(over: Partial<Settings> = {}, keyMismatch: string | null = n
     async forcePush() {},
     async rebuildHistory() {},
     async removeEmptyFolders() {},
+    largeMarkdownPresses: 0,
+    async renameLargeMarkdownNow() {
+      this.largeMarkdownPresses += 1;
+    },
+    largeMarkdownSwitches: [] as boolean[],
+    async setLargeMarkdownAsText(on: boolean) {
+      this.largeMarkdownSwitches.push(on);
+      this.settings.largeMarkdownAsText = on;
+    },
     openConflictReview() {
       this.reviewed += 1;
     },
@@ -307,6 +316,34 @@ describe("settings tab rendering", () => {
     for (const other of others) {
       expect(plugin.settings[other]).toBe(DEFAULT_SETTINGS[other]);
     }
+  });
+
+  // PIN (owner, 2026-09-25, docs/260925-fix-LARGE_MARKDOWN_PLUGIN_WORKER.md): lead-authored
+  // wording, in Troubleshooting, default on, with the explicit rename beside the switch.
+  it("puts the large-Markdown switch and its button in Troubleshooting, wired", async () => {
+    const plugin = fakePlugin();
+    const tab = newTab(plugin);
+    tab.display();
+    const log = logOf(tab);
+    const index = log.settings.findIndex((s) => s.name === "Store large Markdown as text");
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect(log.settings[index].section).toBe("Troubleshooting");
+    expect(log.settings[index].desc).toBe(
+      "Automatically rename Markdown files larger than 1.5 MiB to .txt to reduce Obsidian " +
+        "indexing pressure. Contents are unchanged, but Markdown rendering and links to the old " +
+        "filename may be affected. Renames are included in normal sync."
+    );
+    const row = log.rows[index];
+    expect(DEFAULT_SETTINGS.largeMarkdownAsText).toBe(true);
+    expect(row.toggles[0].getValue()).toBe(true);
+
+    await row.toggles[0].change(false);
+    expect(plugin.largeMarkdownSwitches).toEqual([false]);
+
+    const button = row.buttons.find((b) => b.text === "Rename existing large Markdown");
+    expect(button).toBeDefined();
+    await button?.click();
+    expect(plugin.largeMarkdownPresses).toBe(1);
   });
 
   it("offers the four levels as one ordered choice, loudest first", () => {
