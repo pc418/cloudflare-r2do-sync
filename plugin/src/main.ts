@@ -73,9 +73,16 @@ import {
   type SnapshotInfo,
   type HistoryListing,
   type HistoryOptions,
+  type SyncPassOptions,
   type SyncPreview,
   type SyncResult,
 } from "./sync";
+import {
+  DIAGNOSTIC_FILE,
+  SyncDiagnostics,
+  type DiagnosticStorage,
+  type PassToken,
+} from "./sync-diagnostics";
 import {
   HISTORY_GRANULARITIES,
   isHistoryGranularity,
@@ -481,6 +488,42 @@ const RESOLVING_LABEL = "Resolving…";
 
 const SYNC_COMMAND = "sync-now";
 
+// Recovery pause prose, lead-authored and used verbatim (docs/260925-fix-IPHONE_SYNC_RECOVERY_PLAN.md).
+export const RECOVERY_PAUSED_NOTICE =
+  "R2DO Sync: the previous sync did not finish. Automatic sync is paused so it will not " +
+  "immediately repeat. Export the sync log for diagnostics, or run Sync now once when ready.";
+export const RECOVERY_PAUSED_STATUS = "automatic sync paused";
+export const RESUME_AUTOMATIC_LABEL = "Resume automatic sync";
+export const RESUME_AUTOMATIC_DESC =
+  "Automatic sync was paused after an interrupted sync. Manual Sync now still runs one pass; " +
+  "resuming allows startup, timer and file-change sync again.";
+// Worker-drafted, pending lead wording: the contract asks for a visible explanation but gave no text.
+export const RECOVERY_LOG_FAILED_NOTICE =
+  "R2DO Sync: recovery logging failed, so automatic sync is stopped.";
+
+/**
+ * An automatic pass reached the engine seam while automatic sync is paused or recovery logging
+ * is broken. Every trigger is gated before this; the seam refuses too, so a debounce that was
+ * already armed cannot slip through. Not a sync failure, so it is not reported as one.
+ */
+class AutomaticSyncBlockedError extends Error {}
+
+/** Coarse platform identity for the recovery record; never a device name. */
+function platformLabel(): string {
+  const os = Platform.isIosApp
+    ? "ios"
+    : Platform.isAndroidApp
+      ? "android"
+      : Platform.isMacOS
+        ? "macos"
+        : Platform.isWin
+          ? "windows"
+          : Platform.isLinux
+            ? "linux"
+            : "other";
+  return `${os}-${Platform.isMobile ? "mobile" : "desktop"}`;
+}
+
 /**
  * The one shared-settings failure with a specific cure: this device holds a key the vault
  * does not know. Distinguished from every other cause so the settings tab can offer the fix
@@ -559,6 +602,11 @@ export default class LogSyncPlugin extends Plugin {
    * instead of a pass it leaves a full audit owed, which the next pass of any kind pays.
    */
   #auditOwedBeforeReady = false;
+  /**
+   * The recovery record: an active marker around every scheduled pass, and the pause a pass
+   * that never settled leaves behind. Loaded before any automatic trigger is registered.
+   */
+  #diagnostics: SyncDiagnostics | null = null;
 
   #log: SyncLogEntry[] = [];
   #lastSuccessAt: number | undefined;
@@ -634,6 +682,9 @@ export default class LogSyncPlugin extends Plugin {
     this.#lastConflicts = data?.lastConflicts ?? [];
     this.#pendingEncryptionTransition = data?.pendingEncryptionTransition ?? null;
 
+    // Before any automatic trigger exists: a pass that never settled last time pauses them all.
+    await this.#loadDiagnostics();
+
     // Obsidian hides the status bar on mobile, so the ribbon is the always-present affordance a
     // phone has: it both starts a sync and carries the status in its tooltip. `mobileStatusBar`
     // can un-hide the bar itself, which is what makes silencing notices survivable there.
@@ -676,6 +727,15 @@ export default class LogSyncPlugin extends Plugin {
           return;
         }
         void this.openConflictReview();
+      },
+    });
+    this.addCommand({
+      id: "sync-resume-automatic",
+      name: RESUME_AUTOMATIC_LABEL,
+      checkCallback: (checking) => {
+        if (!this.automaticSyncPaused) return false;
+        if (!checking) void this.resumeAutomaticSync();
+        return true;
       },
     });
     this.addCommand({
@@ -724,6 +784,8 @@ export default class LogSyncPlugin extends Plugin {
         return;
       }
       this.#engine?.markDirty(paths, { fullScan });
+      // Journaled above either way, so a manual pass or a resume still sees the edit.
+      if (this.automaticSyncPaused) return;
       // File events are automatic work too. Keep the journal, but never let an edit
       // publish a fresh device's files before the same consent startup/timer sync needs.
       if (
@@ -832,6 +894,8 @@ export default class LogSyncPlugin extends Plugin {
     // The periodic timer and the mobile resume are registered during `onload`, so they can
     // fire before layout-ready too; the startup pass above is what runs once it arrives.
     if (!this.#layoutReady) return;
+    // Startup, timer and resume all arrive here; a recovery pause answers all of them.
+    if (this.automaticSyncPaused) return;
     if (!this.#scheduler || this.#phase === "decision") return;
     // The first-sync gate needs an answer, and an unattended pass has nobody to give one.
     if (
@@ -865,7 +929,74 @@ export default class LogSyncPlugin extends Plugin {
     // forced open has broken the app rather than merely stopped working.
     this.#mobileStatusBar?.disable();
     this.#mobileStatusBar = null;
+    // Not a clear: a pass still running keeps its marker on disk, so the next load pauses.
+    // Retiring only stops this instance from writing over what the next instance reads.
+    this.#diagnostics?.retire();
     this.#retireScheduler();
+  }
+
+  /** Automatic sync is held: paused after an interrupted pass, or recovery logging failed. */
+  get automaticSyncPaused(): boolean {
+    return this.#diagnostics?.blocksAutomatic ?? false;
+  }
+
+  /** Paused because an earlier pass never settled (not merely because logging failed). */
+  get recoveryPaused(): boolean {
+    return this.#diagnostics?.paused ?? false;
+  }
+
+  /**
+   * Reads the recovery record in this plugin's own folder. `manifest.dir` when Obsidian gives
+   * it; otherwise the folder it would be, from the vault's config directory and the plugin id.
+   */
+  async #loadDiagnostics(): Promise<void> {
+    const dir =
+      this.manifest?.dir ?? `${configDirOf(this.app)}/plugins/${this.manifest?.id ?? "cloudflare-rdo-sync"}`;
+    const adapter = (this.app.vault as Partial<Vault> | undefined)?.adapter as
+      | DiagnosticStorage
+      | undefined;
+    const storage: DiagnosticStorage = {
+      stat: (path) => {
+        if (adapter === undefined) throw new Error("vault adapter unavailable");
+        return adapter.stat(path);
+      },
+      read: (path) => {
+        if (adapter === undefined) throw new Error("vault adapter unavailable");
+        return adapter.read(path);
+      },
+      write: (path, data) => {
+        if (adapter === undefined) throw new Error("vault adapter unavailable");
+        return adapter.write(path, data);
+      },
+    };
+    this.#diagnostics = new SyncDiagnostics({
+      storage,
+      path: `${dir}/${DIAGNOSTIC_FILE}`,
+      pluginVersion: this.manifest?.version ?? "unknown",
+      platform: platformLabel(),
+      onFailure: (failure, error) => {
+        console.error(`R2DO Sync: recovery logging failed (${failure})`, error);
+        new Notice(RECOVERY_LOG_FAILED_NOTICE, 0);
+        this.#renderStatus();
+      },
+    });
+    const outcome = await this.#diagnostics.load();
+    if (outcome.paused) new Notice(RECOVERY_PAUSED_NOTICE, 0);
+  }
+
+  /**
+   * The explicit way out of a recovery pause. Persisted before automatic sync is allowed
+   * again, so a resume that could not be written does not quietly re-pause at the next load.
+   * Does not start a pass itself; the next startup, timer or edit does. The pass after it is a
+   * full audit, because edits during the pause may have fallen out of the journal.
+   */
+  async resumeAutomaticSync(): Promise<boolean> {
+    const diagnostics = this.#diagnostics;
+    if (diagnostics === null || !diagnostics.blocksAutomatic) return true;
+    const resumed = await diagnostics.resume();
+    if (resumed) this.#engine?.markDirty([], { fullScan: true });
+    this.#renderStatus();
+    return resumed;
   }
 
   /**
@@ -1165,6 +1296,10 @@ export default class LogSyncPlugin extends Plugin {
     }
     if (generation !== this.#generation) return;
 
+    const diagnostics = this.#diagnostics;
+    /** The pass this generation's engine is running, so its checkpoints land on its own marker. */
+    let pass: PassToken | null = null;
+
     const store: StateStore = {
       load: async () => {
         if (generation !== this.#generation) throw new Error("sync configuration changed");
@@ -1172,6 +1307,7 @@ export default class LogSyncPlugin extends Plugin {
       },
       save: async (state) => {
         if (generation !== this.#generation) throw new Error("sync configuration changed");
+        if (diagnostics !== null && pass !== null) await diagnostics.checkpoint(pass, "save");
         this.#state = state;
         await this.#persist();
         if (generation !== this.#generation) throw new Error("sync configuration changed");
@@ -1213,16 +1349,49 @@ export default class LogSyncPlugin extends Plugin {
         this.#progress = `${phase === "pull" ? "pulling" : "uploading"} ${done}/${total}`;
         this.#renderStatus();
       },
+      onCheckpoint: async (phase) => {
+        if (diagnostics !== null && pass !== null) await diagnostics.checkpoint(pass, phase);
+      },
     });
 
+    // The one seam every scheduled pass goes through — startup, timer, resume, file events,
+    // manual, forced pushes and every retry — so each one is marked the same way, inside the
+    // scheduler's serialisation. The marker is on disk before the engine does any work, and is
+    // cleared only once the pass settles; a process killed in between leaves it for the next load.
+    const engine = this.#engine;
+    const marked = {
+      sync: async (opts?: SyncPassOptions): Promise<SyncResult> => {
+        if (diagnostics === null) return await engine.sync(opts);
+        if (diagnostics.blocksAutomatic && this.#interactive === 0) {
+          throw new AutomaticSyncBlockedError("automatic sync is paused");
+        }
+        const token = await diagnostics.beginPass();
+        pass = token;
+        try {
+          const result = await engine.sync(opts);
+          await diagnostics.finishPass(token, { result });
+          return result;
+        } catch (error) {
+          await diagnostics.finishPass(token, { error });
+          throw error;
+        } finally {
+          if (pass === token) pass = null;
+        }
+      },
+    };
+
     this.#scheduler = new SyncScheduler({
-      engine: this.#engine,
+      engine: marked,
       debounceMs: Math.max(500, this.settings.debounceSeconds * 1000),
       retryDelaysMs: RETRY_DELAYS_MS.slice(0, this.settings.retryAttempts),
       onResult: (r) => {
         if (generation === this.#generation) void this.#report(r);
       },
       onError: (e) => {
+        if (e instanceof AutomaticSyncBlockedError) {
+          this.#renderStatus();
+          return;
+        }
         if (generation === this.#generation) void this.#reportError(e);
       },
     });
@@ -1829,7 +1998,7 @@ export default class LogSyncPlugin extends Plugin {
   }
 
   async exportLog(): Promise<void> {
-    const body = formatLogNote(this.#log, Date.now());
+    const body = `${formatLogNote(this.#log, Date.now())}${NL}${this.#recoveryReport()}`;
     const name = `r2do-sync-report-${stamp(Date.now())}.md`;
     try {
       const folder = await this.#ensureLogFolder();
@@ -1839,6 +2008,27 @@ export default class LogSyncPlugin extends Plugin {
     } catch (e) {
       new Notice(`R2DO Sync could not write the report: ${message(e)}`, 10_000);
     }
+  }
+
+  /**
+   * The recovery record as it stands in memory, appended to the exported report. Read from
+   * memory rather than disk so it still exports when the record itself could not be read or
+   * written — that failure is then part of what it reports.
+   */
+  #recoveryReport(): string {
+    const diagnostics = this.#diagnostics;
+    const report =
+      diagnostics === null
+        ? { unavailable: true }
+        : { ...diagnostics.snapshot(), loggingFailure: diagnostics.failure };
+    return [
+      "## Sync recovery diagnostics",
+      "",
+      "```json",
+      JSON.stringify(report, null, 2),
+      "```",
+      "",
+    ].join(NL);
   }
 
   /**
@@ -2665,7 +2855,9 @@ export default class LogSyncPlugin extends Plugin {
       case "first-sync":
         return "CONFIRM FIRST SYNC";
       case "idle":
-        return this.#lastPassText();
+        // Held for as long as the pause is, including after a manual pass: that pass did not
+        // resume anything, and "synced 1m ago" would read as if it had.
+        return this.automaticSyncPaused ? RECOVERY_PAUSED_STATUS : this.#lastPassText();
     }
   }
 
@@ -6206,6 +6398,19 @@ export class LogSyncSettingTab extends PluginSettingTab {
   /** The exported log and the two knobs that shape it. */
   #renderTroubleshooting(containerEl: HTMLElement): void {
     this.#heading(containerEl, "Troubleshooting");
+
+    // First, and only while it applies: it is the one row here that changes what sync does.
+    if (this.plugin.recoveryPaused) {
+      new Setting(containerEl)
+        .setName(RESUME_AUTOMATIC_LABEL)
+        .setDesc(RESUME_AUTOMATIC_DESC)
+        .addButton((b) =>
+          b.setButtonText(RESUME_AUTOMATIC_LABEL).onClick(async () => {
+            await this.plugin.resumeAutomaticSync();
+            this.display();
+          })
+        );
+    }
 
     new Setting(containerEl)
       .setName("Sync log")

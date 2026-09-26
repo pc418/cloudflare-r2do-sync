@@ -573,6 +573,9 @@ export interface SyncStatus {
   lastSyncAt?: number;
 }
 
+/** Coarse phases of a sync pass, reported through `SyncEngineOptions.onCheckpoint`. */
+export type SyncCheckpoint = "head" | "remote" | "scan" | "merge" | "upload" | "commit";
+
 export interface SyncEngineOptions {
   vault: VaultAdapter;
   api: SyncApiLike;
@@ -612,6 +615,12 @@ export interface SyncEngineOptions {
   /** What happens to unmergeable pairs. Default "keep-both"; see `ConflictMode`. */
   conflictMode?: ConflictMode;
   onProgress?: (p: { phase: "pull" | "upload"; done: number; total: number }) => void;
+  /**
+   * Awaited at coarse points of a sync pass, so a caller can persist where a pass that never
+   * returns stopped. Absent costs nothing. A rejection fails the pass, so a hook that only
+   * records must swallow its own errors.
+   */
+  onCheckpoint?: (phase: SyncCheckpoint) => Promise<void>;
   /** Files processed concurrently per phase. See `pool.ts`; 1 restores serial behaviour. */
   lanes?: number;
 }
@@ -870,6 +879,7 @@ export class SyncEngine {
   readonly #decideMassChange: ((s: MassChangeSummary) => Promise<MassChangeDecision>) | null;
   readonly #decideContinuity: ((s: ContinuitySummary) => Promise<ContinuityDecision>) | null;
   readonly #onProgress: SyncEngineOptions["onProgress"];
+  readonly #onCheckpoint: SyncEngineOptions["onCheckpoint"];
   readonly #lanes: number;
   /**
    * History rows already built this session, keyed by manifest id *and* the snapshot they
@@ -936,6 +946,7 @@ export class SyncEngine {
     this.#decideMassChange = opts.decideMassChange ?? null;
     this.#decideContinuity = opts.decideContinuity ?? null;
     this.#onProgress = opts.onProgress;
+    this.#onCheckpoint = opts.onCheckpoint;
     this.#lanes = clampLanes(opts.lanes ?? DEFAULT_LANES);
   }
 
@@ -1091,8 +1102,10 @@ export class SyncEngine {
     // the "another device keeps committing" message lie about which happened.
     let casAttempt = 1;
     let rescans = 0;
+    const checkpoint = this.#onCheckpoint;
 
     for (;;) {
+      if (checkpoint) await checkpoint("head");
       const serverHead = await this.#api.getHead();
 
       // A reroot is pinned to the snapshot the operator was shown. Every other pass treats a
@@ -1135,6 +1148,7 @@ export class SyncEngine {
         // invalid file out of `untouchable` and let the remote copy overwrite it. Applying
         // the remote then touches paths the journal never mentioned either.
         incrementalScan = false;
+        if (checkpoint) await checkpoint("remote");
         const remote = await this.#api.getManifest(serverHead);
         const mismatch = this.#modeError(remote, serverHead);
         if (mismatch !== null) return this.#halt(mismatch, outcome);
@@ -1168,6 +1182,7 @@ export class SyncEngine {
         // these, are the blobs the manifest we are about to parent onto references.
         const remoteBlobs = new Set(Object.values(remoteFiles).map(blobKey));
 
+        if (checkpoint) await checkpoint("scan");
         const local = await buildSnapshot();
         remoteSkipped = local.skipped;
         const collisionResolution = this.#resolveRemoteCaseCollisions(
@@ -1238,6 +1253,7 @@ export class SyncEngine {
           }
 
           if (!keepLocal) {
+            if (checkpoint) await checkpoint("merge");
             const applied = await this.#executePlan(plan, remote.device);
             outcome.pulled += applied.pulled;
             outcome.merged += applied.merged;
@@ -1279,6 +1295,7 @@ export class SyncEngine {
       }
 
       // What our commit will be layered on: the snapshot we are about to parent onto.
+      if (checkpoint) await checkpoint("scan");
       const { files, skipped, lines: freshLines, inventory } = await buildSnapshot();
       const carried = this.#carry(baseFiles, untouchable(skipped));
 
@@ -1349,6 +1366,7 @@ export class SyncEngine {
       // to re-upload. Commit still checks, and still fails loud, either way. A reroot
       // parents onto nothing and an empty remote has nothing, so both ask about everything.
       const onParent = reroot === null && serverHead !== null ? baseBlobs : new Set<string>();
+      if (checkpoint) await checkpoint("upload");
       const missing = await this.#api.checkBlobs(hashes.filter((h) => !onParent.has(h)));
       // One pass over the snapshot instead of a scan per upload: at a few thousand files
       // the old find-per-hash was the slowest part of a first sync, not the network.
@@ -1368,6 +1386,7 @@ export class SyncEngine {
         // A reroot's parent is null while its CAS token is still the head this pass saw. If
         // that race is lost, the retry above refuses outright rather than rerooting over the
         // winner: for this one pass a stale head is not something to merge and try again.
+        if (checkpoint) await checkpoint("commit");
         const manifest = await this.#buildManifest(reroot !== null ? null : serverHead, finalFiles, hashes);
         try {
           head = await this.#api.commit(manifest, serverHead, { reroot: reroot !== null });

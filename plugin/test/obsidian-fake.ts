@@ -419,7 +419,7 @@ export class AppVault {
    * pass actually runs, so these throw rather than pretending to be an empty vault: a
    * lifecycle test that reaches the filesystem has escaped its own scope.
    */
-  adapter = {
+  #base: Record<string, unknown> = {
     list: (): never => {
       throw new Error("adapter.list: lifecycle tests must not run a real pass");
     },
@@ -427,6 +427,75 @@ export class AppVault {
       throw new Error("adapter.stat: lifecycle tests must not run a real pass");
     },
   };
+  /**
+   * Files under `<configDir>/plugins/` — this plugin's own folder, where the sync recovery
+   * record lives. Held apart from whatever vault adapter a test installs, so replacing the
+   * adapter does not lose them, and a "restarted" plugin can be handed the same map to read
+   * what the previous instance left on disk.
+   */
+  configFiles = new Map<string, string>();
+  /** Every plugin-folder write, in order, as `path` + the content written. */
+  readonly configWrites: { path: string; data: string }[] = [];
+  /** Test-controlled failures for plugin-folder calls. */
+  configFaults: { stat?: Error; read?: Error; write?: Error } = {};
+
+  #isConfigPath(path: unknown): path is string {
+    return typeof path === "string" && path.startsWith(`${this.configDir}/plugins/`);
+  }
+
+  #routed(prop: string): ((...args: unknown[]) => unknown) | undefined {
+    const base = (): Record<string, unknown> => this.#base;
+    const passThrough = (...args: unknown[]): unknown => {
+      const fn = base()[prop];
+      if (typeof fn !== "function") throw new TypeError(`adapter.${prop} is not a function`);
+      return (fn as (...a: unknown[]) => unknown).apply(base(), args);
+    };
+    if (prop === "stat") {
+      return async (path: unknown, ...rest: unknown[]) => {
+        if (!this.#isConfigPath(path)) return passThrough(path, ...rest);
+        if (this.configFaults.stat) throw this.configFaults.stat;
+        const data = this.configFiles.get(path);
+        return data === undefined ? null : { type: "file", size: data.length, mtime: 1, ctime: 1 };
+      };
+    }
+    if (prop === "read") {
+      return async (path: unknown, ...rest: unknown[]) => {
+        if (!this.#isConfigPath(path)) return passThrough(path, ...rest);
+        if (this.configFaults.read) throw this.configFaults.read;
+        const data = this.configFiles.get(path);
+        if (data === undefined) throw new Error(`ENOENT: ${path}`);
+        return data;
+      };
+    }
+    if (prop === "write") {
+      return async (path: unknown, data: unknown, ...rest: unknown[]) => {
+        if (!this.#isConfigPath(path)) return passThrough(path, data, ...rest);
+        if (this.configFaults.write) throw this.configFaults.write;
+        this.configFiles.set(path, String(data));
+        this.configWrites.push({ path, data: String(data) });
+      };
+    }
+    return undefined;
+  }
+
+  readonly #adapterProxy: unknown = new Proxy(
+    {},
+    {
+      get: (_target, prop) =>
+        (typeof prop === "string" ? this.#routed(prop) : undefined) ?? Reflect.get(this.#base, prop),
+      set: (_target, prop, value) => Reflect.set(this.#base, prop, value),
+      has: (_target, prop) =>
+        prop === "stat" || prop === "read" || prop === "write" || Reflect.has(this.#base, prop),
+    }
+  );
+
+  /** Tests replace it wholesale; plugin-folder paths are always served from `configFiles`. */
+  get adapter(): Record<string, unknown> {
+    return this.#adapterProxy as Record<string, unknown>;
+  }
+  set adapter(value: Record<string, unknown>) {
+    this.#base = value;
+  }
   on(name: string, handler: (...args: unknown[]) => unknown): RecordedEvent {
     const event = { target: "vault", name, handler };
     this.events.push(event);
