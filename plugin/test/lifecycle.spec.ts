@@ -2136,9 +2136,14 @@ describe("startup readiness gate", () => {
   }
 
   /** A request can finish before the scheduler's asynchronous result is persisted. */
+  // A pass awaits real macrotasks (WebCrypto, the recovery marker's writes), so fake-timer ticks
+  // alone can return before it settles on a slower runner; yield the real loop too.
+  const realImmediate = (globalThis as unknown as { setImmediate: (cb: () => void) => void })
+    .setImmediate;
   async function awaitRecordedPasses(plugin: LogSyncPlugin, count: number): Promise<void> {
-    for (let i = 0; i < 100 && outcomes(plugin).length < count; i++) {
+    for (let i = 0; i < 2000 && outcomes(plugin).length < count; i++) {
       await vi.advanceTimersByTimeAsync(1);
+      await new Promise<void>((resolve) => realImmediate(resolve));
     }
     expect(outcomes(plugin)).toHaveLength(count);
   }
@@ -2202,6 +2207,7 @@ describe("startup readiness gate", () => {
 
     layoutReady(app);
     await elapse(DEBOUNCE_MS * 4);
+    await awaitRecordedPasses(plugin, 1);
 
     // One pass, and it is the full audit: the vault was listed and every file read once.
     expect(headCalls()).toBe(1);
@@ -2240,11 +2246,11 @@ describe("startup readiness gate", () => {
     vault.content.set("n0.md", text("n0.md", 2));
     app.vault.fire("modify", { path: "n0.md" });
     await elapse(DEBOUNCE_MS * 2);
+    await awaitRecordedPasses(plugin, 1);
 
     expect(headCalls()).toBe(1);
     expect(vault.lists).toBe(1);
     expect(vault.reads).toContain("n3.md");
-    await awaitRecordedPasses(plugin, 1);
     expect(outcomes(plugin)).toEqual(["committed"]);
 
     // Paid once: a later edit is incremental again and reads only what it names.
@@ -2252,10 +2258,10 @@ describe("startup readiness gate", () => {
     vault.content.set("n1.md", text("n1.md", 2));
     app.vault.fire("modify", { path: "n1.md" });
     await elapse(DEBOUNCE_MS * 2);
+    await awaitRecordedPasses(plugin, 2);
     expect(headCalls()).toBe(2);
     expect(vault.lists).toBe(1);
     expect(vault.reads).toEqual(["n1.md"]);
-    await awaitRecordedPasses(plugin, 2);
     expect(outcomes(plugin)).toEqual(["committed", "committed"]);
   });
 
@@ -2338,6 +2344,7 @@ describe("startup readiness gate", () => {
     app.workspace.onLayoutReady = (callback) => { callback(); };
     await plugin.onload();
     await elapse(DEBOUNCE_MS * 2);
+    await awaitRecordedPasses(plugin, 1);
 
     expect(headCalls()).toBe(1);
     expect([...vault.reads].sort()).toEqual(PATHS);
@@ -2346,6 +2353,7 @@ describe("startup readiness gate", () => {
     vault.content.set("n0.md", text("n0.md", 2));
     app.vault.fire("modify", { path: "n0.md" });
     await elapse(DEBOUNCE_MS * 2);
+    await awaitRecordedPasses(plugin, 2);
     expect(headCalls()).toBe(2);
     expect(outcomes(plugin)).toEqual(["committed", "committed"]);
   });
