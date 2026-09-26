@@ -586,7 +586,10 @@ describe("after a pass", () => {
       expect(server.commits[0].parent).toBe("01REMOTE");
       expect(Object.keys(server.commits[0].files).sort()).toEqual(["in/huge.txt", "keep.md"]);
       expect(server.commits[0].files["in/huge.txt"].h).toBe(await sha256Hex(huge));
-    }
+    },
+    // CPU-bound, not timer-bound: two passes hash and carry a note over 1.5 MiB. Measured 7-12 s
+    // on a loaded machine against vitest's 5 s default.
+    30_000
   );
 
   it("never renames onto a name that exists, and says which", async () => {
