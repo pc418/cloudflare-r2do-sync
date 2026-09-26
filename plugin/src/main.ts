@@ -524,10 +524,10 @@ export const RESUME_AUTOMATIC_DESC =
   "resuming allows startup, timer and file-change sync again.";
 export const RESUME_AFTER_LOG_FAILURE_DESC =
   "Automatic sync stopped because the recovery record could not be read or written. " +
-  "Resuming writes it again and, if that works, allows startup, timer and file-change sync again.";
+  "Resume retries it; an unreadable record is saved beside it before automatic sync resumes.";
 export const RECOVERY_LOG_FAILED_NOTICE =
-  "R2DO Sync: recovery logging failed, so automatic sync is stopped. Once storage works " +
-  "again, use Resume automatic sync in the Troubleshooting settings.";
+  "R2DO Sync: recovery logging failed, so automatic sync is stopped. Use Resume automatic " +
+  "sync in the Troubleshooting settings to retry or set aside an unreadable record.";
 
 /**
  * An automatic pass reached the engine seam while automatic sync is paused or recovery logging
@@ -1040,9 +1040,17 @@ export default class LogSyncPlugin extends Plugin {
         if (adapter === undefined) throw new Error("vault adapter unavailable");
         return adapter.read(path);
       },
+      readBinary: (path) => {
+        if (adapter === undefined) throw new Error("vault adapter unavailable");
+        return adapter.readBinary(path);
+      },
       write: (path, data) => {
         if (adapter === undefined) throw new Error("vault adapter unavailable");
         return adapter.write(path, data);
+      },
+      writeBinary: (path, data) => {
+        if (adapter === undefined) throw new Error("vault adapter unavailable");
+        return adapter.writeBinary(path, data);
       },
     };
     this.#diagnostics = new SyncDiagnostics({
@@ -1069,7 +1077,9 @@ export default class LogSyncPlugin extends Plugin {
   async resumeAutomaticSync(): Promise<boolean> {
     const diagnostics = this.#diagnostics;
     if (diagnostics === null || !diagnostics.blocksAutomatic) return true;
+    const wasPaused = diagnostics.paused;
     const resumed = await diagnostics.resume();
+    if (!resumed && !wasPaused && diagnostics.paused) new Notice(RECOVERY_PAUSED_NOTICE, 0);
     if (resumed) this.#engine?.markDirty([], { fullScan: true });
     this.#renderStatus();
     return resumed;
@@ -1450,7 +1460,9 @@ export default class LogSyncPlugin extends Plugin {
         if (diagnostics?.blocksAutomatic && !isManualSync(opts)) {
           throw new AutomaticSyncBlockedError("automatic sync is paused");
         }
+        const wasPaused = diagnostics?.paused ?? false;
         const token = await diagnostics?.beginPass() ?? null;
+        if (!wasPaused && diagnostics?.paused) new Notice(RECOVERY_PAUSED_NOTICE, 0);
         pass = token;
         try {
           // A forced publish ships what the user previewed, so it is not changed underneath.

@@ -37,11 +37,17 @@ class MemoryStorage implements DiagnosticStorage {
     if (data === undefined) throw new Error("ENOENT");
     return data;
   }
+  async readBinary(path: string) {
+    return Uint8Array.from(new TextEncoder().encode(await this.read(path))).buffer;
+  }
   async write(path: string, data: string) {
     if (this.gated) await new Promise<void>((resolve) => this.#gates.push(resolve));
     if (this.failWrite) throw this.failWrite;
     this.files.set(path, data);
     this.writes.push(data);
+  }
+  async writeBinary(path: string, data: ArrayBuffer) {
+    await this.write(path, new TextDecoder().decode(data));
   }
   releaseAll(): void {
     this.gated = false;

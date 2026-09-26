@@ -437,7 +437,7 @@ export class AppVault {
   /** Every plugin-folder write, in order, as `path` + the content written. */
   readonly configWrites: { path: string; data: string }[] = [];
   /** Test-controlled failures for plugin-folder calls. */
-  configFaults: { stat?: Error; read?: Error; write?: Error } = {};
+  configFaults: { stat?: Error; read?: Error; readBinary?: Error; write?: Error; writeBinary?: Error } = {};
 
   #isConfigPath(path: unknown): path is string {
     return typeof path === "string" && path.startsWith(`${this.configDir}/plugins/`);
@@ -467,12 +467,31 @@ export class AppVault {
         return data;
       };
     }
+    if (prop === "readBinary") {
+      return async (path: unknown, ...rest: unknown[]) => {
+        if (!this.#isConfigPath(path)) return passThrough(path, ...rest);
+        if (this.configFaults.readBinary) throw this.configFaults.readBinary;
+        const data = this.configFiles.get(path);
+        if (data === undefined) throw new Error(`ENOENT: ${path}`);
+        return Uint8Array.from(new TextEncoder().encode(data)).buffer;
+      };
+    }
     if (prop === "write") {
       return async (path: unknown, data: unknown, ...rest: unknown[]) => {
         if (!this.#isConfigPath(path)) return passThrough(path, data, ...rest);
         if (this.configFaults.write) throw this.configFaults.write;
         this.configFiles.set(path, String(data));
         this.configWrites.push({ path, data: String(data) });
+      };
+    }
+    if (prop === "writeBinary") {
+      return async (path: unknown, data: unknown, ...rest: unknown[]) => {
+        if (!this.#isConfigPath(path)) return passThrough(path, data, ...rest);
+        if (this.configFaults.writeBinary) throw this.configFaults.writeBinary;
+        if (!(data instanceof ArrayBuffer)) throw new TypeError("writeBinary needs ArrayBuffer");
+        const text = new TextDecoder().decode(data);
+        this.configFiles.set(path, text);
+        this.configWrites.push({ path, data: text });
       };
     }
     return undefined;
@@ -485,7 +504,7 @@ export class AppVault {
         (typeof prop === "string" ? this.#routed(prop) : undefined) ?? Reflect.get(this.#base, prop),
       set: (_target, prop, value) => Reflect.set(this.#base, prop, value),
       has: (_target, prop) =>
-        prop === "stat" || prop === "read" || prop === "write" || Reflect.has(this.#base, prop),
+        prop === "stat" || prop === "read" || prop === "readBinary" || prop === "write" || prop === "writeBinary" || Reflect.has(this.#base, prop),
     }
   );
 

@@ -19,7 +19,9 @@ import { ApiError } from "./api";
 
 export const DIAGNOSTIC_SCHEMA = "iphone-recovery-1";
 export const DIAGNOSTIC_FILE = "sync-recovery.json";
+export const UNREADABLE_FILE = "sync-recovery.unreadable.txt";
 export const TRACE_LIMIT = 24;
+const UNREADABLE_MAX_BYTES = 65_536;
 
 /** Every event the trace may hold. A closed set is what keeps the record free of user data. */
 export const TRACE_EVENTS = [
@@ -36,6 +38,7 @@ export const TRACE_EVENTS = [
   "save",
   "pass-complete",
   "pass-failed",
+  "unreadable-set-aside",
 ] as const;
 export type TraceEvent = (typeof TRACE_EVENTS)[number];
 
@@ -67,11 +70,26 @@ export interface DiagnosticRecord {
   trace: TraceEntry[];
 }
 
-/** The slice of Obsidian's `DataAdapter` this needs; all three exist since before 1.5. */
+/** The slice of Obsidian's `DataAdapter` this needs; binary I/O preserves corrupt bytes. */
 export interface DiagnosticStorage {
   stat(path: string): Promise<{ type: string } | null>;
   read(path: string): Promise<string>;
+  readBinary(path: string): Promise<ArrayBuffer>;
   write(path: string, data: string): Promise<void>;
+  writeBinary(path: string, data: ArrayBuffer): Promise<void>;
+}
+
+type ReadOutcome = "ready" | "read" | "parse";
+
+function unreadableCopy(raw: ArrayBuffer): ArrayBuffer {
+  if (raw.byteLength <= UNREADABLE_MAX_BYTES) return raw;
+  const marker = new TextEncoder().encode(
+    `\n[truncated: original length ${raw.byteLength} bytes]\n`
+  );
+  const copy = new Uint8Array(UNREADABLE_MAX_BYTES + marker.byteLength);
+  copy.set(new Uint8Array(raw, 0, UNREADABLE_MAX_BYTES));
+  copy.set(marker, UNREADABLE_MAX_BYTES);
+  return copy.buffer;
 }
 
 export type DiagnosticFailure = "read" | "parse" | "write";
@@ -205,6 +223,8 @@ export class SyncDiagnostics {
   readonly #now: () => number;
   readonly #onFailure: SyncDiagnosticsOptions["onFailure"];
   #record: DiagnosticRecord;
+  /** False after an unreadable load: no write may replace a record we have not examined. */
+  #recordTrusted = false;
   #failure: DiagnosticFailure | null = null;
   /** Serialises writes. Each write serialises the record as it is when the write runs. */
   #chain: Promise<void> = Promise.resolve();
@@ -248,6 +268,17 @@ export class SyncDiagnostics {
    * persisted before this returns so it survives the next restart too.
    */
   async load(): Promise<LoadOutcome> {
+    if ((await this.#readStored()) !== "ready") {
+      this.#push("plugin-load");
+      return { paused: this.paused, failure: this.#failure };
+    }
+    this.#push("plugin-load");
+    await this.#pauseInterrupted();
+    return { paused: this.paused, failure: this.#failure };
+  }
+
+  /** Reads a trustworthy base before any write. A failed read/parse leaves the disk untouched. */
+  async #readStored(): Promise<ReadOutcome> {
     const { pluginVersion, platform } = this.#record;
     let text: string | null = null;
     try {
@@ -258,20 +289,25 @@ export class SyncDiagnostics {
       }
     } catch (e) {
       this.#fail("read", e);
-      this.#push("plugin-load");
-      return { paused: this.paused, failure: this.#failure };
+      return "read";
     }
     if (text !== null) {
       const parsed = parseRecord(text);
       if (parsed === null) {
         this.#fail("parse", new Error("recovery record is not readable"));
-        this.#push("plugin-load");
-        return { paused: this.paused, failure: this.#failure };
+        return "parse";
       }
       // Identity describes the build writing the record now, not the one that wrote it last.
       this.#record = { ...parsed, pluginVersion, platform };
+    } else {
+      this.#record = freshRecord(pluginVersion, platform);
     }
-    this.#push("plugin-load");
+    this.#recordTrusted = true;
+    return "ready";
+  }
+
+  /** An old active marker becomes a durable pause, never an invitation to repeat the pass. */
+  async #pauseInterrupted(): Promise<boolean> {
     const interrupted = this.#record.active;
     if (interrupted !== null) {
       const at = this.#now();
@@ -281,14 +317,40 @@ export class SyncDiagnostics {
       try {
         await this.#write();
       } catch (e) {
+        // The disk may still hold the active marker. Re-read it before any later write;
+        // otherwise a second Resume could clear a pause that was never persisted.
+        this.#recordTrusted = false;
         this.#fail("write", e);
+        return false;
       }
     }
-    return { paused: this.paused, failure: this.#failure };
+    return true;
+  }
+
+  /** Retry a failed load before Resume or manual Sync now can write anything. */
+  async #recoverUnread(): Promise<ReadOutcome | "write"> {
+    if (this.#recordTrusted) return "ready";
+    const read = await this.#readStored();
+    if (read !== "ready") return read;
+    this.#push("plugin-load");
+    if (!(await this.#pauseInterrupted())) return "write";
+    // A discovered pause still blocks automation, but the unread-record failure is resolved.
+    if (this.paused) this.#failure = null;
+    return "ready";
   }
 
   /** Persists the active marker. Throws, and the pass must not start, if that fails. */
   async beginPass(): Promise<PassToken> {
+    const recovered = await this.#recoverUnread();
+    if (recovered === "read") {
+      throw new Error("recovery logging failed: the recovery record could not be read, so the pass did not start");
+    }
+    if (recovered === "parse") {
+      throw new Error(
+        "recovery logging failed: the recovery record is unreadable. Use Resume automatic sync in the Troubleshooting settings to set it aside, then sync again"
+      );
+    }
+    if (recovered === "write") throw new DiagnosticWriteError();
     const token: PassToken = { seq: ++this.#seq, startedAt: this.#now() };
     this.#record.active = { startedAt: token.startedAt, phase: "pass-start", phaseAt: token.startedAt };
     this.#current = token;
@@ -361,6 +423,74 @@ export class SyncDiagnostics {
    * whether it was: a resume that is not on disk would come back paused at the next load.
    */
   async resume(): Promise<boolean> {
+    const unread = !this.#recordTrusted;
+    const recovered = await this.#recoverUnread();
+    if (recovered === "parse") return await this.#setAsideUnreadable();
+    if (recovered !== "ready") return false;
+    // The failed read hid a real interruption or pause. Show it first; another deliberate
+    // Resume may clear it, but this one must not silently undo the recovered evidence.
+    if (unread && this.paused) return false;
+    return await this.#resumeTrusted();
+  }
+
+  /** An explicit Resume may replace a corrupt record only after its bytes are set aside. */
+  async #setAsideUnreadable(): Promise<boolean> {
+    let raw: ArrayBuffer;
+    try {
+      raw = await this.#storage.readBinary(this.#path);
+    } catch (e) {
+      this.#failure = null; // the binary read is a new failed recovery attempt
+      this.#fail("read", e);
+      return false;
+    }
+
+    // The file could have been repaired between the text and binary reads. Reconcile a valid
+    // record instead of discarding it on the strength of an earlier parse failure.
+    let parsed: DiagnosticRecord | null = null;
+    try {
+      parsed = parseRecord(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+    } catch {
+      // Invalid UTF-8 is itself unreadable; its original bytes still go to the sidecar.
+    }
+    if (parsed !== null) {
+      const { pluginVersion, platform } = this.#record;
+      this.#record = { ...parsed, pluginVersion, platform };
+      this.#recordTrusted = true;
+      this.#push("plugin-load");
+      if (!(await this.#pauseInterrupted())) return false;
+      if (this.paused) {
+        this.#failure = null;
+        return false;
+      }
+      return await this.#resumeTrusted();
+    }
+
+    try {
+      const dir = this.#path.slice(0, this.#path.lastIndexOf("/") + 1);
+      await this.#storage.writeBinary(`${dir}${UNREADABLE_FILE}`, unreadableCopy(raw));
+    } catch (e) {
+      this.#failure = null; // report this failed preservation attempt, not only the old parse
+      this.#fail("write", e);
+      return false;
+    }
+
+    const { pluginVersion, platform } = this.#record;
+    this.#record = freshRecord(pluginVersion, platform);
+    this.#recordTrusted = true;
+    this.#push("unreadable-set-aside");
+    try {
+      await this.#write();
+    } catch (e) {
+      this.#recordTrusted = false;
+      this.#failure = null;
+      this.#fail("write", e);
+      return false;
+    }
+    this.#failure = null;
+    return true;
+  }
+
+  async #resumeTrusted(): Promise<boolean> {
     const previous = this.#record.paused;
     this.#record.paused = null;
     this.#push("resumed");
@@ -395,6 +525,7 @@ export class SyncDiagnostics {
   #write(): Promise<void> {
     const write = this.#chain.then(async () => {
       if (this.#retired) throw new Error("recovery logging retired with the plugin");
+      if (!this.#recordTrusted) throw new Error("recovery record has not been read safely");
       await this.#storage.write(this.#path, `${JSON.stringify(this.#record, null, 2)}\n`);
     });
     this.#chain = write.catch(() => {});

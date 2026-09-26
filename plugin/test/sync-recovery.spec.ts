@@ -8,7 +8,7 @@ import LogSyncPlugin, {
   RESUME_AUTOMATIC_LABEL,
   type Settings,
 } from "../src/main";
-import { DIAGNOSTIC_SCHEMA, TRACE_LIMIT, type DiagnosticRecord } from "../src/sync-diagnostics";
+import { DIAGNOSTIC_SCHEMA, TRACE_LIMIT, parseRecord, type DiagnosticRecord } from "../src/sync-diagnostics";
 import {
   type FakeElement,
   LifecycleApp,
@@ -70,6 +70,7 @@ function installGlobals(): void {
 const SERVER = "https://synthetic-vault.example.workers.dev";
 const TOKEN = "synthetic-access-token-0123";
 const RECORD_PATH = ".obsidian/plugins/cloudflare-rdo-sync/sync-recovery.json";
+const UNREADABLE_PATH = ".obsidian/plugins/cloudflare-rdo-sync/sync-recovery.unreadable.txt";
 const PATHS = ["alpha-note.md", "beta-note.md", "gamma/delta-note.md"];
 const DEBOUNCE_MS = 5000;
 const INTERVAL_MINUTES = 3;
@@ -215,6 +216,20 @@ function record(disk: Map<string, string>): DiagnosticRecord {
 function recordOrNull(disk: Map<string, string>): DiagnosticRecord | null {
   const raw = disk.get(RECORD_PATH);
   return raw === undefined ? null : (JSON.parse(raw) as DiagnosticRecord);
+}
+
+function storedRecovery(over: Partial<DiagnosticRecord> = {}): DiagnosticRecord {
+  return {
+    schema: DIAGNOSTIC_SCHEMA,
+    pluginVersion: "1.1.4",
+    platform: "ios-mobile",
+    active: null,
+    paused: null,
+    lastCompleted: null,
+    lastFailed: null,
+    trace: [{ at: 10, event: "head" }],
+    ...over,
+  };
 }
 
 function statusText(device: Device): string {
@@ -641,6 +656,251 @@ describe("marker ownership across unload", () => {
 // --- logging failures -------------------------------------------------------------------
 
 describe("recovery logging failures", () => {
+  // PIN: owner 2026-09-25 — never overwrite an unread recovery record (docs/260925-fix-RECOVERY_RESUME_AFTER_READ_FAILURE.md)
+  it("re-reads a recovered record before Resume and preserves its history", async () => {
+    const previous = storedRecovery({
+      lastCompleted: { startedAt: 8, finishedAt: 11, status: "committed" },
+    });
+    const disk = new Map([[RECORD_PATH, JSON.stringify(previous)]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    device.app.vault.configFaults.read = new Error("temporary read failure");
+    await device.plugin.onload();
+    layoutReady(device.app);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
+
+    device.app.vault.configFaults = {};
+    expect(await device.plugin.resumeAutomaticSync()).toBe(true);
+    const resumed = record(disk);
+    expect(resumed.lastCompleted).toEqual(previous.lastCompleted);
+    expect(resumed.trace.slice(0, 1)).toEqual(previous.trace);
+    expect(resumed.trace.at(-1)?.event).toBe("resumed");
+    expect(resumed.pluginVersion).toBe("1.1.3");
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+  });
+
+  it("recovers an unread active marker as a pause before a second explicit Resume", async () => {
+    const interrupted = { startedAt: 8, phase: "merge" as const, phaseAt: 9 };
+    const previous = storedRecovery({ active: interrupted });
+    const disk = new Map([[RECORD_PATH, JSON.stringify(previous)]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    device.app.vault.configFaults.read = new Error("temporary read failure");
+    await device.plugin.onload();
+    layoutReady(device.app);
+
+    device.app.vault.configFaults = {};
+    expect(await device.plugin.resumeAutomaticSync()).toBe(false);
+    const recovered = record(disk);
+    expect(recovered.active).toBeNull();
+    expect(recovered.paused?.interrupted).toEqual(interrupted);
+    expect(recovered.trace[0]).toEqual(previous.trace[0]);
+    expect(recovered.trace.at(-1)?.event).toBe("recovery-paused");
+    expect(device.plugin.recoveryPaused).toBe(true);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
+    expect(Notice.shown).toContain(RECOVERY_PAUSED_NOTICE);
+
+    expect(await device.plugin.resumeAutomaticSync()).toBe(true);
+    expect(record(disk).paused).toBeNull();
+    expect(record(disk).trace.some((entry) => entry.event === "recovery-paused")).toBe(true);
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+  });
+
+  it("re-establishes an unread stored pause before allowing Resume", async () => {
+    const interrupted = { startedAt: 8, phase: "upload" as const, phaseAt: 9 };
+    const previous = storedRecovery({ paused: { since: 10, interrupted } });
+    const disk = new Map([[RECORD_PATH, JSON.stringify(previous)]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    device.app.vault.configFaults.read = new Error("temporary read failure");
+    await device.plugin.onload();
+    layoutReady(device.app);
+
+    device.app.vault.configFaults = {};
+    expect(await device.plugin.resumeAutomaticSync()).toBe(false);
+    expect(record(disk).paused).toEqual(previous.paused);
+    expect(record(disk).trace[0]).toEqual(previous.trace[0]);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
+    expect(await device.plugin.resumeAutomaticSync()).toBe(true);
+    expect(record(disk).paused).toBeNull();
+  });
+
+  it("can recover a repaired parse failure without discarding its active marker", async () => {
+    const disk = new Map([[RECORD_PATH, "{not json"]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    await device.plugin.onload();
+    layoutReady(device.app);
+    const interrupted = { startedAt: 8, phase: "commit" as const, phaseAt: 9 };
+    disk.set(RECORD_PATH, JSON.stringify(storedRecovery({ active: interrupted })));
+
+    expect(await device.plugin.resumeAutomaticSync()).toBe(false);
+    expect(record(disk).paused?.interrupted).toEqual(interrupted);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
+  });
+
+  it("does not clear a newly discovered interruption when its pause write fails", async () => {
+    const interrupted = { startedAt: 8, phase: "merge" as const, phaseAt: 9 };
+    const raw = JSON.stringify(storedRecovery({ active: interrupted }));
+    const disk = new Map([[RECORD_PATH, raw]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    device.app.vault.configFaults.read = new Error("temporary read failure");
+    await device.plugin.onload();
+    layoutReady(device.app);
+
+    device.app.vault.configFaults = { write: new Error("temporary write failure") };
+    expect(await device.plugin.resumeAutomaticSync()).toBe(false);
+    expect(disk.get(RECORD_PATH)).toBe(raw);
+    await device.plugin.syncNow();
+    expect(headCalls()).toBe(0);
+    expect(disk.get(RECORD_PATH)).toBe(raw);
+
+    device.app.vault.configFaults = {};
+    expect(await device.plugin.resumeAutomaticSync()).toBe(false);
+    expect(record(disk).paused?.interrupted).toEqual(interrupted);
+    expect(await device.plugin.resumeAutomaticSync()).toBe(true);
+    expect(record(disk).paused).toBeNull();
+  });
+
+  it("refuses Resume and manual Sync now while a read failure persists", async () => {
+    const raw = JSON.stringify(storedRecovery());
+    const disk = new Map([[RECORD_PATH, raw]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    device.app.vault.configFaults.read = new Error("read unavailable");
+    await device.plugin.onload();
+    layoutReady(device.app);
+
+    expect(await device.plugin.resumeAutomaticSync()).toBe(false);
+    expect(disk.get(RECORD_PATH)).toBe(raw);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
+    await device.plugin.syncNow();
+    expect(headCalls()).toBe(0);
+    expect(disk.get(RECORD_PATH)).toBe(raw);
+    expect(Notice.shown).toContain(RECOVERY_LOG_FAILED_NOTICE);
+    expect(Notice.shown.join("\n")).toContain(
+      "recovery logging failed: the recovery record could not be read, so the pass did not start"
+    );
+  });
+
+  it.each([
+    ["unparsable JSON", "{not json"],
+    ["a wrong-schema record", JSON.stringify({ ...storedRecovery(), schema: "future-schema" })],
+  ])("sets aside %s before explicit Resume and allows automatic sync again", async (_case, raw) => {
+    const disk = new Map([[RECORD_PATH, raw], [UNREADABLE_PATH, "older diagnostic"]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    await device.plugin.onload();
+    layoutReady(device.app);
+
+    expect(await device.plugin.resumeAutomaticSync()).toBe(true);
+    expect(disk.get(UNREADABLE_PATH)).toBe(raw);
+    const sidecarBytes = await (device.app.vault.adapter.readBinary as (path: string) => Promise<ArrayBuffer>)(UNREADABLE_PATH);
+    expect(new Uint8Array(sidecarBytes)).toEqual(new TextEncoder().encode(raw));
+    expect(device.app.vault.configWrites.at(-2)?.path).toBe(UNREADABLE_PATH);
+    expect(device.app.vault.configWrites.at(-1)?.path).toBe(RECORD_PATH);
+    const fresh = record(disk);
+    expect(parseRecord(disk.get(RECORD_PATH)!)).not.toBeNull();
+    expect(fresh.active).toBeNull();
+    expect(fresh.paused).toBeNull();
+    expect(fresh.trace.at(-1)?.event).toBe("unreadable-set-aside");
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+
+    device.app.vault.fire("modify", { path: PATHS[0] });
+    await elapse(DEBOUNCE_MS * 2);
+    expect(headCalls()).toBe(1);
+  });
+
+  it("bounds a large unreadable sidecar at 64 KiB and records the original byte length", async () => {
+    const raw = "{" + "x".repeat(65_536 + 123);
+    const disk = new Map([[RECORD_PATH, raw]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    await device.plugin.onload();
+    layoutReady(device.app);
+
+    expect(await device.plugin.resumeAutomaticSync()).toBe(true);
+    expect(disk.get(UNREADABLE_PATH)).toBe(
+      `${raw.slice(0, 65_536)}\n[truncated: original length ${raw.length} bytes]\n`
+    );
+    expect(record(disk).trace.at(-1)?.event).toBe("unreadable-set-aside");
+  });
+
+  it("does not discard an unreadable record if the sidecar write fails", async () => {
+    const raw = "{not json";
+    const disk = new Map([[RECORD_PATH, raw]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    await device.plugin.onload();
+    layoutReady(device.app);
+    device.app.vault.configFaults.writeBinary = new Error("sidecar unavailable");
+
+    expect(await device.plugin.resumeAutomaticSync()).toBe(false);
+    expect(disk.get(RECORD_PATH)).toBe(raw);
+    expect(disk.has(UNREADABLE_PATH)).toBe(false);
+    expect(device.app.vault.configWrites).toEqual([]);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
+    expect(Notice.shown.filter((n) => n === RECOVERY_LOG_FAILED_NOTICE)).toHaveLength(2);
+
+    device.app.vault.configFaults = {};
+    expect(await device.plugin.resumeAutomaticSync()).toBe(true);
+    expect(disk.get(UNREADABLE_PATH)).toBe(raw);
+    expect(record(disk).trace.at(-1)?.event).toBe("unreadable-set-aside");
+  });
+
+  it.each([
+    ["unparsable JSON", "{not json"],
+    ["a wrong-schema record", JSON.stringify({ ...storedRecovery(), schema: "future-schema" })],
+  ])("manual Sync now refuses %s and points to Resume", async (_case, raw) => {
+    const disk = new Map([[RECORD_PATH, raw]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    await device.plugin.onload();
+    layoutReady(device.app);
+
+    await device.plugin.syncNow();
+    expect(headCalls()).toBe(0);
+    expect(disk.get(RECORD_PATH)).toBe(raw);
+    expect(disk.has(UNREADABLE_PATH)).toBe(false);
+    expect(Notice.shown.join("\n")).toContain(
+      "recovery logging failed: the recovery record is unreadable. Use Resume automatic sync in the Troubleshooting settings to set it aside, then sync again"
+    );
+  });
+
+  it("re-reads before manual Sync now, keeping a recovered interruption paused", async () => {
+    const interrupted = { startedAt: 8, phase: "scan" as const, phaseAt: 9 };
+    const disk = new Map([[RECORD_PATH, JSON.stringify(storedRecovery({ active: interrupted }))]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    device.app.vault.configFaults.read = new Error("temporary read failure");
+    await device.plugin.onload();
+    layoutReady(device.app);
+
+    device.app.vault.configFaults = {};
+    await device.plugin.syncNow();
+    expect(headCalls()).toBe(1);
+    expect(record(disk).paused?.interrupted).toEqual(interrupted);
+    expect(record(disk).active).toBeNull();
+    expect(record(disk).trace.some((entry) => entry.event === "recovery-paused")).toBe(true);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
+    expect(Notice.shown).toContain(RECOVERY_PAUSED_NOTICE);
+  });
+
+  it("keeps a running manual pass marked if Resume follows recovery of an unread record", async () => {
+    const interrupted = { startedAt: 8, phase: "scan" as const, phaseAt: 9 };
+    const disk = new Map([[RECORD_PATH, JSON.stringify(storedRecovery({ active: interrupted }))]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    device.app.vault.configFaults.read = new Error("temporary read failure");
+    await device.plugin.onload();
+    layoutReady(device.app);
+    device.app.vault.configFaults = {};
+    expect(await device.plugin.resumeAutomaticSync()).toBe(false);
+
+    let release!: () => void;
+    device.server.hold = new Promise<void>((resolve) => (release = resolve));
+    const pass = device.plugin.syncNow();
+    await until(() => headCalls() === 1, "the manual pass to reach the server");
+    const running = record(disk).active;
+    expect(running).not.toBeNull();
+    expect(await device.plugin.resumeAutomaticSync()).toBe(true);
+    expect(record(disk).active).toEqual(running);
+    expect(record(disk).paused).toBeNull();
+    release();
+    await pass;
+    expect(record(disk).active).toBeNull();
+    expect(record(disk).lastCompleted).not.toBeNull();
+  });
+
   it("does not start a pass whose marker cannot be written, and stops automatic sync visibly", async () => {
     const device = boot(data());
     device.app.vault.configFaults.write = new Error("synthetic write failure");
