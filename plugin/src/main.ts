@@ -522,8 +522,12 @@ export const RESUME_AUTOMATIC_LABEL = "Resume automatic sync";
 export const RESUME_AUTOMATIC_DESC =
   "Automatic sync was paused after an interrupted sync. Manual Sync now still runs one pass; " +
   "resuming allows startup, timer and file-change sync again.";
+export const RESUME_AFTER_LOG_FAILURE_DESC =
+  "Automatic sync stopped because the recovery record could not be read or written. " +
+  "Resuming writes it again and, if that works, allows startup, timer and file-change sync again.";
 export const RECOVERY_LOG_FAILED_NOTICE =
-  "R2DO Sync: recovery logging failed, so automatic sync is stopped.";
+  "R2DO Sync: recovery logging failed, so automatic sync is stopped. Once storage works " +
+  "again, use Resume automatic sync in the Troubleshooting settings.";
 
 /**
  * An automatic pass reached the engine seam while automatic sync is paused or recovery logging
@@ -6732,10 +6736,12 @@ export class LogSyncSettingTab extends PluginSettingTab {
     this.#heading(containerEl, "Troubleshooting");
 
     // First, and only while it applies: it is the one row here that changes what sync does.
-    if (this.plugin.recoveryPaused) {
+    // Gated on everything that holds automatic sync, not only an interrupted pass: a failed
+    // recovery-record write holds it too, and until the next load this row is its way out.
+    if (this.plugin.automaticSyncPaused) {
       new Setting(containerEl)
         .setName(RESUME_AUTOMATIC_LABEL)
-        .setDesc(RESUME_AUTOMATIC_DESC)
+        .setDesc(this.plugin.recoveryPaused ? RESUME_AUTOMATIC_DESC : RESUME_AFTER_LOG_FAILURE_DESC)
         .addButton((b) =>
           b.setButtonText(RESUME_AUTOMATIC_LABEL).onClick(async () => {
             await this.plugin.resumeAutomaticSync();

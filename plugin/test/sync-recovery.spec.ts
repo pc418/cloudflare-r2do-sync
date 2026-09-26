@@ -3,6 +3,7 @@ import LogSyncPlugin, {
   RECOVERY_LOG_FAILED_NOTICE,
   RECOVERY_PAUSED_NOTICE,
   RECOVERY_PAUSED_STATUS,
+  RESUME_AFTER_LOG_FAILURE_DESC,
   RESUME_AUTOMATIC_DESC,
   RESUME_AUTOMATIC_LABEL,
   type Settings,
@@ -668,6 +669,55 @@ describe("recovery logging failures", () => {
     device.app.vault.fire("modify", { path: PATHS[0] });
     await elapse(DEBOUNCE_MS * 2);
     expect(headCalls()).toBe(1);
+  });
+
+  // PIN: owner 2026-09-25 — a logging-only failure must offer the settings resume row, not
+  // just the command palette (Codex review finding #3, docs/260925-eval-CODEX_REVIEW_1_1_4.md).
+  it("offers the settings resume row after a transient write failure mid-pass, and it restores automatic sync", async () => {
+    const device = boot(data());
+    let release!: () => void;
+    device.server.hold = new Promise<void>((resolve) => (release = resolve));
+    await device.plugin.onload();
+    layoutReady(device.app);
+    await until(() => headCalls() === 1, "the startup pass to reach the server");
+    expect(record(device.app.vault.configFiles).active).not.toBeNull();
+
+    // Storage fails while the pass runs: its checkpoints and its finish cannot be written.
+    device.app.vault.configFaults.write = new Error("synthetic transient write failure");
+    release();
+    await until(() => device.plugin.automaticSyncPaused, "the failed checkpoint");
+    for (let i = 0; i < 50; i++) await elapse(1);
+    expect(device.plugin.recoveryPaused).toBe(false);
+    expect(Notice.shown.filter((n) => n === RECOVERY_LOG_FAILED_NOTICE)).toHaveLength(1);
+    expect(RECOVERY_LOG_FAILED_NOTICE).toContain(RESUME_AUTOMATIC_LABEL);
+
+    // The row is shown for this case too, with wording that names the failure, not an interruption.
+    const tab = (device.plugin as unknown as { settingTabs: { display(): void; containerEl: FakeElement }[] })
+      .settingTabs[0];
+    tab.display();
+    const rowAt = tab.containerEl.log.settings.findIndex((s) => s.name === RESUME_AUTOMATIC_LABEL);
+    expect(rowAt).toBeGreaterThanOrEqual(0);
+    expect(tab.containerEl.log.settings[rowAt].desc).toBe(RESUME_AFTER_LOG_FAILURE_DESC);
+    expect(tab.containerEl.log.settings[rowAt].section).toBe("Troubleshooting");
+
+    // Storage recovers; the row's button clears the failure and rewrites the record.
+    device.app.vault.configFaults = {};
+    await tab.containerEl.log.rows[rowAt].buttons[0].click();
+    await until(
+      () => {
+        const r = recordOrNull(device.app.vault.configFiles);
+        return r !== null && r.active === null && r.paused === null && r.lastCompleted !== null;
+      },
+      "the resumed record on disk"
+    );
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+    expect(tab.containerEl.log.settings.map((s) => s.name)).not.toContain(RESUME_AUTOMATIC_LABEL);
+
+    // Automatic sync runs again.
+    device.vault.content.set(PATHS[2], text(PATHS[2], 3));
+    device.app.vault.fire("modify", { path: PATHS[2] });
+    await elapse(DEBOUNCE_MS * 2);
+    expect(headCalls()).toBe(2);
   });
 
   it.each([
