@@ -261,19 +261,18 @@ async function fireEveryAutomaticSource(device: Device): Promise<void> {
 /** Launches, starts the startup pass and kills the process while the pass waits on the server. */
 async function launchAndKillMidPass(): Promise<{ disk: Map<string, string>; dataJson: unknown }> {
   const first = boot(data());
-  let release!: () => void;
-  first.server.hold = new Promise<void>((resolve) => (release = resolve));
+  first.server.hold = new Promise<void>(() => {});
   await first.plugin.onload();
   layoutReady(first.app);
   await until(() => headCalls() === 1, "the startup pass to reach the server");
   // The process dies here: whatever is on disk now is what the next launch finds. No
-  // onunload, no settle. (The held request is released only so the test leaves nothing
-  // pending; the dead process's later writes land on a disk nobody reads.)
+  // onunload, no settle. The held request is never released, as for a killed process: a
+  // released dead pass would carry on through the global `requestUrlMock`, which the next
+  // `boot()` points at the new device's server, and commit there (seen on the CI runner).
   const disk = new Map(first.app.vault.configFiles);
   const dataJson = dataJsonOf(first);
   expect(record(disk).active).not.toBeNull();
   first.plugin.onunload();
-  release();
   await elapse(10);
   requestUrlMock.calls.length = 0;
   Notice.shown.length = 0;
