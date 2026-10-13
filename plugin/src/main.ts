@@ -513,15 +513,31 @@ function manualPass(opts: SyncPassOptions): SyncPassOptions {
   return marked;
 }
 
-// Recovery pause prose, lead-authored and used verbatim (docs/260925-fix-IPHONE_SYNC_RECOVERY_PLAN.md).
-export const RECOVERY_PAUSED_NOTICE =
-  "R2DO Sync: the previous sync did not finish. Automatic sync is paused so it will not " +
-  "immediately repeat. Export the sync log for diagnostics, or run Sync now once when ready.";
-export const RECOVERY_PAUSED_STATUS = "automatic sync paused";
+// Interrupted-sync cooldown prose, lead-authored and used verbatim
+// (docs/261013-fix-AUTO_CONTINUE_AFTER_INTERRUPTED_SYNC.md).
+
+/** `15 minutes`, `30 minutes`, `1 hour`, `2 hours` or `4 hours` — every wait `cooldownMs` gives. */
+function cooldownWaitText(waitMs: number): string {
+  const minutes = Math.round(waitMs / 60_000);
+  if (minutes < 60) return `${minutes} minutes`;
+  const hours = Math.round(minutes / 60);
+  return hours === 1 ? "1 hour" : `${hours} hours`;
+}
+
+/** Raised once, on the load that starts a cooldown. */
+export function recoveryCooldownNotice(streak: number, waitMs: number): string {
+  return (
+    `R2DO Sync: the last ${streak} syncs did not finish, so automatic sync waits ` +
+    `${cooldownWaitText(waitMs)} before trying again. Sync now still runs one right away.`
+  );
+}
+export const RECOVERY_PAUSED_STATUS = "automatic sync waiting";
 export const RESUME_AUTOMATIC_LABEL = "Resume automatic sync";
 export const RESUME_AUTOMATIC_DESC =
-  "Automatic sync was paused after an interrupted sync. Manual Sync now still runs one pass; " +
-  "resuming allows startup, timer and file-change sync again.";
+  "Several syncs in a row did not finish, so automatic sync is waiting before it tries again. " +
+  "Resume lets startup, timer and file-change sync run now.";
+// Recovery-logging prose, unchanged (docs/260925-fix-RECOVERY_RESUME_AFTER_READ_FAILURE.md).
+export const RECOVERY_LOG_FAILED_STATUS = "automatic sync paused";
 export const RESUME_AFTER_LOG_FAILURE_DESC =
   "Automatic sync stopped because the recovery record could not be read or written. " +
   "Resume retries it; an unreadable record is saved beside it before automatic sync resumes.";
@@ -530,9 +546,9 @@ export const RECOVERY_LOG_FAILED_NOTICE =
   "sync in the Troubleshooting settings to retry or set aside an unreadable record.";
 
 /**
- * An automatic pass reached the engine seam while automatic sync is paused or recovery logging
- * is broken. Every trigger is gated before this; the seam refuses too, so a debounce that was
- * already armed cannot slip through. Not a sync failure, so it is not reported as one.
+ * An automatic pass reached the engine seam while automatic sync is cooling down or recovery
+ * logging is broken. Every trigger is gated before this; the seam refuses too, so a debounce
+ * that was already armed cannot slip through. Not a sync failure, so it is not reported as one.
  */
 class AutomaticSyncBlockedError extends Error {}
 
@@ -637,8 +653,9 @@ export default class LogSyncPlugin extends Plugin {
    */
   #auditOwedBeforeReady = false;
   /**
-   * The recovery record: an active marker around every scheduled pass, and the pause a pass
-   * that never settled leaves behind. Loaded before any automatic trigger is registered.
+   * The recovery record: an active marker around every scheduled pass, the streak of passes
+   * that never settled, and the cooldown a long streak starts. Loaded before any automatic
+   * trigger is registered.
    */
   #diagnostics: SyncDiagnostics | null = null;
   /** Markdown paths from vault events and pulls, owed an oversized-Markdown check. */
@@ -663,6 +680,22 @@ export default class LogSyncPlugin extends Plugin {
   #lastFailureAt: number | undefined;
   #sharedSettings: { rev: SettingsRev; fingerprint: string } | null = null;
   #settingsPushTimer: number | null = null;
+  /**
+   * Automatic requests (startup, resume, timer, file event) a recovery cooldown refused, as a
+   * running count; `#cooldownPaid` is the count the newest completed pass covered. While it is
+   * ahead, one full-audit automatic pass is owed. Without this a device with periodic sync off
+   * would sit on the refused edits until some unrelated trigger came along. A pass covers only
+   * the refusals made before it started — the engine journals its paths at pass start — so an
+   * edit refused while a manual pass is mid-commit still owes a pass of its own.
+   */
+  #cooldownRefused = 0;
+  #cooldownPaid = 0;
+  /** One-shot timer for the owed pass: at the cooldown's deadline, or at once once it ended. */
+  #cooldownTimer: number | null = null;
+
+  get #cooldownOwed(): boolean {
+    return this.#cooldownRefused > this.#cooldownPaid;
+  }
   #lastConflicts: ConflictInfo[] = [];
   #pendingEncryptionTransition: PendingEncryptionTransition | null = null;
   #backupModalOpen = false;
@@ -735,7 +768,8 @@ export default class LogSyncPlugin extends Plugin {
     this.#lastConflicts = data?.lastConflicts ?? [];
     this.#pendingEncryptionTransition = data?.pendingEncryptionTransition ?? null;
 
-    // Before any automatic trigger exists: a pass that never settled last time pauses them all.
+    // Before any automatic trigger exists: a pass that never settled last time is counted, and
+    // the third in a row holds them all for a cooldown.
     await this.#loadDiagnostics();
 
     // Obsidian hides the status bar on mobile, so the ribbon is the always-present affordance a
@@ -903,7 +937,14 @@ export default class LogSyncPlugin extends Plugin {
     // which is not something the interval's name suggests.
     if (Platform.isMobile) {
       this.registerDomEvent(document, "visibilitychange", () => {
-        if (document.visibilityState !== "visible" || !this.settings.syncOnStartup) return;
+        if (document.visibilityState !== "visible") return;
+        // iOS suspends timers, so the owed pass may have missed its deadline while hidden.
+        // It answers a request already made, so the resume settings below do not gate it.
+        if (this.#cooldownOwed && !this.recoveryPaused) {
+          void this.#runOwedPass();
+          return;
+        }
+        if (!this.settings.syncOnStartup) return;
         const gapMinutes = this.settings.resumeSyncMinutes;
         if (gapMinutes <= 0) return; // 0 is off, and is the only way to reach zero gap
         const lastPassAt = Math.max(this.#lastSuccessAt ?? 0, this.#lastFailureAt ?? 0);
@@ -923,7 +964,10 @@ export default class LogSyncPlugin extends Plugin {
       return;
     }
     this.#engine?.markDirty(paths, { fullScan });
-    if (this.automaticSyncPaused) return;
+    if (this.automaticSyncPaused) {
+      this.#oweAfterCooldown();
+      return;
+    }
     // File events are automatic work too. Keep the journal, but never let an edit
     // publish a fresh device's files before the same consent startup/timer sync needs.
     if (
@@ -969,8 +1013,11 @@ export default class LogSyncPlugin extends Plugin {
     // The periodic timer and the mobile resume are registered during `onload`, so they can
     // fire before layout-ready too; the startup pass above is what runs once it arrives.
     if (!this.#layoutReady) return;
-    // Startup, timer and resume all arrive here; a recovery pause answers all of them.
-    if (this.automaticSyncPaused) return;
+    // Startup, timer and resume all arrive here; a recovery cooldown answers all of them.
+    if (this.automaticSyncPaused) {
+      this.#oweAfterCooldown();
+      return;
+    }
     if (!this.#scheduler || this.#phase === "decision") return;
     // The first-sync gate needs an answer, and an unattended pass has nobody to give one.
     if (
@@ -997,28 +1044,79 @@ export default class LogSyncPlugin extends Plugin {
     }
   }
 
+  /**
+   * An automatic request was refused. If a recovery cooldown is what refused it, one
+   * full-audit pass is owed at the cooldown's end, and the timer for it is armed. A logging
+   * failure owes nothing here: it lasts until Resume, which is a decision, not a deadline.
+   * Nothing refused means nothing owed — expiry never invents a pass the settings would not.
+   */
+  #oweAfterCooldown(): void {
+    if (!this.recoveryPaused) return;
+    this.#cooldownRefused++;
+    // Edits refused meanwhile are journaled, but startup and resume owe a whole-vault audit.
+    this.#engine?.markDirty([], { fullScan: true });
+    this.#armOwedPass();
+  }
+
+  /**
+   * (Re)arms the one-shot timer for an owed pass: at the cooldown's deadline while it lasts,
+   * otherwise on the next tick — a macrotask, so a pass that just completed has left the
+   * scheduler and the owed pass is a pass of its own rather than coalesced into that one.
+   */
+  #armOwedPass(): void {
+    if (this.#unloaded || !this.#cooldownOwed) return;
+    if (this.#cooldownTimer !== null) window.clearTimeout(this.#cooldownTimer);
+    this.#cooldownTimer = window.setTimeout(() => {
+      this.#cooldownTimer = null;
+      void this.#runOwedPass();
+    }, this.#diagnostics?.cooldownRemainingMs ?? 0);
+  }
+
+  /**
+   * Asks for the pass a cooldown owes, once nothing holds automatic sync: at the deadline, on
+   * mobile resume, after Resume, after a pass that left later refusals unanswered, or after a
+   * rebuild. Through `#autoSync`, so layout-ready, consent and the scheduler still gate it.
+   * Asking discharges nothing: only a completed pass that started after the refusals does.
+   * A clock stepped back mid-wait re-arms for the remainder; a rebuild in progress (no
+   * scheduler) keeps the debt for `#finishRebuild` to ask again.
+   */
+  async #runOwedPass(): Promise<void> {
+    if (!this.#cooldownOwed || this.#unloaded) return;
+    if (this.recoveryPaused) {
+      this.#armOwedPass();
+      return;
+    }
+    if (this.#scheduler === null) return;
+    this.#renderStatus();
+    await this.#autoSync();
+  }
+
   onunload(): void {
     this.#unloaded = true;
     if (this.#settingsPushTimer !== null) window.clearTimeout(this.#settingsPushTimer);
+    if (this.#cooldownTimer !== null) window.clearTimeout(this.#cooldownTimer);
     if (this.#autoSyncTimer !== null) window.clearInterval(this.#autoSyncTimer);
     // Obsidian's own layout, put back as it was. A disabled plugin that leaves the status bar
     // forced open has broken the app rather than merely stopped working.
     this.#mobileStatusBar?.disable();
     this.#mobileStatusBar = null;
-    // Not a clear: a pass still running keeps its marker on disk, so the next load pauses.
+    // Not a clear: a pass still running keeps its marker on disk, so the next load counts it.
     // Retiring only stops this instance from writing over what the next instance reads.
     this.#diagnostics?.retire();
     this.#retireScheduler();
   }
 
-  /** Automatic sync is held: paused after an interrupted pass, or recovery logging failed. */
+  /** Automatic sync is held: cooling down after repeated interruptions, or recovery logging failed. */
   get automaticSyncPaused(): boolean {
     return this.#diagnostics?.blocksAutomatic ?? false;
   }
 
-  /** Paused because an earlier pass never settled (not merely because logging failed). */
+  /**
+   * Waiting out a cooldown because several passes in a row never settled (not merely because
+   * logging failed). False again once the cooldown's deadline passes.
+   */
   get recoveryPaused(): boolean {
-    return this.#diagnostics?.paused ?? false;
+    return this.#diagnostics?.coolingDown ?? false;
   }
 
   /**
@@ -1063,25 +1161,32 @@ export default class LogSyncPlugin extends Plugin {
         new Notice(RECOVERY_LOG_FAILED_NOTICE, 0);
         this.#renderStatus();
       },
+      // Once, when a cooldown starts: on load, or when a read failure is recovered later. A
+      // reload inside the same cooldown says nothing again; the status bar carries it.
+      onCooldown: (streak, waitMs) => {
+        new Notice(recoveryCooldownNotice(streak, waitMs), 0);
+        this.#renderStatus();
+      },
     });
-    const outcome = await this.#diagnostics.load();
-    if (outcome.paused) new Notice(RECOVERY_PAUSED_NOTICE, 0);
+    await this.#diagnostics.load();
   }
 
   /**
-   * The explicit way out of a recovery pause. Persisted before automatic sync is allowed
-   * again, so a resume that could not be written does not quietly re-pause at the next load.
-   * Does not start a pass itself; the next startup, timer or edit does. The pass after it is a
-   * full audit, because edits during the pause may have fallen out of the journal.
+   * An optional override, never required: ends a recovery cooldown (and resets the
+   * interruption streak) or retries a failed recovery record. Persisted before automatic sync
+   * is allowed again, so a resume that could not be written does not quietly come back at the
+   * next load. Starts no pass of its own: only one a cooldown already owes for a refused
+   * request; otherwise the next startup, timer or edit does. The pass after it is a full
+   * audit, because edits while held may have fallen out of the journal.
    */
   async resumeAutomaticSync(): Promise<boolean> {
     const diagnostics = this.#diagnostics;
     if (diagnostics === null || !diagnostics.blocksAutomatic) return true;
-    const wasPaused = diagnostics.paused;
     const resumed = await diagnostics.resume();
-    if (!resumed && !wasPaused && diagnostics.paused) new Notice(RECOVERY_PAUSED_NOTICE, 0);
     if (resumed) this.#engine?.markDirty([], { fullScan: true });
     this.#renderStatus();
+    // Ending a cooldown early ends it: a request it refused is answered now, not at the deadline.
+    if (resumed) this.#armOwedPass();
     return resumed;
   }
 
@@ -1451,27 +1556,32 @@ export default class LogSyncPlugin extends Plugin {
     }
     const marked = {
       sync: async (opts?: SyncPassOptions): Promise<SyncResult> => {
+        // A manual pass runs through a cooldown, and settling ends it (`finishPass`).
         if (diagnostics?.blocksAutomatic && !isManualSync(opts)) {
           throw new AutomaticSyncBlockedError("automatic sync is paused");
         }
         await this.#localMaintenance;
-        // An automatic request can wait behind pre-existing maintenance while a manual
-        // pass fails and activates recovery pause. Check again at the engine boundary.
+        // An automatic request can wait behind pre-existing maintenance while a manual pass
+        // recovers an unread record into a cooldown. Check again at the engine boundary.
         if (diagnostics?.blocksAutomatic && !isManualSync(opts)) {
           throw new AutomaticSyncBlockedError("automatic sync is paused");
         }
-        const wasPaused = diagnostics?.paused ?? false;
         const token = await diagnostics?.beginPass() ?? null;
-        if (!wasPaused && diagnostics?.paused) new Notice(RECOVERY_PAUSED_NOTICE, 0);
         pass = token;
         try {
           // A forced publish ships what the user previewed, so it is not changed underneath.
           if (opts?.keepLocal !== true && opts?.reroot === undefined) {
             await this.#largeMarkdownInPass(generation);
           }
+          // The engine takes its journal as it starts: refusals up to here are in this pass.
+          const covers = this.#cooldownRefused;
           const result = await engine.sync(opts);
           await this.#largeMarkdownInPass(generation, result);
           if (token !== null) await diagnostics?.finishPass(token, { result });
+          this.#cooldownPaid = Math.max(this.#cooldownPaid, covers);
+          // Refused after this pass took its journal: owed a pass of its own, now that the
+          // cooldown this one settled has ended, not at the old deadline.
+          this.#armOwedPass();
           return result;
         } catch (error) {
           if (token !== null) await diagnostics?.finishPass(token, { error });
@@ -1491,6 +1601,7 @@ export default class LogSyncPlugin extends Plugin {
       },
       onError: (e) => {
         if (e instanceof AutomaticSyncBlockedError) {
+          if (generation === this.#generation) this.#oweAfterCooldown();
           this.#renderStatus();
           return;
         }
@@ -1509,6 +1620,8 @@ export default class LogSyncPlugin extends Plugin {
     this.#renderStatus();
     // Work that a retired scheduler dropped, or that a settings change just switched on.
     this.#requestLargeMarkdownDrain();
+    // A cooldown's owed pass that came due while there was no scheduler to take it.
+    this.#armOwedPass();
   }
 
   /**
@@ -3203,9 +3316,10 @@ export default class LogSyncPlugin extends Plugin {
       case "first-sync":
         return "CONFIRM FIRST SYNC";
       case "idle":
-        // Held for as long as the pause is, including after a manual pass: that pass did not
-        // resume anything, and "synced 1m ago" would read as if it had.
-        return this.automaticSyncPaused ? RECOVERY_PAUSED_STATUS : this.#lastPassText();
+        // Held for as long as automatic sync is: "synced 1m ago" would read as if it were not.
+        // A cooldown stops holding at its deadline, and the periodic refresh re-reads it.
+        if (this.recoveryPaused) return RECOVERY_PAUSED_STATUS;
+        return this.automaticSyncPaused ? RECOVERY_LOG_FAILED_STATUS : this.#lastPassText();
     }
   }
 

@@ -2,8 +2,8 @@ import type { SyncCheckpoint, SyncResult } from "./sync";
 import { ApiError } from "./api";
 
 /**
- * Durable recovery record for sync passes: where a pass that never finished stopped, and
- * whether automatic sync is paused because of it.
+ * Durable recovery record for sync passes: where a pass that never finished stopped, how many
+ * passes in a row did so, and whether automatic sync is waiting out a cooldown because of it.
  *
  * Written to its own small file in this plugin's folder rather than `data.json`, so a marker
  * write never rewrites credentials or sync state, and so it survives a process the OS killed
@@ -11,10 +11,13 @@ import { ApiError } from "./api";
  * key, note content, manifest map or raw error message.
  *
  * What it can and cannot tell apart: a pass killed before it settled leaves `active` set, and
- * the next load pauses automatic sync. A pass that settled and was followed by a crash (for
- * example while the app indexes the files it just wrote) leaves `lastCompleted` and no
- * `active`, so it is NOT attributed to sync and does not pause anything; the trace then shows
- * a `plugin-load` after `pass-complete` rather than an interrupted pass.
+ * the next load counts it once into `streak`. One or two in a row is ordinary on a phone
+ * (backgrounding, swipe-away), so automatic sync simply continues; the third starts a cooldown
+ * (`cooldownMs`), which exists only to break a crash loop and always ends by itself. Any pass
+ * that settles — completed or failed — resets the streak. A pass that settled and was followed
+ * by a crash (for example while the app indexes the files it just wrote) leaves
+ * `lastCompleted` and no `active`, so it is NOT attributed to sync and counts for nothing; the
+ * trace then shows a `plugin-load` after `pass-complete` rather than an interrupted pass.
  */
 
 export const DIAGNOSTIC_SCHEMA = "iphone-recovery-1";
@@ -23,7 +26,27 @@ export const UNREADABLE_FILE = "sync-recovery.unreadable.txt";
 export const TRACE_LIMIT = 24;
 const UNREADABLE_MAX_BYTES = 65_536;
 
-/** Every event the trace may hold. A closed set is what keeps the record free of user data. */
+/** Interruptions in a row that automatic sync absorbs without waiting. The next one waits. */
+export const FREE_INTERRUPTIONS = 2;
+const COOLDOWN_BASE_MS = 15 * 60_000;
+export const COOLDOWN_MAX_MS = 4 * 60 * 60_000;
+
+/**
+ * How long automatic sync waits after `streak` consecutive interrupted passes: nothing up to
+ * `FREE_INTERRUPTIONS`, then 15 minutes doubling per further interruption, capped at 4 hours.
+ */
+export function cooldownMs(streak: number): number {
+  if (streak <= FREE_INTERRUPTIONS) return 0;
+  const doublings = Math.min(streak - FREE_INTERRUPTIONS - 1, 4);
+  return Math.min(COOLDOWN_BASE_MS * 2 ** doublings, COOLDOWN_MAX_MS);
+}
+
+/**
+ * Every event the trace may hold. A closed set is what keeps the record free of user data.
+ * Never extend it lightly: 1.1.6 rejects a record with an event it does not know, so a new
+ * persisted event makes the record unreadable to a build the user may roll back to
+ * (`test/fixtures/sync-diagnostics-1.1.6.ts`). New top-level fields are safe; it drops them.
+ */
 export const TRACE_EVENTS = [
   "plugin-load",
   "recovery-paused",
@@ -62,8 +85,17 @@ export interface DiagnosticRecord {
   platform: string;
   /** Set from before a pass does any work until it settles. Left set by a killed process. */
   active: ActivePass | null;
-  /** Automatic sync is paused until explicitly resumed. Holds the pass that never finished. */
+  /**
+   * The 1.1.4–1.1.6 durable pause. Never set by this build, and written as `null` because
+   * 1.1.6 requires the key; a stored one is lifted on load (`streak` 1).
+   */
   paused: { since: number; interrupted: ActivePass } | null;
+  /** Passes in a row that started and never settled. Any settled pass resets it to 0. */
+  streak: number;
+  /** Automatic sync waits until `until`. Set once `streak` passes `FREE_INTERRUPTIONS`. */
+  cooldown: { since: number; until: number } | null;
+  /** The newest interrupted pass a load consumed, and when it was found. Evidence only. */
+  lastInterrupted: { detectedAt: number; pass: ActivePass } | null;
   lastCompleted: { startedAt: number; finishedAt: number; status: SyncResult["status"] } | null;
   /** `error` is a coarse kind (`http-<status>` or `error`), never the error's own message. */
   lastFailed: { startedAt: number; finishedAt: number; error: string } | null;
@@ -108,8 +140,8 @@ export interface PassToken {
 }
 
 export interface LoadOutcome {
-  /** Automatic sync is paused (either just now, or still from an earlier load). */
-  paused: boolean;
+  /** Automatic sync is waiting out a cooldown (started just now, or still from an earlier load). */
+  coolingDown: boolean;
   /** Set when the record exists but could not be read or understood, or the pause write failed. */
   failure: DiagnosticFailure | null;
 }
@@ -122,6 +154,8 @@ export interface SyncDiagnosticsOptions {
   now?: () => number;
   /** Called once per transition into a failed state, so the owner can say so. */
   onFailure?: (failure: DiagnosticFailure, error: unknown) => void;
+  /** Called once a newly started cooldown is persisted: `streak` interruptions, `waitMs` wait. */
+  onCooldown?: (streak: number, waitMs: number) => void;
 }
 
 function freshRecord(pluginVersion: string, platform: string): DiagnosticRecord {
@@ -131,6 +165,9 @@ function freshRecord(pluginVersion: string, platform: string): DiagnosticRecord 
     platform,
     active: null,
     paused: null,
+    streak: 0,
+    cooldown: null,
+    lastInterrupted: null,
     lastCompleted: null,
     lastFailed: null,
     trace: [],
@@ -171,6 +208,29 @@ export function parseRecord(text: string): DiagnosticRecord | null {
     if (!interrupted) return null;
     paused = { since: raw.paused.since, interrupted };
   }
+  // Absent means a 1.1.4–1.1.6 record: its pause was one interruption, already consumed. A
+  // present value that is not a count is unreadable, never mistaken for that older shape.
+  let streak = paused === null ? 0 : 1;
+  if ("streak" in raw) {
+    if (typeof raw.streak !== "number" || !Number.isSafeInteger(raw.streak) || raw.streak < 0) {
+      return null;
+    }
+    streak = raw.streak;
+  }
+  let cooldown: DiagnosticRecord["cooldown"] = null;
+  if (raw.cooldown !== undefined && raw.cooldown !== null) {
+    const c = raw.cooldown;
+    if (!isObject(c) || !isTime(c.since) || !isTime(c.until)) return null;
+    cooldown = { since: c.since, until: c.until };
+  }
+  let lastInterrupted: DiagnosticRecord["lastInterrupted"] = null;
+  if (raw.lastInterrupted !== undefined && raw.lastInterrupted !== null) {
+    const l = raw.lastInterrupted;
+    if (!isObject(l) || !isTime(l.detectedAt)) return null;
+    const pass = parseActive(l.pass);
+    if (!pass) return null;
+    lastInterrupted = { detectedAt: l.detectedAt, pass };
+  }
   let lastCompleted: DiagnosticRecord["lastCompleted"] = null;
   if (raw.lastCompleted !== null) {
     const c = raw.lastCompleted;
@@ -204,6 +264,9 @@ export function parseRecord(text: string): DiagnosticRecord | null {
     platform: typeof raw.platform === "string" ? raw.platform : "unknown",
     active,
     paused,
+    streak,
+    cooldown,
+    lastInterrupted,
     lastCompleted,
     lastFailed,
     trace: trace.slice(-TRACE_LIMIT),
@@ -222,6 +285,7 @@ export class SyncDiagnostics {
   readonly #path: string;
   readonly #now: () => number;
   readonly #onFailure: SyncDiagnosticsOptions["onFailure"];
+  readonly #onCooldown: SyncDiagnosticsOptions["onCooldown"];
   #record: DiagnosticRecord;
   /** False after an unreadable load: no write may replace a record we have not examined. */
   #recordTrusted = false;
@@ -236,8 +300,10 @@ export class SyncDiagnostics {
   constructor(opts: SyncDiagnosticsOptions) {
     this.#storage = opts.storage;
     this.#path = opts.path;
-    this.#now = opts.now ?? Date.now;
+    // Looked up per call, not captured: the cooldown is checked against the clock as it reads now.
+    this.#now = opts.now ?? (() => Date.now());
     this.#onFailure = opts.onFailure;
+    this.#onCooldown = opts.onCooldown;
     this.#record = freshRecord(opts.pluginVersion, opts.platform);
   }
 
@@ -245,17 +311,46 @@ export class SyncDiagnostics {
     return this.#path;
   }
 
-  get paused(): boolean {
-    return this.#record.paused !== null;
+  /**
+   * Automatic sync is waiting out a cooldown after repeated interruptions. Read against the
+   * clock each time, and expiry is irreversible: the first check that finds the deadline passed
+   * — or the clock reading before the cooldown began, which can only be a correction — retires
+   * the cooldown in memory, and the next write persists that, so no later clock step revives
+   * it. A stored deadline past `since` + the 4-hour cap is never honoured.
+   *
+   * Limitation: with no monotonic clock across reloads, a backward step *during* a live
+   * cooldown that still lands after `since` lengthens that one cooldown by the step — bounded
+   * by the cap plus the step.
+   */
+  get coolingDown(): boolean {
+    return this.cooldownRemainingMs > 0;
+  }
+
+  /** How long automatic sync still waits; 0 once the cooldown has ended (see `coolingDown`). */
+  get cooldownRemainingMs(): number {
+    const cooldown = this.#record.cooldown;
+    if (cooldown === null) return 0;
+    const now = this.#now();
+    const deadline = Math.min(cooldown.until, cooldown.since + COOLDOWN_MAX_MS);
+    if (now >= cooldown.since && now < deadline) return deadline - now;
+    this.#record.cooldown = null;
+    // Persisted at once: left only in memory, a reload under a clock set back into the old
+    // window would read the cooldown back from disk. Like a checkpoint, a failed write is a
+    // logging failure and never reaches the caller; memory stays cleared. Never written over
+    // a record not yet read safely, nor after retirement.
+    if (this.#recordTrusted && !this.#retired) {
+      this.#write().catch((e: unknown) => this.#fail("write", e));
+    }
+    return 0;
   }
 
   get failure(): DiagnosticFailure | null {
     return this.#failure;
   }
 
-  /** Automatic sync must not start: paused after an interrupted pass, or logging is broken. */
+  /** Automatic sync must not start: cooling down after repeated interruptions, or logging is broken. */
   get blocksAutomatic(): boolean {
-    return this.paused || this.#failure !== null;
+    return this.coolingDown || this.#failure !== null;
   }
 
   /** A copy of the in-memory record, for the exported report. */
@@ -264,17 +359,18 @@ export class SyncDiagnostics {
   }
 
   /**
-   * Reads the previous record. An absent file is normal. An active marker becomes a pause,
-   * persisted before this returns so it survives the next restart too.
+   * Reads the previous record. An absent file is normal. An active marker is counted into the
+   * streak exactly once, persisted before this returns: automatic sync may only start on a
+   * counted interruption, and a reload without a new pass finds nothing left to count.
    */
   async load(): Promise<LoadOutcome> {
     if ((await this.#readStored()) !== "ready") {
       this.#push("plugin-load");
-      return { paused: this.paused, failure: this.#failure };
+      return { coolingDown: this.coolingDown, failure: this.#failure };
     }
     this.#push("plugin-load");
-    await this.#pauseInterrupted();
-    return { paused: this.paused, failure: this.#failure };
+    await this.#consumeInterrupted();
+    return { coolingDown: this.coolingDown, failure: this.#failure };
   }
 
   /** Reads a trustworthy base before any write. A failed read/parse leaves the disk untouched. */
@@ -306,24 +402,41 @@ export class SyncDiagnostics {
     return "ready";
   }
 
-  /** An old active marker becomes a durable pause, never an invitation to repeat the pass. */
-  async #pauseInterrupted(): Promise<boolean> {
+  /**
+   * Consumes an old active marker into the streak, and lifts a 1.1.4–1.1.6 pause (already
+   * counted as one by `parseRecord`). Up to `FREE_INTERRUPTIONS` in a row, automatic sync just
+   * continues — `streak` and `lastInterrupted` are the evidence; there is deliberately no trace
+   * event for it (see `TRACE_EVENTS`). Past it, a cooldown starts from now. Persisted in one
+   * write, or not at all.
+   */
+  async #consumeInterrupted(): Promise<boolean> {
     const interrupted = this.#record.active;
-    if (interrupted !== null) {
-      const at = this.#now();
-      this.#record.active = null;
-      this.#record.paused = { since: at, interrupted };
-      this.#push("recovery-paused", at);
-      try {
-        await this.#write();
-      } catch (e) {
-        // The disk may still hold the active marker. Re-read it before any later write;
-        // otherwise a second Resume could clear a pause that was never persisted.
-        this.#recordTrusted = false;
-        this.#fail("write", e);
-        return false;
-      }
+    const legacy = this.#record.paused;
+    if (interrupted === null && legacy === null) return true;
+    const at = this.#now();
+    let waitMs = 0;
+    if (legacy !== null) {
+      this.#record.paused = null;
+      this.#record.lastInterrupted = { detectedAt: legacy.since, pass: legacy.interrupted };
     }
+    if (interrupted !== null) {
+      this.#record.active = null;
+      this.#record.streak += 1;
+      this.#record.lastInterrupted = { detectedAt: at, pass: interrupted };
+      waitMs = cooldownMs(this.#record.streak);
+      this.#record.cooldown = waitMs > 0 ? { since: at, until: at + waitMs } : null;
+    }
+    if (waitMs > 0) this.#push("recovery-paused", at);
+    try {
+      await this.#write();
+    } catch (e) {
+      // The disk may still hold the active marker. Re-read it before any later write; it is
+      // counted once that write succeeds — never twice, and never without being persisted.
+      this.#recordTrusted = false;
+      this.#fail("write", e);
+      return false;
+    }
+    if (waitMs > 0) this.#onCooldown?.(this.#record.streak, waitMs);
     return true;
   }
 
@@ -333,9 +446,9 @@ export class SyncDiagnostics {
     const read = await this.#readStored();
     if (read !== "ready") return read;
     this.#push("plugin-load");
-    if (!(await this.#pauseInterrupted())) return "write";
-    // A discovered pause still blocks automation, but the unread-record failure is resolved.
-    if (this.paused) this.#failure = null;
+    if (!(await this.#consumeInterrupted())) return "write";
+    // A discovered cooldown still blocks automation, but the unread-record failure is resolved.
+    if (this.coolingDown) this.#failure = null;
     return "ready";
   }
 
@@ -362,7 +475,7 @@ export class SyncDiagnostics {
       if (this.#current === token) {
         this.#current = null;
         // No engine work started. A later successful resume must not persist a
-        // phantom active pass and pause the following launch again.
+        // phantom active pass for the following launch to count as an interruption.
         this.#record.active = null;
       }
       throw new DiagnosticWriteError({ cause: e });
@@ -385,8 +498,10 @@ export class SyncDiagnostics {
 
   /**
    * Records how a pass settled and clears its marker. Only the pass that set the marker can
-   * clear it. Never throws; a failed write leaves the marker on disk, which pauses the next
-   * load — the conservative direction.
+   * clear it. A settled pass — completed or failed: a sync error is not a killed process —
+   * also resets the streak and ends any cooldown, in the same write. Never throws; a failed
+   * write leaves the marker on disk, which the next load counts as an interruption — the
+   * conservative direction.
    */
   async finishPass(
     token: PassToken,
@@ -396,6 +511,8 @@ export class SyncDiagnostics {
     this.#current = null;
     const at = this.#now();
     this.#record.active = null;
+    this.#record.streak = 0;
+    this.#record.cooldown = null;
     if ("result" in outcome) {
       this.#record.lastCompleted = {
         startedAt: token.startedAt,
@@ -419,17 +536,18 @@ export class SyncDiagnostics {
   }
 
   /**
-   * Clears the pause and any logging failure, if the cleared record can be persisted. Returns
-   * whether it was: a resume that is not on disk would come back paused at the next load.
+   * Resets the streak, ends any cooldown and clears any logging failure, if the cleared record
+   * can be persisted. Returns whether it was: a resume that is not on disk would come back
+   * waiting at the next load. Never required — a cooldown ends by itself — only an override.
    */
   async resume(): Promise<boolean> {
     const unread = !this.#recordTrusted;
     const recovered = await this.#recoverUnread();
     if (recovered === "parse") return await this.#setAsideUnreadable();
     if (recovered !== "ready") return false;
-    // The failed read hid a real interruption or pause. Show it first; another deliberate
-    // Resume may clear it, but this one must not silently undo the recovered evidence.
-    if (unread && this.paused) return false;
+    // The failed read hid a real cooldown. Show it first; another deliberate Resume may end
+    // it, but this one must not silently undo the recovered evidence.
+    if (unread && this.coolingDown) return false;
     return await this.#resumeTrusted();
   }
 
@@ -457,8 +575,8 @@ export class SyncDiagnostics {
       this.#record = { ...parsed, pluginVersion, platform };
       this.#recordTrusted = true;
       this.#push("plugin-load");
-      if (!(await this.#pauseInterrupted())) return false;
-      if (this.paused) {
+      if (!(await this.#consumeInterrupted())) return false;
+      if (this.coolingDown) {
         this.#failure = null;
         return false;
       }
@@ -491,13 +609,15 @@ export class SyncDiagnostics {
   }
 
   async #resumeTrusted(): Promise<boolean> {
-    const previous = this.#record.paused;
+    const { paused, streak, cooldown } = this.#record;
     this.#record.paused = null;
+    this.#record.streak = 0;
+    this.#record.cooldown = null;
     this.#push("resumed");
     try {
       await this.#write();
     } catch (e) {
-      this.#record.paused = previous;
+      Object.assign(this.#record, { paused, streak, cooldown });
       this.#failure = null; // re-arm the transition so the failure is reported again
       this.#fail("write", e);
       return false;
