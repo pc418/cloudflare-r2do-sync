@@ -271,10 +271,41 @@ async function elapse(ms: number): Promise<void> {
   for (let i = 0; i < 20; i++) await vi.advanceTimersByTimeAsync(1);
 }
 
-/** Waits (bounded) for an asynchronous condition the scheduler reaches on its own time. */
+/** The real `setTimeout`, captured before any test fakes it. */
+const realSetTimeout = globalThis.setTimeout;
+
+/**
+ * Waits for a condition the app reaches on its own time. Fake time advances at most 200 ms (a
+ * debounce or retry timer is never fired by accident); real time is yielded as well, for up
+ * to 4 s (inside vitest's 5 s test timeout), because a pass awaits real macrotasks —
+ * WebCrypto digests — that no fake-timer tick can hurry. A slow runner needs more of them,
+ * which is why no assertion that a pass ran may follow a fixed number of ticks (AGENTS.md,
+ * "UI and testing gotchas").
+ */
 async function until(condition: () => boolean, what: string): Promise<void> {
-  for (let i = 0; i < 200 && !condition(); i++) await vi.advanceTimersByTimeAsync(1);
+  const started = performance.now();
+  for (let fakeMs = 0; !condition() && performance.now() - started < 4_000; fakeMs++) {
+    await new Promise<void>((resolve) => realSetTimeout(resolve, 0));
+    await vi.advanceTimersByTimeAsync(fakeMs < 200 ? 1 : 0);
+  }
   if (!condition()) throw new Error(`timed out waiting for ${what}`);
+}
+
+/**
+ * Passes that settled (completed or failed) on `device`, read from the record writes it made:
+ * each is the write that took the active marker away with `pass-complete`/`pass-failed`.
+ */
+function settledPasses(device: Device): number {
+  let settled = 0;
+  let wasActive = false;
+  for (const write of device.app.vault.configWrites) {
+    const parsed = parseRecord(write.data);
+    if (parsed === null) continue;
+    const last = parsed.trace.at(-1)?.event;
+    if (wasActive && parsed.active === null && (last === "pass-complete" || last === "pass-failed")) settled++;
+    wasActive = parsed.active !== null;
+  }
+  return settled;
 }
 
 function layoutReady(app: LifecycleApp): void {
@@ -433,14 +464,17 @@ describe("active marker around every scheduled pass", () => {
         (JSON.parse(w.data) as DiagnosticRecord).trace.at(-1)?.event === "pass-start"
       ).length;
 
+    // Each trigger waits for the previous pass to settle: a request made while one is in
+    // flight is answered by that pass (the scheduler coalesces), not by a pass of its own.
     device.vault.content.set(PATHS[0], text(PATHS[0], 2));
     device.app.vault.fire("modify", { path: PATHS[0] });
     await elapse(DEBOUNCE_MS * 2);
+    await until(() => settledPasses(device) === 1, "the file-event pass to settle");
     expect(headCalls()).toBe(1);
     expect(starts()).toBe(1);
 
     windowTimers.find((t) => t.kind === "interval" && t.ms === INTERVAL_MINUTES * 60_000)!.fn();
-    await elapse(10);
+    await until(() => settledPasses(device) === 2, "the timer pass to settle");
     expect(headCalls()).toBe(2);
     expect(starts()).toBe(2);
 
@@ -490,8 +524,7 @@ describe("active marker around every scheduled pass", () => {
     expect(record(next.app.vault.configFiles).streak).toBe(0);
     expect(next.plugin.automaticSyncPaused).toBe(false);
     layoutReady(next.app);
-    await elapse(10);
-    expect(headCalls()).toBe(1);
+    await until(() => headCalls() === 1, "the startup pass");
   });
 
   it("keeps the record free of file names, the server URL and the access token", async () => {
@@ -634,7 +667,7 @@ describe("a pass that never settled", () => {
     // The next ordinary trigger is simply allowed again.
     device.app.vault.fire("modify", { path: PATHS[0] });
     await elapse(DEBOUNCE_MS * 2);
-    expect(headCalls()).toBe(1);
+    await until(() => headCalls() === 1, "the file-event pass");
   });
 
   it("runs the owed pass on mobile resume when the deadline passed while timers were suspended", async () => {
@@ -667,8 +700,7 @@ describe("a pass that never settled", () => {
     const cooldown = record(disk).cooldown!;
     await vi.advanceTimersByTimeAsync(cooldown.until - Date.now() + 60_000);
     statusRefresh().fn(); // the app's own status refresh is what reads the cooldown here
-    await elapse(10);
-    expect(record(disk).cooldown).toBeNull();
+    await until(() => record(disk).cooldown === null, "the cooldown's end on disk");
     expect(headCalls()).toBe(0);
 
     // Unloaded with no pass and no Resume; the clock is set back into the old window.
@@ -798,7 +830,7 @@ describe("a pass that never settled", () => {
     device.vault.content.set(PATHS[2], text(PATHS[2], 3));
     device.app.vault.fire("modify", { path: PATHS[2] });
     await elapse(DEBOUNCE_MS * 2);
-    expect(headCalls()).toBe(2);
+    await until(() => headCalls() === 2, "the file-event pass");
   });
 
   it("ends the cooldown on a pass that failed with an error, which is not an interruption", async () => {
@@ -817,7 +849,7 @@ describe("a pass that never settled", () => {
     device.server.headStatus = 200;
     device.app.vault.fire("modify", { path: PATHS[2] });
     await elapse(DEBOUNCE_MS * 2);
-    expect(headCalls()).toBe(2);
+    await until(() => headCalls() === 2, "the file-event pass");
   });
 
   it("makes the next wait longer when a manual pass during the cooldown is interrupted", async () => {
@@ -912,15 +944,15 @@ describe("a pass that never settled", () => {
     // The row is gone once it no longer applies.
     expect(tab.containerEl.log.settings.map((s) => s.name)).not.toContain(RESUME_AUTOMATIC_LABEL);
     // The startup pass the cooldown refused is answered now, not at the old deadline.
-    await until(() => record(disk).lastCompleted !== null && record(disk).active === null, "the owed pass");
+    await until(() => settledPasses(device) === 1, "the owed pass");
     expect(headCalls()).toBe(1);
 
     // A file event now syncs, and the next launch is not held.
     device.vault.content.set(PATHS[2], text(PATHS[2], 3));
     device.app.vault.fire("modify", { path: PATHS[2] });
     await elapse(DEBOUNCE_MS * 2);
+    await until(() => settledPasses(device) === 2, "the file-event pass");
     expect(headCalls()).toBe(2);
-    await until(() => record(disk).lastCompleted !== null && record(disk).active === null, "the pass");
 
     device.plugin.onunload();
     Notice.shown.length = 0;
@@ -929,8 +961,7 @@ describe("a pass that never settled", () => {
     await next.plugin.onload();
     expect(cooldownNotices()).toEqual([]);
     layoutReady(next.app);
-    await elapse(10);
-    expect(headCalls()).toBe(1);
+    await until(() => headCalls() === 1, "the startup pass");
   });
 
   it("drops the resume row and command once the cooldown expires", async () => {
@@ -1207,7 +1238,7 @@ describe("recovery logging failures", () => {
 
     device.app.vault.fire("modify", { path: PATHS[0] });
     await elapse(DEBOUNCE_MS * 2);
-    expect(headCalls()).toBe(1);
+    await until(() => headCalls() === 1, "the file-event pass");
   });
 
   it("bounds a large unreadable sidecar at 64 KiB and records the original byte length", async () => {
@@ -1355,7 +1386,7 @@ describe("recovery logging failures", () => {
     expect(device.plugin.automaticSyncPaused).toBe(false);
     device.app.vault.fire("modify", { path: PATHS[0] });
     await elapse(DEBOUNCE_MS * 2);
-    expect(headCalls()).toBe(1);
+    await until(() => headCalls() === 1, "the file-event pass");
   });
 
   // PIN: owner 2026-09-25 — a logging-only failure must offer the settings resume row, not
@@ -1404,7 +1435,7 @@ describe("recovery logging failures", () => {
     device.vault.content.set(PATHS[2], text(PATHS[2], 3));
     device.app.vault.fire("modify", { path: PATHS[2] });
     await elapse(DEBOUNCE_MS * 2);
-    expect(headCalls()).toBe(2);
+    await until(() => headCalls() === 2, "the file-event pass");
   });
 
   it.each([
