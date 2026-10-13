@@ -334,6 +334,13 @@ export class SyncDiagnostics {
     const deadline = Math.min(cooldown.until, cooldown.since + COOLDOWN_MAX_MS);
     if (now >= cooldown.since && now < deadline) return deadline - now;
     this.#record.cooldown = null;
+    // Persisted at once: left only in memory, a reload under a clock set back into the old
+    // window would read the cooldown back from disk. Like a checkpoint, a failed write is a
+    // logging failure and never reaches the caller; memory stays cleared. Never written over
+    // a record not yet read safely, nor after retirement.
+    if (this.#recordTrusted && !this.#retired) {
+      this.#write().catch((e: unknown) => this.#fail("write", e));
+    }
     return 0;
   }
 

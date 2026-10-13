@@ -135,11 +135,13 @@ interface ServerControl {
   /** Called with the recovery record as it stood when each head request arrived. */
   onHead: ((record: string | undefined) => void) | null;
   headStatus: number;
+  /** While set, `/api/commit` waits on it: a pass is held mid-commit. */
+  commitHold: Promise<void> | null;
 }
 
 /** Serves only this device's own commits, so a pass never has anything to pull. */
 function steadyServer(app: LifecycleApp): ServerControl {
-  const control: ServerControl = { hold: null, onHead: null, headStatus: 200 };
+  const control: ServerControl = { hold: null, onHead: null, headStatus: 200, commitHold: null };
   let head = "01HEAD";
   let commits = 0;
   requestUrlMock.impl = async (req) => {
@@ -157,6 +159,7 @@ function steadyServer(app: LifecycleApp): ServerControl {
     }
     if (url.endsWith("/api/blobs/check")) return { status: 200, text: "", json: { missing: [] } };
     if (url.endsWith("/api/commit")) {
+      if (control.commitHold !== null) await control.commitHold;
       head = `01NEXT${++commits}`;
       return { status: 200, text: "", json: { head } };
     }
@@ -167,6 +170,8 @@ function steadyServer(app: LifecycleApp): ServerControl {
 
 const headCalls = () =>
   requestUrlMock.calls.filter((c) => (c as { url: string }).url.endsWith("/api/head")).length;
+const commitCalls = () =>
+  requestUrlMock.calls.filter((c) => (c as { url: string }).url.endsWith("/api/commit")).length;
 
 function settings(over: Partial<Settings> = {}): Partial<Settings> {
   return {
@@ -653,6 +658,86 @@ describe("a pass that never settled", () => {
     // The one-shot timer, once it does run, owes nothing more.
     await vi.advanceTimersByTimeAsync(20 * 60_000);
     expect(headCalls()).toBe(1);
+  });
+
+  it("persists the end of a cooldown, so a reload under a clock set back into it is not held", async () => {
+    fakeClock();
+    const { device, disk } = await launchCoolingDown({ intervalMinutes: 0, syncOnStartup: false });
+    layoutReady(device.app);
+    const cooldown = record(disk).cooldown!;
+    await vi.advanceTimersByTimeAsync(cooldown.until - Date.now() + 60_000);
+    statusRefresh().fn(); // the app's own status refresh is what reads the cooldown here
+    await elapse(10);
+    expect(record(disk).cooldown).toBeNull();
+    expect(headCalls()).toBe(0);
+
+    // Unloaded with no pass and no Resume; the clock is set back into the old window.
+    device.plugin.onunload();
+    vi.setSystemTime(cooldown.since + 5 * 60_000);
+    const next = boot(dataJsonOf(device), disk);
+    await next.plugin.onload();
+    expect(next.plugin.automaticSyncPaused).toBe(false);
+    expect(statusText(next)).not.toContain(RECOVERY_PAUSED_STATUS);
+    expect(record(disk).streak).toBe(3);
+  });
+
+  it("still owes a pass for an edit refused while a manual pass through the cooldown is committing", async () => {
+    fakeClock();
+    const { device, disk } = await launchCoolingDown({ intervalMinutes: 0, syncOnStartup: false });
+    layoutReady(device.app);
+    const deadline = record(disk).cooldown!.until;
+    let release!: () => void;
+    device.server.commitHold = new Promise<void>((resolve) => (release = resolve));
+    const manual = device.plugin.syncNow();
+    await until(() => commitCalls() === 1, "the manual pass to reach its commit");
+
+    // The edit arrives while that commit is held: the cooldown still stands, so it is refused,
+    // and the pass already took its journal.
+    device.vault.content.set(PATHS[1], text(PATHS[1], 2));
+    device.app.vault.fire("modify", { path: PATHS[1] });
+    await elapse(DEBOUNCE_MS * 2);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
+    expect(headCalls()).toBe(1);
+    const readsBefore = device.vault.reads.length;
+
+    release();
+    await manual;
+    expect(record(disk).cooldown).toBeNull();
+    // The cooldown ended with that pass; the edit's own pass follows at once, not at the deadline.
+    await until(() => headCalls() === 2, "a pass for the refused edit");
+    await until(() => record(disk).active === null && commitCalls() === 2, "it to commit");
+    expect(Date.now()).toBeLessThan(deadline);
+    expect(device.vault.reads.slice(readsBefore)).toContain(PATHS[1]);
+    expect(record(disk).lastCompleted?.status).toBe("committed");
+  });
+
+  it("keeps the owed pass across a settings rebuild that spans the deadline", async () => {
+    fakeClock();
+    const { device, disk } = await launchCoolingDown({ intervalMinutes: 0, syncOnStartup: false });
+    layoutReady(device.app);
+    device.app.vault.fire("modify", { path: PATHS[0] });
+    await elapse(DEBOUNCE_MS * 2);
+    expect(headCalls()).toBe(0);
+    const deadline = record(disk).cooldown!.until;
+
+    // Hold the rebuild at its first await (the data save): no scheduler exists at the deadline.
+    const plugin = device.plugin as unknown as { saveData(data: unknown): Promise<void> };
+    const save = plugin.saveData.bind(plugin);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    plugin.saveData = async (data) => {
+      await held;
+      await save(data);
+    };
+    const rebuilding = device.plugin.saveSettings();
+    await vi.advanceTimersByTimeAsync(deadline - Date.now() + 1_000);
+    expect(headCalls()).toBe(0);
+
+    plugin.saveData = save;
+    release();
+    await rebuilding;
+    await until(() => headCalls() === 1, "the owed pass once the rebuild completes");
+    await until(() => record(disk).active === null && record(disk).lastCompleted !== null, "it to settle");
   });
 
   it("does not count a reload without a new pass", async () => {

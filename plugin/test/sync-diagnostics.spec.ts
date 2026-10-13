@@ -336,9 +336,10 @@ describe("interruption streak", () => {
     clock.now = 14 * HOUR;
     expect(diagnostics.blocksAutomatic).toBe(false);
 
-    // A stored deadline beyond the cap.
-    storage.files.set(PATH, legacyRecord({ streak: 9, cooldown: { since: HOUR, until: 100 * HOUR } }));
-    const stored = launch(storage, clock);
+    // A stored deadline beyond the cap. (Its own storage: the expiry above persists itself.)
+    const capped = new MemoryStorage();
+    capped.files.set(PATH, legacyRecord({ streak: 9, cooldown: { since: HOUR, until: 100 * HOUR } }));
+    const stored = launch(capped, clock);
     clock.now = 5 * HOUR - 1;
     await stored.diagnostics.load();
     expect(stored.diagnostics.cooldownRemainingMs).toBe(1);
@@ -366,6 +367,45 @@ describe("interruption streak", () => {
     expect(storage.record().cooldown).toBeNull();
     const next = launch(storage, clock);
     expect(await next.diagnostics.load()).toEqual({ coolingDown: false, failure: null });
+  });
+
+  it("persists a cooldown's end at once, so a reload under a clock set back into it stays clear", async () => {
+    const storage = new MemoryStorage();
+    storage.files.set(PATH, legacyRecord({ streak: 3, cooldown: { since: HOUR, until: HOUR + 15 * MIN } }));
+    const clock = { now: HOUR + 5 * MIN };
+    const first = launch(storage, clock);
+    await first.diagnostics.load();
+    expect(first.diagnostics.coolingDown).toBe(true);
+
+    clock.now = HOUR + 20 * MIN;
+    expect(first.diagnostics.blocksAutomatic).toBe(false);
+    await flush();
+    expect(storage.record().cooldown).toBeNull();
+    expect(storage.record().streak).toBe(3); // nothing settled; only the wait ended
+
+    // Unloaded with no pass and no Resume, the clock set back into the old window, reloaded.
+    first.diagnostics.retire();
+    clock.now = HOUR + 5 * MIN;
+    const reloaded = launch(storage, clock);
+    expect(await reloaded.diagnostics.load()).toEqual({ coolingDown: false, failure: null });
+  });
+
+  it("persists an end found at load, and keeps memory cleared when that write fails", async () => {
+    const storage = new MemoryStorage();
+    storage.files.set(PATH, legacyRecord({ streak: 3, cooldown: { since: HOUR, until: HOUR + 15 * MIN } }));
+    const clock = { now: 2 * HOUR };
+    await launch(storage, clock).diagnostics.load();
+    await flush();
+    expect(storage.record().cooldown).toBeNull();
+
+    storage.files.set(PATH, legacyRecord({ streak: 3, cooldown: { since: HOUR, until: HOUR + 15 * MIN } }));
+    storage.failWrite = new Error("read-only");
+    const failing = launch(storage, clock);
+    expect(await failing.diagnostics.load()).toEqual({ coolingDown: false, failure: null });
+    await flush();
+    expect(failing.failures).toEqual(["write"]);
+    clock.now = HOUR + 5 * MIN;
+    expect(failing.diagnostics.coolingDown).toBe(false);
   });
 
   it("ends a cooldown when the clock reads before it began, and a later forward step does not revive it", async () => {

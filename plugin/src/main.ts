@@ -681,13 +681,21 @@ export default class LogSyncPlugin extends Plugin {
   #sharedSettings: { rev: SettingsRev; fingerprint: string } | null = null;
   #settingsPushTimer: number | null = null;
   /**
-   * A recovery cooldown refused an automatic request (startup, resume, timer or file event),
-   * so one full-audit automatic pass is owed when it ends. Without this a device with periodic
-   * sync off would sit on the refused edits until some unrelated trigger came along.
+   * Automatic requests (startup, resume, timer, file event) a recovery cooldown refused, as a
+   * running count; `#cooldownPaid` is the count the newest completed pass covered. While it is
+   * ahead, one full-audit automatic pass is owed. Without this a device with periodic sync off
+   * would sit on the refused edits until some unrelated trigger came along. A pass covers only
+   * the refusals made before it started — the engine journals its paths at pass start — so an
+   * edit refused while a manual pass is mid-commit still owes a pass of its own.
    */
-  #cooldownOwed = false;
-  /** One-shot timer at the cooldown's deadline, armed only while a pass is owed. */
+  #cooldownRefused = 0;
+  #cooldownPaid = 0;
+  /** One-shot timer for the owed pass: at the cooldown's deadline, or at once once it ended. */
   #cooldownTimer: number | null = null;
+
+  get #cooldownOwed(): boolean {
+    return this.#cooldownRefused > this.#cooldownPaid;
+  }
   #lastConflicts: ConflictInfo[] = [];
   #pendingEncryptionTransition: PendingEncryptionTransition | null = null;
   #backupModalOpen = false;
@@ -1044,34 +1052,41 @@ export default class LogSyncPlugin extends Plugin {
    */
   #oweAfterCooldown(): void {
     if (!this.recoveryPaused) return;
-    this.#cooldownOwed = true;
+    this.#cooldownRefused++;
     // Edits refused meanwhile are journaled, but startup and resume owe a whole-vault audit.
     this.#engine?.markDirty([], { fullScan: true });
-    this.#armCooldownTimer();
-  }
-
-  #armCooldownTimer(): void {
-    if (this.#unloaded || this.#cooldownTimer !== null) return;
-    const remaining = this.#diagnostics?.cooldownRemainingMs ?? 0;
-    if (remaining <= 0) return;
-    this.#cooldownTimer = window.setTimeout(() => {
-      this.#cooldownTimer = null;
-      void this.#runOwedPass();
-    }, remaining);
+    this.#armOwedPass();
   }
 
   /**
-   * Runs the pass a cooldown owes, once nothing holds automatic sync: at the deadline, on
-   * mobile resume, or after Resume. Through `#autoSync`, so layout-ready, consent and the
-   * scheduler still gate it. A clock stepped back mid-wait just re-arms for the remainder.
+   * (Re)arms the one-shot timer for an owed pass: at the cooldown's deadline while it lasts,
+   * otherwise on the next tick — a macrotask, so a pass that just completed has left the
+   * scheduler and the owed pass is a pass of its own rather than coalesced into that one.
+   */
+  #armOwedPass(): void {
+    if (this.#unloaded || !this.#cooldownOwed) return;
+    if (this.#cooldownTimer !== null) window.clearTimeout(this.#cooldownTimer);
+    this.#cooldownTimer = window.setTimeout(() => {
+      this.#cooldownTimer = null;
+      void this.#runOwedPass();
+    }, this.#diagnostics?.cooldownRemainingMs ?? 0);
+  }
+
+  /**
+   * Asks for the pass a cooldown owes, once nothing holds automatic sync: at the deadline, on
+   * mobile resume, after Resume, after a pass that left later refusals unanswered, or after a
+   * rebuild. Through `#autoSync`, so layout-ready, consent and the scheduler still gate it.
+   * Asking discharges nothing: only a completed pass that started after the refusals does.
+   * A clock stepped back mid-wait re-arms for the remainder; a rebuild in progress (no
+   * scheduler) keeps the debt for `#finishRebuild` to ask again.
    */
   async #runOwedPass(): Promise<void> {
     if (!this.#cooldownOwed || this.#unloaded) return;
     if (this.recoveryPaused) {
-      this.#armCooldownTimer();
+      this.#armOwedPass();
       return;
     }
-    this.#cooldownOwed = false;
+    if (this.#scheduler === null) return;
     this.#renderStatus();
     await this.#autoSync();
   }
@@ -1171,7 +1186,7 @@ export default class LogSyncPlugin extends Plugin {
     if (resumed) this.#engine?.markDirty([], { fullScan: true });
     this.#renderStatus();
     // Ending a cooldown early ends it: a request it refused is answered now, not at the deadline.
-    if (resumed) void this.#runOwedPass();
+    if (resumed) this.#armOwedPass();
     return resumed;
   }
 
@@ -1558,11 +1573,15 @@ export default class LogSyncPlugin extends Plugin {
           if (opts?.keepLocal !== true && opts?.reroot === undefined) {
             await this.#largeMarkdownInPass(generation);
           }
+          // The engine takes its journal as it starts: refusals up to here are in this pass.
+          const covers = this.#cooldownRefused;
           const result = await engine.sync(opts);
           await this.#largeMarkdownInPass(generation, result);
           if (token !== null) await diagnostics?.finishPass(token, { result });
-          // A completed pass consumed the journal, including any full audit a cooldown owed.
-          this.#cooldownOwed = false;
+          this.#cooldownPaid = Math.max(this.#cooldownPaid, covers);
+          // Refused after this pass took its journal: owed a pass of its own, now that the
+          // cooldown this one settled has ended, not at the old deadline.
+          this.#armOwedPass();
           return result;
         } catch (error) {
           if (token !== null) await diagnostics?.finishPass(token, { error });
@@ -1601,6 +1620,8 @@ export default class LogSyncPlugin extends Plugin {
     this.#renderStatus();
     // Work that a retired scheduler dropped, or that a settings change just switched on.
     this.#requestLargeMarkdownDrain();
+    // A cooldown's owed pass that came due while there was no scheduler to take it.
+    this.#armOwedPass();
   }
 
   /**
