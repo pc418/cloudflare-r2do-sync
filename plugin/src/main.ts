@@ -513,15 +513,31 @@ function manualPass(opts: SyncPassOptions): SyncPassOptions {
   return marked;
 }
 
-// Recovery pause prose, lead-authored and used verbatim (docs/260925-fix-IPHONE_SYNC_RECOVERY_PLAN.md).
-export const RECOVERY_PAUSED_NOTICE =
-  "R2DO Sync: the previous sync did not finish. Automatic sync is paused so it will not " +
-  "immediately repeat. Export the sync log for diagnostics, or run Sync now once when ready.";
-export const RECOVERY_PAUSED_STATUS = "automatic sync paused";
+// Interrupted-sync cooldown prose, lead-authored and used verbatim
+// (docs/261013-fix-AUTO_CONTINUE_AFTER_INTERRUPTED_SYNC.md).
+
+/** `15 minutes`, `30 minutes`, `1 hour`, `2 hours` or `4 hours` — every wait `cooldownMs` gives. */
+function cooldownWaitText(waitMs: number): string {
+  const minutes = Math.round(waitMs / 60_000);
+  if (minutes < 60) return `${minutes} minutes`;
+  const hours = Math.round(minutes / 60);
+  return hours === 1 ? "1 hour" : `${hours} hours`;
+}
+
+/** Raised once, on the load that starts a cooldown. */
+export function recoveryCooldownNotice(streak: number, waitMs: number): string {
+  return (
+    `R2DO Sync: the last ${streak} syncs did not finish, so automatic sync waits ` +
+    `${cooldownWaitText(waitMs)} before trying again. Sync now still runs one right away.`
+  );
+}
+export const RECOVERY_PAUSED_STATUS = "automatic sync waiting";
 export const RESUME_AUTOMATIC_LABEL = "Resume automatic sync";
 export const RESUME_AUTOMATIC_DESC =
-  "Automatic sync was paused after an interrupted sync. Manual Sync now still runs one pass; " +
-  "resuming allows startup, timer and file-change sync again.";
+  "Several syncs in a row did not finish, so automatic sync is waiting before it tries again. " +
+  "Resume lets startup, timer and file-change sync run now.";
+// Recovery-logging prose, unchanged (docs/260925-fix-RECOVERY_RESUME_AFTER_READ_FAILURE.md).
+export const RECOVERY_LOG_FAILED_STATUS = "automatic sync paused";
 export const RESUME_AFTER_LOG_FAILURE_DESC =
   "Automatic sync stopped because the recovery record could not be read or written. " +
   "Resume retries it; an unreadable record is saved beside it before automatic sync resumes.";
@@ -530,9 +546,9 @@ export const RECOVERY_LOG_FAILED_NOTICE =
   "sync in the Troubleshooting settings to retry or set aside an unreadable record.";
 
 /**
- * An automatic pass reached the engine seam while automatic sync is paused or recovery logging
- * is broken. Every trigger is gated before this; the seam refuses too, so a debounce that was
- * already armed cannot slip through. Not a sync failure, so it is not reported as one.
+ * An automatic pass reached the engine seam while automatic sync is cooling down or recovery
+ * logging is broken. Every trigger is gated before this; the seam refuses too, so a debounce
+ * that was already armed cannot slip through. Not a sync failure, so it is not reported as one.
  */
 class AutomaticSyncBlockedError extends Error {}
 
@@ -637,8 +653,9 @@ export default class LogSyncPlugin extends Plugin {
    */
   #auditOwedBeforeReady = false;
   /**
-   * The recovery record: an active marker around every scheduled pass, and the pause a pass
-   * that never settled leaves behind. Loaded before any automatic trigger is registered.
+   * The recovery record: an active marker around every scheduled pass, the streak of passes
+   * that never settled, and the cooldown a long streak starts. Loaded before any automatic
+   * trigger is registered.
    */
   #diagnostics: SyncDiagnostics | null = null;
   /** Markdown paths from vault events and pulls, owed an oversized-Markdown check. */
@@ -735,7 +752,8 @@ export default class LogSyncPlugin extends Plugin {
     this.#lastConflicts = data?.lastConflicts ?? [];
     this.#pendingEncryptionTransition = data?.pendingEncryptionTransition ?? null;
 
-    // Before any automatic trigger exists: a pass that never settled last time pauses them all.
+    // Before any automatic trigger exists: a pass that never settled last time is counted, and
+    // the third in a row holds them all for a cooldown.
     await this.#loadDiagnostics();
 
     // Obsidian hides the status bar on mobile, so the ribbon is the always-present affordance a
@@ -969,7 +987,7 @@ export default class LogSyncPlugin extends Plugin {
     // The periodic timer and the mobile resume are registered during `onload`, so they can
     // fire before layout-ready too; the startup pass above is what runs once it arrives.
     if (!this.#layoutReady) return;
-    // Startup, timer and resume all arrive here; a recovery pause answers all of them.
+    // Startup, timer and resume all arrive here; a recovery cooldown answers all of them.
     if (this.automaticSyncPaused) return;
     if (!this.#scheduler || this.#phase === "decision") return;
     // The first-sync gate needs an answer, and an unattended pass has nobody to give one.
@@ -1005,20 +1023,23 @@ export default class LogSyncPlugin extends Plugin {
     // forced open has broken the app rather than merely stopped working.
     this.#mobileStatusBar?.disable();
     this.#mobileStatusBar = null;
-    // Not a clear: a pass still running keeps its marker on disk, so the next load pauses.
+    // Not a clear: a pass still running keeps its marker on disk, so the next load counts it.
     // Retiring only stops this instance from writing over what the next instance reads.
     this.#diagnostics?.retire();
     this.#retireScheduler();
   }
 
-  /** Automatic sync is held: paused after an interrupted pass, or recovery logging failed. */
+  /** Automatic sync is held: cooling down after repeated interruptions, or recovery logging failed. */
   get automaticSyncPaused(): boolean {
     return this.#diagnostics?.blocksAutomatic ?? false;
   }
 
-  /** Paused because an earlier pass never settled (not merely because logging failed). */
+  /**
+   * Waiting out a cooldown because several passes in a row never settled (not merely because
+   * logging failed). False again once the cooldown's deadline passes.
+   */
   get recoveryPaused(): boolean {
-    return this.#diagnostics?.paused ?? false;
+    return this.#diagnostics?.coolingDown ?? false;
   }
 
   /**
@@ -1063,23 +1084,27 @@ export default class LogSyncPlugin extends Plugin {
         new Notice(RECOVERY_LOG_FAILED_NOTICE, 0);
         this.#renderStatus();
       },
+      // Once, when a cooldown starts: on load, or when a read failure is recovered later. A
+      // reload inside the same cooldown says nothing again; the status bar carries it.
+      onCooldown: (streak, waitMs) => {
+        new Notice(recoveryCooldownNotice(streak, waitMs), 0);
+        this.#renderStatus();
+      },
     });
-    const outcome = await this.#diagnostics.load();
-    if (outcome.paused) new Notice(RECOVERY_PAUSED_NOTICE, 0);
+    await this.#diagnostics.load();
   }
 
   /**
-   * The explicit way out of a recovery pause. Persisted before automatic sync is allowed
-   * again, so a resume that could not be written does not quietly re-pause at the next load.
-   * Does not start a pass itself; the next startup, timer or edit does. The pass after it is a
-   * full audit, because edits during the pause may have fallen out of the journal.
+   * An optional override, never required: ends a recovery cooldown (and resets the
+   * interruption streak) or retries a failed recovery record. Persisted before automatic sync
+   * is allowed again, so a resume that could not be written does not quietly come back at the
+   * next load. Does not start a pass itself; the next startup, timer or edit does. The pass
+   * after it is a full audit, because edits while held may have fallen out of the journal.
    */
   async resumeAutomaticSync(): Promise<boolean> {
     const diagnostics = this.#diagnostics;
     if (diagnostics === null || !diagnostics.blocksAutomatic) return true;
-    const wasPaused = diagnostics.paused;
     const resumed = await diagnostics.resume();
-    if (!resumed && !wasPaused && diagnostics.paused) new Notice(RECOVERY_PAUSED_NOTICE, 0);
     if (resumed) this.#engine?.markDirty([], { fullScan: true });
     this.#renderStatus();
     return resumed;
@@ -1451,18 +1476,17 @@ export default class LogSyncPlugin extends Plugin {
     }
     const marked = {
       sync: async (opts?: SyncPassOptions): Promise<SyncResult> => {
+        // A manual pass runs through a cooldown, and settling ends it (`finishPass`).
         if (diagnostics?.blocksAutomatic && !isManualSync(opts)) {
           throw new AutomaticSyncBlockedError("automatic sync is paused");
         }
         await this.#localMaintenance;
-        // An automatic request can wait behind pre-existing maintenance while a manual
-        // pass fails and activates recovery pause. Check again at the engine boundary.
+        // An automatic request can wait behind pre-existing maintenance while a manual pass
+        // recovers an unread record into a cooldown. Check again at the engine boundary.
         if (diagnostics?.blocksAutomatic && !isManualSync(opts)) {
           throw new AutomaticSyncBlockedError("automatic sync is paused");
         }
-        const wasPaused = diagnostics?.paused ?? false;
         const token = await diagnostics?.beginPass() ?? null;
-        if (!wasPaused && diagnostics?.paused) new Notice(RECOVERY_PAUSED_NOTICE, 0);
         pass = token;
         try {
           // A forced publish ships what the user previewed, so it is not changed underneath.
@@ -3203,9 +3227,10 @@ export default class LogSyncPlugin extends Plugin {
       case "first-sync":
         return "CONFIRM FIRST SYNC";
       case "idle":
-        // Held for as long as the pause is, including after a manual pass: that pass did not
-        // resume anything, and "synced 1m ago" would read as if it had.
-        return this.automaticSyncPaused ? RECOVERY_PAUSED_STATUS : this.#lastPassText();
+        // Held for as long as automatic sync is: "synced 1m ago" would read as if it were not.
+        // A cooldown stops holding at its deadline, and the periodic refresh re-reads it.
+        if (this.recoveryPaused) return RECOVERY_PAUSED_STATUS;
+        return this.automaticSyncPaused ? RECOVERY_LOG_FAILED_STATUS : this.#lastPassText();
     }
   }
 

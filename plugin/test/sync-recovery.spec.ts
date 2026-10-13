@@ -1,14 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import LogSyncPlugin, {
   RECOVERY_LOG_FAILED_NOTICE,
-  RECOVERY_PAUSED_NOTICE,
+  RECOVERY_LOG_FAILED_STATUS,
   RECOVERY_PAUSED_STATUS,
   RESUME_AFTER_LOG_FAILURE_DESC,
   RESUME_AUTOMATIC_DESC,
   RESUME_AUTOMATIC_LABEL,
+  recoveryCooldownNotice,
   type Settings,
 } from "../src/main";
-import { DIAGNOSTIC_SCHEMA, TRACE_LIMIT, parseRecord, type DiagnosticRecord } from "../src/sync-diagnostics";
+import {
+  DIAGNOSTIC_SCHEMA,
+  TRACE_LIMIT,
+  cooldownMs,
+  parseRecord,
+  type DiagnosticRecord,
+} from "../src/sync-diagnostics";
 import {
   type FakeElement,
   LifecycleApp,
@@ -19,15 +26,19 @@ import {
 } from "./obsidian-fake";
 
 /**
- * The sync recovery pause, driven through the real plugin, scheduler and engine.
+ * Sync recovery after an interrupted pass, driven through the real plugin, scheduler and engine.
  *
  * PIN (lead assignment 2026-09-25, docs/260925-fix-IPHONE_SYNC_RECOVERY_PLAN.md): every
  * scheduled pass persists an active marker before it does any work and clears it only once it
- * settles. A load that finds a marker left behind pauses ALL automatic sync — startup, timer,
- * mobile resume and file events — until an explicit resume, across rebuilds and restarts.
- * Manual Sync now still runs one consent-gated pass and does not unpause. A pass that settled
- * (result or error) is never reported as interrupted. A recovery record that cannot be read or
- * written stops automatic sync and says so.
+ * settles. A pass that settled (result or error) is never reported as interrupted. A recovery
+ * record that cannot be read or written stops automatic sync and says so.
+ *
+ * PIN (owner 2026-10-13, docs/261013-fix-AUTO_CONTINUE_AFTER_INTERRUPTED_SYNC.md): a load
+ * that finds a marker left behind counts it once into a persisted streak. One or two in a row
+ * continue automatically and silently. The third holds ALL automatic sync — startup, timer,
+ * mobile resume and file events — for a cooldown (15 minutes doubling to 4 hours) that ends by
+ * itself, across rebuilds and restarts. Manual Sync now runs through it (consent-gated), and
+ * any settled pass resets the streak. Resume is an optional override, never required.
  *
  * All fixtures are synthetic: file names, server and token below are made up.
  */
@@ -218,7 +229,11 @@ function recordOrNull(disk: Map<string, string>): DiagnosticRecord | null {
   return raw === undefined ? null : (JSON.parse(raw) as DiagnosticRecord);
 }
 
-function storedRecovery(over: Partial<DiagnosticRecord> = {}): DiagnosticRecord {
+type StoredRecord = Omit<DiagnosticRecord, "streak" | "cooldown" | "lastInterrupted"> &
+  Partial<Pick<DiagnosticRecord, "streak" | "cooldown" | "lastInterrupted">>;
+
+/** A record as 1.1.4–1.1.6 wrote it — no streak — unless `over` adds the newer fields. */
+function storedRecovery(over: Partial<DiagnosticRecord> = {}): StoredRecord {
   return {
     schema: DIAGNOSTIC_SCHEMA,
     pluginVersion: "1.1.4",
@@ -274,26 +289,66 @@ async function fireEveryAutomaticSource(device: Device): Promise<void> {
   await elapse(DEBOUNCE_MS * 4);
 }
 
-/** Launches, starts the startup pass and kills the process while the pass waits on the server. */
-async function launchAndKillMidPass(): Promise<{ disk: Map<string, string>; dataJson: unknown }> {
-  const first = boot(data());
-  first.server.hold = new Promise<void>(() => {});
-  await first.plugin.onload();
-  layoutReady(first.app);
+/**
+ * Lets a loaded `device` start its startup pass, and kills the process while the pass waits on
+ * the server. Asserts the pass got that far: automatic sync was not held.
+ */
+async function killMidPass(device: Device): Promise<{ disk: Map<string, string>; dataJson: unknown }> {
+  device.server.hold = new Promise<void>(() => {});
+  layoutReady(device.app);
   await until(() => headCalls() === 1, "the startup pass to reach the server");
   // The process dies here: whatever is on disk now is what the next launch finds. No
   // onunload, no settle. The held request is never released, as for a killed process: a
   // released dead pass would carry on through the global `requestUrlMock`, which the next
   // `boot()` points at the new device's server, and commit there (seen on the CI runner).
-  const disk = new Map(first.app.vault.configFiles);
-  const dataJson = dataJsonOf(first);
+  const disk = new Map(device.app.vault.configFiles);
+  const dataJson = dataJsonOf(device);
   expect(record(disk).active).not.toBeNull();
-  first.plugin.onunload();
+  device.plugin.onunload();
   await elapse(10);
   requestUrlMock.calls.length = 0;
   Notice.shown.length = 0;
   return { disk, dataJson };
 }
+
+/** Launches, starts the startup pass and kills the process while the pass waits on the server. */
+async function launchAndKillMidPass(): Promise<{ disk: Map<string, string>; dataJson: unknown }> {
+  const first = boot(data());
+  await first.plugin.onload();
+  return await killMidPass(first);
+}
+
+const INTERRUPTED = { startedAt: 8, phase: "scan" as const, phaseAt: 9 };
+
+/** A launch that finds a third interruption in a row on disk, so it starts a cooldown. */
+async function launchCoolingDown(
+  over: Partial<Settings> = {},
+  extra: Record<string, unknown> = {}
+): Promise<{ device: Device; disk: Map<string, string> }> {
+  const disk = new Map([[RECORD_PATH, JSON.stringify(storedRecovery({ streak: 2, active: INTERRUPTED }))]]);
+  const device = boot(data(over, extra), disk);
+  await device.plugin.onload();
+  expect(record(disk).streak).toBe(3);
+  return { device, disk };
+}
+
+/** Every notice about passes that did not finish (the cooldown notice is the only one). */
+const cooldownNotices = () => Notice.shown.filter((n) => n.includes("did not finish"));
+
+const automaticTimer = (): FakeTimer => {
+  const timer = windowTimers.find(
+    (t) => t.kind === "interval" && !t.cleared && t.ms === INTERVAL_MINUTES * 60_000
+  );
+  expect(timer).toBeDefined();
+  return timer!;
+};
+
+/** The newest launch's status refresh (earlier launches' intervals are never cleared here). */
+const statusRefresh = (): FakeTimer => {
+  const timer = [...windowTimers].reverse().find((t) => t.kind === "interval" && !t.cleared && t.ms === 30_000);
+  expect(timer).toBeDefined();
+  return timer!;
+};
 
 beforeEach(() => {
   installGlobals();
@@ -307,6 +362,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   Platform.isMobile = false;
 });
 
@@ -338,6 +394,8 @@ describe("active marker around every scheduled pass", () => {
     expect(done.platform).toMatch(/-mobile$/);
     expect(done.active).toBeNull();
     expect(done.paused).toBeNull();
+    expect(done.streak).toBe(0);
+    expect(done.cooldown).toBeNull();
     expect(done.lastCompleted?.status).toBe("committed");
     expect(done.lastFailed).toBeNull();
     expect(done.trace.map((t) => t.event)).toEqual([
@@ -416,7 +474,8 @@ describe("active marker around every scheduled pass", () => {
     requestUrlMock.calls.length = 0;
     const next = boot(dataJsonOf(device), device.app.vault.configFiles);
     await next.plugin.onload();
-    expect(Notice.shown).not.toContain(RECOVERY_PAUSED_NOTICE);
+    expect(cooldownNotices()).toEqual([]);
+    expect(record(next.app.vault.configFiles).streak).toBe(0);
     expect(next.plugin.automaticSyncPaused).toBe(false);
     layoutReady(next.app);
     await elapse(10);
@@ -444,56 +503,128 @@ describe("active marker around every scheduled pass", () => {
   });
 });
 
-// --- pause ------------------------------------------------------------------------------
+// --- interrupted passes: continue, then cool down ----------------------------------------
 
-describe("recovery pause after a pass that never settled", () => {
-  it("blocks every automatic source on the next launch, and says so", async () => {
-    const { disk, dataJson } = await launchAndKillMidPass();
-    const device = boot(dataJson, disk);
+describe("a pass that never settled", () => {
+  it("words the cooldown exactly as the owner wrote it, for every wait it can give", () => {
+    expect([3, 4, 5, 6, 7, 12].map((n) => recoveryCooldownNotice(n, cooldownMs(n)))).toEqual([
+      "R2DO Sync: the last 3 syncs did not finish, so automatic sync waits 15 minutes before trying again. Sync now still runs one right away.",
+      "R2DO Sync: the last 4 syncs did not finish, so automatic sync waits 30 minutes before trying again. Sync now still runs one right away.",
+      "R2DO Sync: the last 5 syncs did not finish, so automatic sync waits 1 hour before trying again. Sync now still runs one right away.",
+      "R2DO Sync: the last 6 syncs did not finish, so automatic sync waits 2 hours before trying again. Sync now still runs one right away.",
+      "R2DO Sync: the last 7 syncs did not finish, so automatic sync waits 4 hours before trying again. Sync now still runs one right away.",
+      "R2DO Sync: the last 12 syncs did not finish, so automatic sync waits 4 hours before trying again. Sync now still runs one right away.",
+    ]);
+    expect(RECOVERY_PAUSED_STATUS).toBe("automatic sync waiting");
+    expect(RESUME_AUTOMATIC_DESC).toBe(
+      "Several syncs in a row did not finish, so automatic sync is waiting before it tries again. Resume lets startup, timer and file-change sync run now."
+    );
+    expect(RESUME_AUTOMATIC_LABEL).toBe("Resume automatic sync");
+  });
+
+  // PIN: owner 2026-10-13 — an interrupted sync continues automatically; the settings Resume button is never required (docs/261013-fix-AUTO_CONTINUE_AFTER_INTERRUPTED_SYNC.md)
+  it("continues after one and two interruptions, waits after the third, and the wait ends by itself", async () => {
+    let { disk, dataJson } = await launchAndKillMidPass();
+
+    // First interruption: counted and persisted before any trigger exists, silent, not held —
+    // the startup pass runs (and is killed again, inside `killMidPass`).
+    let device = boot(dataJson, disk);
     await device.plugin.onload();
+    expect(record(disk).streak).toBe(1);
+    expect(record(disk).active).toBeNull();
+    expect(record(disk).cooldown).toBeNull();
+    expect(record(disk).trace.slice(-2).map((t) => t.event)).toEqual(["plugin-load", "recovery-continued"]);
+    expect(cooldownNotices()).toEqual([]);
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+    expect(statusText(device)).not.toContain(RECOVERY_PAUSED_STATUS);
+    ({ disk, dataJson } = await killMidPass(device));
 
-    // Paused before any trigger could run, persisted, and visible.
-    expect(Notice.shown).toContain(RECOVERY_PAUSED_NOTICE);
-    const paused = record(disk);
-    expect(paused.active).toBeNull();
-    expect(paused.paused?.interrupted.phase).toBe("head");
-    expect(paused.trace.slice(-2).map((t) => t.event)).toEqual(["plugin-load", "recovery-paused"]);
+    // Second in a row: the same.
+    device = boot(dataJson, disk);
+    await device.plugin.onload();
+    expect(record(disk).streak).toBe(2);
+    expect(record(disk).cooldown).toBeNull();
+    expect(cooldownNotices()).toEqual([]);
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+    ({ disk, dataJson } = await killMidPass(device));
+
+    // Third in a row: a 15-minute cooldown, announced once, holding every automatic source.
+    device = boot(dataJson, disk);
+    await device.plugin.onload();
+    const third = record(disk);
+    expect(third.streak).toBe(3);
+    expect(third.cooldown).not.toBeNull();
+    expect(third.cooldown!.until - third.cooldown!.since).toBe(15 * 60_000);
+    expect(third.trace.at(-1)?.event).toBe("recovery-paused");
+    expect(cooldownNotices()).toEqual([
+      "R2DO Sync: the last 3 syncs did not finish, so automatic sync waits 15 minutes before trying again. Sync now still runs one right away.",
+    ]);
     expect(statusText(device)).toContain(RECOVERY_PAUSED_STATUS);
-
     await fireEveryAutomaticSource(device);
-
     expect(headCalls()).toBe(0);
     expect(requestUrlMock.calls).toEqual([]);
     expect(device.vault.reads).toEqual([]);
     expect(device.vault.lists).toBe(0);
-    expect(statusText(device)).toContain(RECOVERY_PAUSED_STATUS);
+
+    // One millisecond short of the deadline it still holds.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(third.cooldown!.until - 1);
+    automaticTimer().fn();
+    await elapse(10);
+    expect(headCalls()).toBe(0);
+
+    // At the deadline nothing is held any more: the status says so on its next refresh, and
+    // the next ordinary trigger runs a pass that settles and resets the streak. No Resume.
+    clock.mockReturnValue(third.cooldown!.until);
+    statusRefresh().fn();
+    expect(statusText(device)).not.toContain(RECOVERY_PAUSED_STATUS);
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+    automaticTimer().fn();
+    await until(() => record(disk).lastCompleted !== null && record(disk).active === null, "the pass after the cooldown");
+    expect(headCalls()).toBe(1);
+    expect(record(disk).streak).toBe(0);
+    expect(record(disk).cooldown).toBeNull();
+    expect(record(disk).trace.some((t) => t.event === "resumed")).toBe(false);
   });
 
-  it("survives a settings rebuild and a second restart", async () => {
+  it("does not count a reload without a new pass", async () => {
     const { disk, dataJson } = await launchAndKillMidPass();
-    const second = boot(dataJson, disk);
+    const first = boot(dataJson, disk);
+    await first.plugin.onload();
+    expect(record(disk).streak).toBe(1);
+    first.plugin.onunload(); // before layout-ready: no pass started
+
+    const second = boot(dataJsonOf(first), disk);
     await second.plugin.onload();
-    layoutReady(second.app);
+    expect(record(disk).streak).toBe(1);
+    expect(record(disk).trace.filter((t) => t.event === "recovery-continued")).toHaveLength(1);
+    expect(second.plugin.automaticSyncPaused).toBe(false);
+  });
 
-    await second.plugin.saveSettings(); // rebuilds the engine and scheduler
-    await fireEveryAutomaticSource(second);
+  it("keeps a cooldown across a settings rebuild and a restart, without announcing it again", async () => {
+    const { device, disk } = await launchCoolingDown();
+    expect(cooldownNotices()).toHaveLength(1);
+    const cooldown = record(disk).cooldown;
+    layoutReady(device.app);
+    await device.plugin.saveSettings(); // rebuilds the engine and scheduler
+    await fireEveryAutomaticSource(device);
     expect(headCalls()).toBe(0);
-    expect(second.plugin.automaticSyncPaused).toBe(true);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
 
-    second.plugin.onunload();
+    device.plugin.onunload();
     Notice.shown.length = 0;
-    const third = boot(dataJsonOf(second), disk);
-    await third.plugin.onload();
-    expect(Notice.shown).toContain(RECOVERY_PAUSED_NOTICE);
-    expect(third.plugin.automaticSyncPaused).toBe(true);
-    await fireEveryAutomaticSource(third);
+    const next = boot(dataJsonOf(device), disk);
+    await next.plugin.onload();
+    expect(cooldownNotices()).toEqual([]);
+    expect(record(disk).streak).toBe(3);
+    expect(record(disk).cooldown).toEqual(cooldown);
+    expect(next.plugin.automaticSyncPaused).toBe(true);
+    expect(statusText(next)).toContain(RECOVERY_PAUSED_STATUS);
+    await fireEveryAutomaticSource(next);
     expect(headCalls()).toBe(0);
   });
 
-  it("lets Sync now run one pass without unpausing, and that pass still sees paused-time edits", async () => {
-    const { disk, dataJson } = await launchAndKillMidPass();
-    const device = boot(dataJson, disk);
-    await device.plugin.onload();
+  it("lets Sync now run through the cooldown and end it, and that pass sees edits made while waiting", async () => {
+    const { device, disk } = await launchCoolingDown();
     await fireEveryAutomaticSource(device);
     expect(headCalls()).toBe(0);
 
@@ -504,22 +635,87 @@ describe("recovery pause after a pass that never settled", () => {
     const after = record(disk);
     expect(after.lastCompleted?.status).toBe("committed");
     expect(after.active).toBeNull();
-    expect(after.paused).not.toBeNull();
-    expect(device.plugin.automaticSyncPaused).toBe(true);
-    expect(statusText(device)).toContain(RECOVERY_PAUSED_STATUS);
+    expect(after.streak).toBe(0);
+    expect(after.cooldown).toBeNull();
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+    expect(statusText(device)).not.toContain(RECOVERY_PAUSED_STATUS);
 
-    // Still paused for automatic work afterwards.
-    await fireEveryAutomaticSource(device);
-    expect(headCalls()).toBe(1);
+    device.vault.content.set(PATHS[2], text(PATHS[2], 3));
+    device.app.vault.fire("modify", { path: PATHS[2] });
+    await elapse(DEBOUNCE_MS * 2);
+    expect(headCalls()).toBe(2);
   });
 
-  it("keeps Sync now behind first-sync consent while paused", async () => {
-    const { disk } = await launchAndKillMidPass();
-    const device = boot(
-      data({ firstSyncAcknowledged: false }, { state: null }),
-      disk
-    );
+  it("ends the cooldown on a pass that failed with an error, which is not an interruption", async () => {
+    const { device, disk } = await launchCoolingDown();
+    layoutReady(device.app);
+    device.server.headStatus = 500;
+    await device.plugin.syncNow();
+
+    const failed = record(disk);
+    expect(failed.lastFailed?.error).toBe("http-500");
+    expect(failed.active).toBeNull();
+    expect(failed.streak).toBe(0);
+    expect(failed.cooldown).toBeNull();
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+
+    device.server.headStatus = 200;
+    device.app.vault.fire("modify", { path: PATHS[2] });
+    await elapse(DEBOUNCE_MS * 2);
+    expect(headCalls()).toBe(2);
+  });
+
+  it("makes the next wait longer when a manual pass during the cooldown is interrupted", async () => {
+    const { device, disk: live } = await launchCoolingDown();
+    device.server.hold = new Promise<void>(() => {});
+    void device.plugin.syncNow();
+    await until(() => headCalls() === 1, "the manual pass to reach the server");
+    // The process dies mid-pass.
+    const disk = new Map(live);
+    const dataJson = dataJsonOf(device);
+    expect(record(disk).active).not.toBeNull();
+    device.plugin.onunload();
+    await elapse(10);
+    requestUrlMock.calls.length = 0;
+    Notice.shown.length = 0;
+
+    const next = boot(dataJson, disk);
+    await next.plugin.onload();
+    const longer = record(disk);
+    expect(longer.streak).toBe(4);
+    expect(longer.cooldown!.until - longer.cooldown!.since).toBe(30 * 60_000);
+    expect(cooldownNotices()).toEqual([
+      "R2DO Sync: the last 4 syncs did not finish, so automatic sync waits 30 minutes before trying again. Sync now still runs one right away.",
+    ]);
+    await fireEveryAutomaticSource(next);
+    expect(headCalls()).toBe(0);
+  });
+
+  it.each([
+    ["a 1.1.4–1.1.6 pause", { paused: { since: 7, interrupted: INTERRUPTED } }, 1],
+    ["a 1.1.4–1.1.6 pause with an active marker", { paused: { since: 7, interrupted: INTERRUPTED }, active: INTERRUPTED }, 2],
+  ] as const)("lifts %s on load and syncs automatically", async (_case, over, streak) => {
+    const disk = new Map([[RECORD_PATH, JSON.stringify(storedRecovery(over))]]);
+    const device = boot(data(), disk);
     await device.plugin.onload();
+
+    const lifted = record(disk);
+    expect(lifted.paused).toBeNull();
+    expect(lifted.active).toBeNull();
+    expect(lifted.streak).toBe(streak);
+    expect(lifted.cooldown).toBeNull();
+    expect(lifted.trace.at(-1)?.event).toBe("recovery-continued");
+    expect(cooldownNotices()).toEqual([]);
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+
+    layoutReady(device.app);
+    await until(() => record(disk).lastCompleted !== null, "the startup pass");
+    expect(headCalls()).toBe(1);
+    expect(record(disk).streak).toBe(0);
+  });
+
+  it("keeps Sync now behind first-sync consent while waiting", async () => {
+    const { device } = await launchCoolingDown({ firstSyncAcknowledged: false }, { state: null });
     expect(device.plugin.automaticSyncPaused).toBe(true);
 
     const pass = device.plugin.syncNow();
@@ -533,15 +729,13 @@ describe("recovery pause after a pass that never settled", () => {
     expect(device.plugin.automaticSyncPaused).toBe(true);
   });
 
-  it("resumes only on the explicit action, persists it, and automatic sync runs again", async () => {
-    const { disk, dataJson } = await launchAndKillMidPass();
-    const device = boot(dataJson, disk);
-    await device.plugin.onload();
+  it("offers Resume as an optional override that ends the cooldown now, and persists it", async () => {
+    const { device, disk } = await launchCoolingDown();
     layoutReady(device.app);
     await elapse(10);
     expect(headCalls()).toBe(0);
 
-    // The Troubleshooting row, with the lead's wording, only while paused.
+    // The Troubleshooting row, with the lead's wording, only while held.
     const tab = (device.plugin as unknown as { settingTabs: { display(): void; containerEl: FakeElement }[] })
       .settingTabs[0];
     tab.display();
@@ -555,14 +749,15 @@ describe("recovery pause after a pass that never settled", () => {
     await button.click();
     await elapse(10);
 
-    expect(record(disk).paused).toBeNull();
+    expect(record(disk).streak).toBe(0);
+    expect(record(disk).cooldown).toBeNull();
     expect(record(disk).trace.at(-1)?.event).toBe("resumed");
     expect(device.plugin.automaticSyncPaused).toBe(false);
     expect(statusText(device)).not.toContain(RECOVERY_PAUSED_STATUS);
     // The row is gone once it no longer applies.
     expect(tab.containerEl.log.settings.map((s) => s.name)).not.toContain(RESUME_AUTOMATIC_LABEL);
 
-    // A file event now syncs, and the next launch is not paused.
+    // A file event now syncs, and the next launch is not held.
     device.vault.content.set(PATHS[2], text(PATHS[2], 3));
     device.app.vault.fire("modify", { path: PATHS[2] });
     await elapse(DEBOUNCE_MS * 2);
@@ -574,30 +769,45 @@ describe("recovery pause after a pass that never settled", () => {
     requestUrlMock.calls.length = 0;
     const next = boot(dataJsonOf(device), disk);
     await next.plugin.onload();
-    expect(Notice.shown).not.toContain(RECOVERY_PAUSED_NOTICE);
+    expect(cooldownNotices()).toEqual([]);
     layoutReady(next.app);
     await elapse(10);
     expect(headCalls()).toBe(1);
   });
 
-  it("offers the resume command only while paused", async () => {
-    const { disk, dataJson } = await launchAndKillMidPass();
-    const device = boot(dataJson, disk);
-    await device.plugin.onload();
+  it("drops the resume row and command once the cooldown expires", async () => {
+    const { device, disk } = await launchCoolingDown();
     const command = (device.plugin as unknown as {
       commands: { id: string; name: string; checkCallback?: (checking: boolean) => boolean | void }[];
     }).commands.find((c) => c.id === "sync-resume-automatic");
     expect(command?.name).toBe(RESUME_AUTOMATIC_LABEL);
     expect(command!.checkCallback!(true)).toBe(true);
+    const tab = (device.plugin as unknown as { settingTabs: { display(): void; containerEl: FakeElement }[] })
+      .settingTabs[0];
+    tab.display();
+    expect(tab.containerEl.log.settings.map((s) => s.name)).toContain(RESUME_AUTOMATIC_LABEL);
+
+    vi.spyOn(Date, "now").mockReturnValue(record(disk).cooldown!.until);
+    expect(command!.checkCallback!(true)).toBe(false);
+    tab.display();
+    expect(tab.containerEl.log.settings.map((s) => s.name)).not.toContain(RESUME_AUTOMATIC_LABEL);
+  });
+
+  it("offers the resume command only while held", async () => {
+    const { device, disk } = await launchCoolingDown();
+    const command = (device.plugin as unknown as {
+      commands: { id: string; name: string; checkCallback?: (checking: boolean) => boolean | void }[];
+    }).commands.find((c) => c.id === "sync-resume-automatic");
+    expect(command!.checkCallback!(true)).toBe(true);
 
     command!.checkCallback!(false);
-    await until(() => record(disk).paused === null, "the resume to persist");
+    await until(() => record(disk).cooldown === null, "the resume to persist");
     expect(command!.checkCallback!(true)).toBe(false);
   });
 
-  it("exports the recovery record with the sync log while paused, without starting a pass", async () => {
-    const { disk, dataJson } = await launchAndKillMidPass();
-    const device = boot(dataJson, disk);
+  it("exports the recovery record with the sync log while waiting, without starting a pass", async () => {
+    const disk = new Map([[RECORD_PATH, JSON.stringify(storedRecovery({ streak: 2, active: INTERRUPTED }))]]);
+    const device = boot(data(), disk);
     const created: { path: string; body: string }[] = [];
     (device.app.vault as unknown as { create: unknown }).create = async (path: string, body: string) => {
       created.push({ path, body });
@@ -615,7 +825,9 @@ describe("recovery pause after a pass that never settled", () => {
     const json = body.slice(body.indexOf("```json") + 7, body.lastIndexOf("```"));
     const exported = JSON.parse(json) as DiagnosticRecord & { loggingFailure: unknown };
     expect(exported.schema).toBe(DIAGNOSTIC_SCHEMA);
-    expect(exported.paused?.interrupted.phase).toBe("head");
+    expect(exported.lastInterrupted?.pass.phase).toBe("scan");
+    expect(exported.streak).toBe(3);
+    expect(exported.cooldown).not.toBeNull();
     expect(exported.loggingFailure).toBeNull();
     expect(headCalls()).toBe(0);
   });
@@ -635,21 +847,23 @@ describe("marker ownership across unload", () => {
     first.plugin.onunload();
     expect(record(first.app.vault.configFiles).active).not.toBeNull();
 
-    // Plugin reload in the same process: the same disk.
+    // Plugin reload in the same process: the same disk. The marker is counted, not cleared.
     const disk = first.app.vault.configFiles;
     const second = boot(dataJsonOf(first), disk);
     await second.plugin.onload();
-    expect(second.plugin.automaticSyncPaused).toBe(true);
+    expect(record(disk).streak).toBe(1);
+    expect(record(disk).active).toBeNull();
     const writesBefore = second.app.vault.configWrites.length;
-    const pausedRecord = disk.get(RECORD_PATH);
+    const countedRecord = disk.get(RECORD_PATH);
 
-    // The old instance's pass now settles; it must not write over the new instance's record.
+    // The old instance's pass now settles; it must not write over the new instance's record,
+    // and in particular must not reset the streak it never owned.
     release();
     await elapse(50);
     expect(first.app.vault.configWrites.at(-1)?.data).not.toContain("pass-complete");
-    expect(disk.get(RECORD_PATH)).toBe(pausedRecord);
+    expect(disk.get(RECORD_PATH)).toBe(countedRecord);
     expect(second.app.vault.configWrites.length).toBe(writesBefore);
-    expect(record(disk).paused).not.toBeNull();
+    expect(record(disk).streak).toBe(1);
   });
 });
 
@@ -678,9 +892,30 @@ describe("recovery logging failures", () => {
     expect(device.plugin.automaticSyncPaused).toBe(false);
   });
 
-  it("recovers an unread active marker as a pause before a second explicit Resume", async () => {
+  it("counts an unread active marker once it is read, and Resume then clears the logging failure", async () => {
     const interrupted = { startedAt: 8, phase: "merge" as const, phaseAt: 9 };
     const previous = storedRecovery({ active: interrupted });
+    const disk = new Map([[RECORD_PATH, JSON.stringify(previous)]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    device.app.vault.configFaults.read = new Error("temporary read failure");
+    await device.plugin.onload();
+    layoutReady(device.app);
+
+    // One interruption is not a cooldown: there is nothing to show first, so this Resume is
+    // the one that clears the failure, after the marker is counted and kept as evidence.
+    device.app.vault.configFaults = {};
+    expect(await device.plugin.resumeAutomaticSync()).toBe(true);
+    const recovered = record(disk);
+    expect(recovered.active).toBeNull();
+    expect(recovered.lastInterrupted?.pass).toEqual(interrupted);
+    expect(recovered.trace[0]).toEqual(previous.trace[0]);
+    expect(recovered.trace.slice(-2).map((t) => t.event)).toEqual(["recovery-continued", "resumed"]);
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+    expect(cooldownNotices()).toEqual([]);
+  });
+
+  it("recovers an unread third interruption as a cooldown before a second explicit Resume", async () => {
+    const previous = storedRecovery({ streak: 2, active: INTERRUPTED });
     const disk = new Map([[RECORD_PATH, JSON.stringify(previous)]]);
     const device = boot(data({ syncOnStartup: false }), disk);
     device.app.vault.configFaults.read = new Error("temporary read failure");
@@ -691,22 +926,29 @@ describe("recovery logging failures", () => {
     expect(await device.plugin.resumeAutomaticSync()).toBe(false);
     const recovered = record(disk);
     expect(recovered.active).toBeNull();
-    expect(recovered.paused?.interrupted).toEqual(interrupted);
+    expect(recovered.streak).toBe(3);
+    expect(recovered.cooldown).not.toBeNull();
+    expect(recovered.lastInterrupted?.pass).toEqual(INTERRUPTED);
     expect(recovered.trace[0]).toEqual(previous.trace[0]);
     expect(recovered.trace.at(-1)?.event).toBe("recovery-paused");
     expect(device.plugin.recoveryPaused).toBe(true);
     expect(device.plugin.automaticSyncPaused).toBe(true);
-    expect(Notice.shown).toContain(RECOVERY_PAUSED_NOTICE);
+    expect(cooldownNotices()).toEqual([recoveryCooldownNotice(3, cooldownMs(3))]);
 
     expect(await device.plugin.resumeAutomaticSync()).toBe(true);
-    expect(record(disk).paused).toBeNull();
+    expect(record(disk).cooldown).toBeNull();
+    expect(record(disk).streak).toBe(0);
     expect(record(disk).trace.some((entry) => entry.event === "recovery-paused")).toBe(true);
     expect(device.plugin.automaticSyncPaused).toBe(false);
   });
 
-  it("re-establishes an unread stored pause before allowing Resume", async () => {
-    const interrupted = { startedAt: 8, phase: "upload" as const, phaseAt: 9 };
-    const previous = storedRecovery({ paused: { since: 10, interrupted } });
+  it("re-establishes an unread stored cooldown before allowing Resume", async () => {
+    const since = Date.now();
+    const previous = storedRecovery({
+      streak: 3,
+      cooldown: { since, until: since + 15 * 60_000 },
+      lastInterrupted: { detectedAt: since, pass: INTERRUPTED },
+    });
     const disk = new Map([[RECORD_PATH, JSON.stringify(previous)]]);
     const device = boot(data({ syncOnStartup: false }), disk);
     device.app.vault.configFaults.read = new Error("temporary read failure");
@@ -715,11 +957,12 @@ describe("recovery logging failures", () => {
 
     device.app.vault.configFaults = {};
     expect(await device.plugin.resumeAutomaticSync()).toBe(false);
-    expect(record(disk).paused).toEqual(previous.paused);
+    expect(record(disk).cooldown).toEqual(previous.cooldown);
+    expect(record(disk).streak).toBe(3);
     expect(record(disk).trace[0]).toEqual(previous.trace[0]);
     expect(device.plugin.automaticSyncPaused).toBe(true);
     expect(await device.plugin.resumeAutomaticSync()).toBe(true);
-    expect(record(disk).paused).toBeNull();
+    expect(record(disk).cooldown).toBeNull();
   });
 
   it("can recover a repaired parse failure without discarding its active marker", async () => {
@@ -730,12 +973,14 @@ describe("recovery logging failures", () => {
     const interrupted = { startedAt: 8, phase: "commit" as const, phaseAt: 9 };
     disk.set(RECORD_PATH, JSON.stringify(storedRecovery({ active: interrupted })));
 
-    expect(await device.plugin.resumeAutomaticSync()).toBe(false);
-    expect(record(disk).paused?.interrupted).toEqual(interrupted);
-    expect(device.plugin.automaticSyncPaused).toBe(true);
+    expect(await device.plugin.resumeAutomaticSync()).toBe(true);
+    expect(record(disk).lastInterrupted?.pass).toEqual(interrupted);
+    expect(record(disk).trace.some((t) => t.event === "recovery-continued")).toBe(true);
+    expect(disk.has(UNREADABLE_PATH)).toBe(false);
+    expect(device.plugin.automaticSyncPaused).toBe(false);
   });
 
-  it("does not clear a newly discovered interruption when its pause write fails", async () => {
+  it("does not count or discard a newly discovered interruption when its write fails", async () => {
     const interrupted = { startedAt: 8, phase: "merge" as const, phaseAt: 9 };
     const raw = JSON.stringify(storedRecovery({ active: interrupted }));
     const disk = new Map([[RECORD_PATH, raw]]);
@@ -750,12 +995,15 @@ describe("recovery logging failures", () => {
     await device.plugin.syncNow();
     expect(headCalls()).toBe(0);
     expect(disk.get(RECORD_PATH)).toBe(raw);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
 
     device.app.vault.configFaults = {};
-    expect(await device.plugin.resumeAutomaticSync()).toBe(false);
-    expect(record(disk).paused?.interrupted).toEqual(interrupted);
     expect(await device.plugin.resumeAutomaticSync()).toBe(true);
-    expect(record(disk).paused).toBeNull();
+    const counted = record(disk);
+    expect(counted.lastInterrupted?.pass).toEqual(interrupted);
+    expect(counted.trace.filter((t) => t.event === "recovery-continued")).toHaveLength(1);
+    expect(counted.active).toBeNull();
+    expect(device.plugin.automaticSyncPaused).toBe(false);
   });
 
   it("refuses Resume and manual Sync now while a read failure persists", async () => {
@@ -858,7 +1106,7 @@ describe("recovery logging failures", () => {
     );
   });
 
-  it("re-reads before manual Sync now, keeping a recovered interruption paused", async () => {
+  it("re-reads before manual Sync now, counting a recovered interruption, and the read failure still holds automatic sync", async () => {
     const interrupted = { startedAt: 8, phase: "scan" as const, phaseAt: 9 };
     const disk = new Map([[RECORD_PATH, JSON.stringify(storedRecovery({ active: interrupted }))]]);
     const device = boot(data({ syncOnStartup: false }), disk);
@@ -869,16 +1117,38 @@ describe("recovery logging failures", () => {
     device.app.vault.configFaults = {};
     await device.plugin.syncNow();
     expect(headCalls()).toBe(1);
-    expect(record(disk).paused?.interrupted).toEqual(interrupted);
-    expect(record(disk).active).toBeNull();
-    expect(record(disk).trace.some((entry) => entry.event === "recovery-paused")).toBe(true);
+    const after = record(disk);
+    expect(after.lastInterrupted?.pass).toEqual(interrupted);
+    expect(after.active).toBeNull();
+    expect(after.trace.some((entry) => entry.event === "recovery-continued")).toBe(true);
+    // The pass settled, so the streak it counted is reset; the logging failure is Resume's.
+    expect(after.streak).toBe(0);
+    expect(device.plugin.recoveryPaused).toBe(false);
     expect(device.plugin.automaticSyncPaused).toBe(true);
-    expect(Notice.shown).toContain(RECOVERY_PAUSED_NOTICE);
+    expect(statusText(device)).toContain(RECOVERY_LOG_FAILED_STATUS);
+    expect(cooldownNotices()).toEqual([]);
+  });
+
+  it("re-reads before manual Sync now, which runs through a recovered cooldown and ends it", async () => {
+    const disk = new Map([[RECORD_PATH, JSON.stringify(storedRecovery({ streak: 2, active: INTERRUPTED }))]]);
+    const device = boot(data({ syncOnStartup: false }), disk);
+    device.app.vault.configFaults.read = new Error("temporary read failure");
+    await device.plugin.onload();
+    layoutReady(device.app);
+
+    device.app.vault.configFaults = {};
+    await device.plugin.syncNow();
+    expect(headCalls()).toBe(1);
+    expect(cooldownNotices()).toEqual([recoveryCooldownNotice(3, cooldownMs(3))]);
+    expect(record(disk).trace.some((entry) => entry.event === "recovery-paused")).toBe(true);
+    expect(record(disk).streak).toBe(0);
+    expect(record(disk).cooldown).toBeNull();
+    expect(device.plugin.automaticSyncPaused).toBe(false);
   });
 
   it("keeps a running manual pass marked if Resume follows recovery of an unread record", async () => {
-    const interrupted = { startedAt: 8, phase: "scan" as const, phaseAt: 9 };
-    const disk = new Map([[RECORD_PATH, JSON.stringify(storedRecovery({ active: interrupted }))]]);
+    const interrupted = INTERRUPTED;
+    const disk = new Map([[RECORD_PATH, JSON.stringify(storedRecovery({ streak: 2, active: interrupted }))]]);
     const device = boot(data({ syncOnStartup: false }), disk);
     device.app.vault.configFaults.read = new Error("temporary read failure");
     await device.plugin.onload();
@@ -894,7 +1164,7 @@ describe("recovery logging failures", () => {
     expect(running).not.toBeNull();
     expect(await device.plugin.resumeAutomaticSync()).toBe(true);
     expect(record(disk).active).toEqual(running);
-    expect(record(disk).paused).toBeNull();
+    expect(record(disk).cooldown).toBeNull();
     release();
     await pass;
     expect(record(disk).active).toBeNull();
@@ -913,7 +1183,8 @@ describe("recovery logging failures", () => {
     expect(Notice.shown).toContain(RECOVERY_LOG_FAILED_NOTICE);
     expect(Notice.shown.filter((n) => n === RECOVERY_LOG_FAILED_NOTICE)).toHaveLength(1);
     expect(device.plugin.automaticSyncPaused).toBe(true);
-    expect(statusText(device)).toContain(RECOVERY_PAUSED_STATUS);
+    expect(statusText(device)).toContain(RECOVERY_LOG_FAILED_STATUS);
+    expect(statusText(device)).not.toContain(RECOVERY_PAUSED_STATUS);
 
     await fireEveryAutomaticSource(device);
     expect(headCalls()).toBe(0);
@@ -987,13 +1258,19 @@ describe("recovery logging failures", () => {
       schema: DIAGNOSTIC_SCHEMA, pluginVersion: "1", platform: "x", active: null, paused: null,
       lastCompleted: null, lastFailed: null, trace: [{ at: 1, event: "alpha-note.md" }],
     })],
+    // A present streak that is not a count is unreadable, never a 1.1.4–1.1.6 record.
+    ["an invalid streak", JSON.stringify({
+      ...storedRecovery({ paused: { since: 7, interrupted: INTERRUPTED } }), streak: -1,
+    })],
+    ["a non-integer streak", JSON.stringify({ ...storedRecovery({ active: INTERRUPTED }), streak: "2" })],
   ])("stops automatic sync when the record is %s", async (_label, content) => {
     const disk = new Map([[RECORD_PATH, content]]);
     const device = boot(data(), disk);
     await device.plugin.onload();
 
     expect(Notice.shown).toContain(RECOVERY_LOG_FAILED_NOTICE);
-    expect(Notice.shown).not.toContain(RECOVERY_PAUSED_NOTICE);
+    expect(cooldownNotices()).toEqual([]);
+    expect(disk.get(RECORD_PATH)).toBe(content);
     await fireEveryAutomaticSource(device);
     expect(headCalls()).toBe(0);
   });
