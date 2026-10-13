@@ -14,6 +14,10 @@ import {
   type DiagnosticStorage,
 } from "../src/sync-diagnostics";
 import { FakeServer, FakeStore, FakeVault } from "./fakes";
+import {
+  SyncDiagnostics as SyncDiagnostics116,
+  parseRecord as parseRecord116,
+} from "./fixtures/sync-diagnostics-1.1.6";
 
 /**
  * The recovery record on its own. PIN (lead assignment 2026-09-25,
@@ -268,7 +272,7 @@ describe("interruption streak", () => {
     expect(storage.record().streak).toBe(1);
     expect(storage.record().active).toBeNull();
     expect(storage.record().cooldown).toBeNull();
-    expect(storage.record().trace.at(-1)?.event).toBe("recovery-continued");
+    expect(storage.record().trace.at(-1)?.event).toBe("plugin-load");
     expect(load.diagnostics.blocksAutomatic).toBe(false);
 
     // A reload with no new pass finds nothing left to count.
@@ -320,7 +324,7 @@ describe("interruption streak", () => {
     expect(load.cooldowns).toEqual([[4, 30 * MIN]]);
   });
 
-  it("caps the wait at 4 hours, and never honours a wait longer than the cap", async () => {
+  it("caps the wait at 4 hours, and never honours a stored deadline past the cap", async () => {
     const storage = new MemoryStorage();
     storage.files.set(PATH, legacyRecord({ streak: 7, active: { startedAt: 5, phase: "upload", phaseAt: 6 } }));
     const clock = { now: 10 * HOUR };
@@ -332,26 +336,58 @@ describe("interruption streak", () => {
     clock.now = 14 * HOUR;
     expect(diagnostics.blocksAutomatic).toBe(false);
 
-    // A stored deadline beyond the cap, or a clock set back before the cooldown began.
+    // A stored deadline beyond the cap.
     storage.files.set(PATH, legacyRecord({ streak: 9, cooldown: { since: HOUR, until: 100 * HOUR } }));
-    const skewed = launch(storage, clock);
-    await skewed.diagnostics.load();
+    const stored = launch(storage, clock);
     clock.now = 5 * HOUR - 1;
-    expect(skewed.diagnostics.coolingDown).toBe(true);
+    await stored.diagnostics.load();
+    expect(stored.diagnostics.cooldownRemainingMs).toBe(1);
     clock.now = 5 * HOUR;
-    expect(skewed.diagnostics.coolingDown).toBe(false);
-    // Set back more than the cap before the cooldown's start: no longer a bounded wait.
-    clock.now = HOUR - 1;
-    expect(skewed.diagnostics.coolingDown).toBe(false);
+    expect(stored.diagnostics.coolingDown).toBe(false);
+  });
 
-    // A small step back (a clock correction) keeps an ordinary cooldown.
+  it("never revives an expired cooldown when the clock is set back, and persists its end", async () => {
+    const storage = new MemoryStorage();
     storage.files.set(PATH, legacyRecord({ streak: 3, cooldown: { since: HOUR, until: HOUR + 15 * MIN } }));
-    const corrected = launch(storage, clock);
-    await corrected.diagnostics.load();
-    clock.now = HOUR - 5_000;
-    expect(corrected.diagnostics.coolingDown).toBe(true);
-    clock.now = HOUR + 15 * MIN;
-    expect(corrected.diagnostics.coolingDown).toBe(false);
+    const clock = { now: HOUR + 5 * MIN };
+    const { diagnostics } = launch(storage, clock);
+    await diagnostics.load();
+    expect(diagnostics.coolingDown).toBe(true);
+
+    // Forward past the deadline, then back inside it: expiry is irreversible.
+    clock.now = HOUR + 1 * HOUR;
+    expect(diagnostics.blocksAutomatic).toBe(false);
+    clock.now = HOUR + 5 * MIN;
+    expect(diagnostics.coolingDown).toBe(false);
+    expect(diagnostics.blocksAutomatic).toBe(false);
+
+    // The next write persists the end, so a reload under the stepped-back clock stays clear.
+    await diagnostics.finishPass(await diagnostics.beginPass(), { result: RESULT });
+    expect(storage.record().cooldown).toBeNull();
+    const next = launch(storage, clock);
+    expect(await next.diagnostics.load()).toEqual({ coolingDown: false, failure: null });
+  });
+
+  it("ends a cooldown when the clock reads before it began, and a later forward step does not revive it", async () => {
+    const storage = new MemoryStorage();
+    storage.files.set(PATH, legacyRecord({ streak: 3, cooldown: { since: HOUR, until: HOUR + 15 * MIN } }));
+    const clock = { now: HOUR - 5_000 };
+    const { diagnostics } = launch(storage, clock);
+    expect(await diagnostics.load()).toEqual({ coolingDown: false, failure: null });
+    clock.now = HOUR + MIN;
+    expect(diagnostics.coolingDown).toBe(false);
+    expect(diagnostics.cooldownRemainingMs).toBe(0);
+  });
+
+  it("lets a backward step inside a live cooldown lengthen it by no more than the step (stated limitation)", async () => {
+    const storage = new MemoryStorage();
+    storage.files.set(PATH, legacyRecord({ streak: 3, cooldown: { since: HOUR, until: HOUR + 15 * MIN } }));
+    const clock = { now: HOUR + 10 * MIN };
+    const { diagnostics } = launch(storage, clock);
+    await diagnostics.load();
+    expect(diagnostics.cooldownRemainingMs).toBe(5 * MIN);
+    clock.now = HOUR + 2 * MIN; // stepped back 8 minutes, still after `since`
+    expect(diagnostics.cooldownRemainingMs).toBe(13 * MIN);
   });
 
   it.each([
@@ -410,7 +446,7 @@ describe("interruption streak", () => {
     expect(lifted.streak).toBe(1);
     expect(lifted.cooldown).toBeNull();
     expect(lifted.lastInterrupted).toEqual({ detectedAt: 7, pass: interrupted });
-    expect(lifted.trace.at(-1)?.event).toBe("recovery-continued");
+    expect(lifted.trace.at(-1)?.event).toBe("plugin-load");
     expect(cooldowns).toEqual([]);
     expect(diagnostics.blocksAutomatic).toBe(false);
   });
@@ -447,6 +483,54 @@ describe("interruption streak", () => {
       expect(storage.files.get(PATH)).toBe(raw);
     }
   );
+
+  // Rolling back to 1.1.6 must not find an unreadable record: that stops automatic sync there
+  // and refuses Sync now until Resume sets the record aside (sol review, 2026-10-13).
+  it("writes records that 1.1.6 still reads: after a continued interruption, a legacy lift, a cooldown and a reset", async () => {
+    const written: [string, string][] = [];
+    const clock = { now: HOUR };
+    const capture = (label: string, storage: MemoryStorage) => written.push([label, storage.files.get(PATH)!]);
+
+    const continued = new MemoryStorage();
+    await killedPass(continued, clock);
+    await launch(continued, clock).diagnostics.load();
+    expect(continued.record().streak).toBe(1);
+    capture("streak 1", continued);
+
+    const legacy = new MemoryStorage();
+    legacy.files.set(PATH, legacyRecord({
+      paused: { since: 7, interrupted: { startedAt: 5, phase: "merge", phaseAt: 6 } },
+      active: { startedAt: 8, phase: "upload", phaseAt: 9 },
+    }));
+    await launch(legacy, clock).diagnostics.load();
+    expect(legacy.record().streak).toBe(2);
+    capture("legacy migration", legacy);
+
+    const cooling = new MemoryStorage();
+    cooling.files.set(PATH, legacyRecord({ streak: 2, active: { startedAt: 5, phase: "scan", phaseAt: 6 } }));
+    const { diagnostics } = launch(cooling, clock);
+    await diagnostics.load();
+    expect(diagnostics.coolingDown).toBe(true);
+    capture("cooldown", cooling);
+    const pass = await diagnostics.beginPass();
+    await diagnostics.checkpoint(pass, "save");
+    capture("a pass running in a cooldown", cooling);
+    await diagnostics.finishPass(pass, { result: RESULT });
+    capture("reset", cooling);
+    expect(await diagnostics.resume()).toBe(true);
+    capture("resumed", cooling);
+
+    for (const [label, raw] of written) {
+      expect(parseRecord116(raw), label).not.toBeNull();
+      // And the 1.1.6 load itself, which is what a rolled-back device runs. (A record with a
+      // running pass's marker is paused there, as 1.1.6 pauses any interruption; readable is
+      // the property that matters.)
+      const storage = new MemoryStorage();
+      storage.files.set(PATH, raw);
+      const rolledBack = new SyncDiagnostics116({ storage, path: PATH, pluginVersion: "1.1.6", platform: "ios-mobile" });
+      expect((await rolledBack.load()).failure, label).toBeNull();
+    }
+  });
 
   it("does not count an interruption it could not persist, and counts it once when it can", async () => {
     const storage = new MemoryStorage();

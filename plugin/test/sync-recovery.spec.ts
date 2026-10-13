@@ -69,10 +69,20 @@ function installGlobals(): void {
     const timer = windowTimers.find((t) => t.id === id);
     if (timer !== undefined) timer.cleared = true;
   };
+  // A one-shot timeout is recorded AND runs on vitest's fake clock, so a test advancing time
+  // sees it fire exactly as the app would; intervals stay manual (tests fire them by hand).
+  const timeout = (fn: () => void, ms: number): number => {
+    const id = make("timeout")(fn, ms);
+    const timer = windowTimers.find((t) => t.id === id)!;
+    globalThis.setTimeout(() => {
+      if (!timer.cleared) fn();
+    }, ms);
+    return id;
+  };
   const win = {
     setInterval: make("interval"),
     clearInterval: clear,
-    setTimeout: make("timeout"),
+    setTimeout: timeout,
     clearTimeout: clear,
   };
   Object.assign(globalThis, { window: win, document: { visibilityState: "visible" } });
@@ -335,13 +345,10 @@ async function launchCoolingDown(
 /** Every notice about passes that did not finish (the cooldown notice is the only one). */
 const cooldownNotices = () => Notice.shown.filter((n) => n.includes("did not finish"));
 
-const automaticTimer = (): FakeTimer => {
-  const timer = windowTimers.find(
-    (t) => t.kind === "interval" && !t.cleared && t.ms === INTERVAL_MINUTES * 60_000
-  );
-  expect(timer).toBeDefined();
-  return timer!;
-};
+/** Fake `Date` too, so advancing timers moves the clock the cooldown is measured on. */
+function fakeClock(): void {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+}
 
 /** The newest launch's status refresh (earlier launches' intervals are never cleared here). */
 const statusRefresh = (): FakeTimer => {
@@ -524,6 +531,7 @@ describe("a pass that never settled", () => {
 
   // PIN: owner 2026-10-13 — an interrupted sync continues automatically; the settings Resume button is never required (docs/261013-fix-AUTO_CONTINUE_AFTER_INTERRUPTED_SYNC.md)
   it("continues after one and two interruptions, waits after the third, and the wait ends by itself", async () => {
+    fakeClock();
     let { disk, dataJson } = await launchAndKillMidPass();
 
     // First interruption: counted and persisted before any trigger exists, silent, not held —
@@ -533,7 +541,7 @@ describe("a pass that never settled", () => {
     expect(record(disk).streak).toBe(1);
     expect(record(disk).active).toBeNull();
     expect(record(disk).cooldown).toBeNull();
-    expect(record(disk).trace.slice(-2).map((t) => t.event)).toEqual(["plugin-load", "recovery-continued"]);
+    expect(record(disk).trace.at(-1)?.event).toBe("plugin-load");
     expect(cooldownNotices()).toEqual([]);
     expect(device.plugin.automaticSyncPaused).toBe(false);
     expect(statusText(device)).not.toContain(RECOVERY_PAUSED_STATUS);
@@ -566,24 +574,85 @@ describe("a pass that never settled", () => {
     expect(device.vault.reads).toEqual([]);
     expect(device.vault.lists).toBe(0);
 
-    // One millisecond short of the deadline it still holds.
-    const clock = vi.spyOn(Date, "now").mockReturnValue(third.cooldown!.until - 1);
-    automaticTimer().fn();
-    await elapse(10);
+    // From here nothing is fired by hand: only the clock and its timers advance. One
+    // millisecond short of the deadline it still holds.
+    await vi.advanceTimersByTimeAsync(third.cooldown!.until - Date.now() - 1);
     expect(headCalls()).toBe(0);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
 
-    // At the deadline nothing is held any more: the status says so on its next refresh, and
-    // the next ordinary trigger runs a pass that settles and resets the streak. No Resume.
-    clock.mockReturnValue(third.cooldown!.until);
-    statusRefresh().fn();
-    expect(statusText(device)).not.toContain(RECOVERY_PAUSED_STATUS);
-    expect(device.plugin.automaticSyncPaused).toBe(false);
-    automaticTimer().fn();
-    await until(() => record(disk).lastCompleted !== null && record(disk).active === null, "the pass after the cooldown");
+    // At the deadline the pass the refused requests are owed runs by itself, settles, and
+    // resets the streak. No Resume, no trigger.
+    await until(() => record(disk).lastCompleted !== null && record(disk).active === null, "the owed pass");
     expect(headCalls()).toBe(1);
     expect(record(disk).streak).toBe(0);
     expect(record(disk).cooldown).toBeNull();
     expect(record(disk).trace.some((t) => t.event === "resumed")).toBe(false);
+    expect(statusText(device)).not.toContain(RECOVERY_PAUSED_STATUS);
+    // Owed once, run once.
+    await elapse(DEBOUNCE_MS * 4);
+    expect(headCalls()).toBe(1);
+  });
+
+  it("ends by itself with periodic sync off: an edit refused while waiting syncs at the deadline", async () => {
+    fakeClock();
+    const { device, disk } = await launchCoolingDown({ intervalMinutes: 0, syncOnStartup: false });
+    layoutReady(device.app);
+    expect(windowTimers.some((t) => t.kind === "interval" && t.ms === INTERVAL_MINUTES * 60_000)).toBe(false);
+
+    device.vault.content.set(PATHS[0], text(PATHS[0], 2));
+    device.app.vault.fire("modify", { path: PATHS[0] });
+    await elapse(DEBOUNCE_MS * 2);
+    expect(headCalls()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(record(disk).cooldown!.until - Date.now() - 1);
+    expect(headCalls()).toBe(0);
+    await until(() => headCalls() === 1, "the owed pass at the deadline");
+    await until(() => record(disk).lastCompleted !== null && record(disk).active === null, "it to settle");
+    expect(device.vault.reads).toContain(PATHS[0]);
+    expect(record(disk).lastCompleted?.status).toBe("committed");
+    expect(record(disk).streak).toBe(0);
+    expect(record(disk).cooldown).toBeNull();
+    await elapse(DEBOUNCE_MS * 4);
+    expect(headCalls()).toBe(1);
+  });
+
+  it("runs nothing at the deadline when the cooldown refused nothing", async () => {
+    fakeClock();
+    const { device, disk } = await launchCoolingDown({ intervalMinutes: 0, syncOnStartup: false });
+    layoutReady(device.app);
+    await vi.advanceTimersByTimeAsync(record(disk).cooldown!.until - Date.now() + 60_000);
+    expect(headCalls()).toBe(0);
+    statusRefresh().fn();
+    expect(statusText(device)).not.toContain(RECOVERY_PAUSED_STATUS);
+    expect(device.plugin.automaticSyncPaused).toBe(false);
+
+    // The next ordinary trigger is simply allowed again.
+    device.app.vault.fire("modify", { path: PATHS[0] });
+    await elapse(DEBOUNCE_MS * 2);
+    expect(headCalls()).toBe(1);
+  });
+
+  it("runs the owed pass on mobile resume when the deadline passed while timers were suspended", async () => {
+    fakeClock();
+    const { device, disk } = await launchCoolingDown({ intervalMinutes: 0, syncOnStartup: false });
+    layoutReady(device.app);
+    device.app.vault.fire("modify", { path: PATHS[0] });
+    await elapse(DEBOUNCE_MS * 2);
+    expect(headCalls()).toBe(0);
+
+    // Suspended: the wall clock passes the deadline, the timers do not run.
+    const deadline = record(disk).cooldown!.until;
+    vi.setSystemTime(deadline + 60_000);
+    expect(headCalls()).toBe(0);
+    const resume = (device.plugin as unknown as { domEvents: { type: string; handler: () => void }[] })
+      .domEvents.find((e) => e.type === "visibilitychange");
+    resume!.handler(); // syncOnStartup is off: only the owed pass may answer this
+    await until(() => record(disk).lastCompleted !== null && record(disk).active === null, "the owed pass");
+    expect(headCalls()).toBe(1);
+
+    // The one-shot timer, once it does run, owes nothing more.
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    expect(headCalls()).toBe(1);
   });
 
   it("does not count a reload without a new pass", async () => {
@@ -591,12 +660,13 @@ describe("a pass that never settled", () => {
     const first = boot(dataJson, disk);
     await first.plugin.onload();
     expect(record(disk).streak).toBe(1);
+    const counted = record(disk).lastInterrupted;
     first.plugin.onunload(); // before layout-ready: no pass started
 
     const second = boot(dataJsonOf(first), disk);
     await second.plugin.onload();
     expect(record(disk).streak).toBe(1);
-    expect(record(disk).trace.filter((t) => t.event === "recovery-continued")).toHaveLength(1);
+    expect(record(disk).lastInterrupted).toEqual(counted);
     expect(second.plugin.automaticSyncPaused).toBe(false);
   });
 
@@ -704,7 +774,7 @@ describe("a pass that never settled", () => {
     expect(lifted.active).toBeNull();
     expect(lifted.streak).toBe(streak);
     expect(lifted.cooldown).toBeNull();
-    expect(lifted.trace.at(-1)?.event).toBe("recovery-continued");
+    expect(lifted.trace.at(-1)?.event).toBe("plugin-load");
     expect(cooldownNotices()).toEqual([]);
     expect(device.plugin.automaticSyncPaused).toBe(false);
 
@@ -751,17 +821,20 @@ describe("a pass that never settled", () => {
 
     expect(record(disk).streak).toBe(0);
     expect(record(disk).cooldown).toBeNull();
-    expect(record(disk).trace.at(-1)?.event).toBe("resumed");
+    expect(record(disk).trace.some((t) => t.event === "resumed")).toBe(true);
     expect(device.plugin.automaticSyncPaused).toBe(false);
     expect(statusText(device)).not.toContain(RECOVERY_PAUSED_STATUS);
     // The row is gone once it no longer applies.
     expect(tab.containerEl.log.settings.map((s) => s.name)).not.toContain(RESUME_AUTOMATIC_LABEL);
+    // The startup pass the cooldown refused is answered now, not at the old deadline.
+    await until(() => record(disk).lastCompleted !== null && record(disk).active === null, "the owed pass");
+    expect(headCalls()).toBe(1);
 
     // A file event now syncs, and the next launch is not held.
     device.vault.content.set(PATHS[2], text(PATHS[2], 3));
     device.app.vault.fire("modify", { path: PATHS[2] });
     await elapse(DEBOUNCE_MS * 2);
-    expect(headCalls()).toBe(1);
+    expect(headCalls()).toBe(2);
     await until(() => record(disk).lastCompleted !== null && record(disk).active === null, "the pass");
 
     device.plugin.onunload();
@@ -909,7 +982,7 @@ describe("recovery logging failures", () => {
     expect(recovered.active).toBeNull();
     expect(recovered.lastInterrupted?.pass).toEqual(interrupted);
     expect(recovered.trace[0]).toEqual(previous.trace[0]);
-    expect(recovered.trace.slice(-2).map((t) => t.event)).toEqual(["recovery-continued", "resumed"]);
+    expect(recovered.trace.slice(-2).map((t) => t.event)).toEqual(["plugin-load", "resumed"]);
     expect(device.plugin.automaticSyncPaused).toBe(false);
     expect(cooldownNotices()).toEqual([]);
   });
@@ -975,7 +1048,7 @@ describe("recovery logging failures", () => {
 
     expect(await device.plugin.resumeAutomaticSync()).toBe(true);
     expect(record(disk).lastInterrupted?.pass).toEqual(interrupted);
-    expect(record(disk).trace.some((t) => t.event === "recovery-continued")).toBe(true);
+    expect(record(disk).trace.at(-1)?.event).toBe("resumed");
     expect(disk.has(UNREADABLE_PATH)).toBe(false);
     expect(device.plugin.automaticSyncPaused).toBe(false);
   });
@@ -1001,7 +1074,6 @@ describe("recovery logging failures", () => {
     expect(await device.plugin.resumeAutomaticSync()).toBe(true);
     const counted = record(disk);
     expect(counted.lastInterrupted?.pass).toEqual(interrupted);
-    expect(counted.trace.filter((t) => t.event === "recovery-continued")).toHaveLength(1);
     expect(counted.active).toBeNull();
     expect(device.plugin.automaticSyncPaused).toBe(false);
   });
@@ -1120,7 +1192,6 @@ describe("recovery logging failures", () => {
     const after = record(disk);
     expect(after.lastInterrupted?.pass).toEqual(interrupted);
     expect(after.active).toBeNull();
-    expect(after.trace.some((entry) => entry.event === "recovery-continued")).toBe(true);
     // The pass settled, so the streak it counted is reset; the logging failure is Resume's.
     expect(after.streak).toBe(0);
     expect(device.plugin.recoveryPaused).toBe(false);

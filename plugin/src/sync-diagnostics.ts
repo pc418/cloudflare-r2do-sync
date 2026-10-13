@@ -41,11 +41,15 @@ export function cooldownMs(streak: number): number {
   return Math.min(COOLDOWN_BASE_MS * 2 ** doublings, COOLDOWN_MAX_MS);
 }
 
-/** Every event the trace may hold. A closed set is what keeps the record free of user data. */
+/**
+ * Every event the trace may hold. A closed set is what keeps the record free of user data.
+ * Never extend it lightly: 1.1.6 rejects a record with an event it does not know, so a new
+ * persisted event makes the record unreadable to a build the user may roll back to
+ * (`test/fixtures/sync-diagnostics-1.1.6.ts`). New top-level fields are safe; it drops them.
+ */
 export const TRACE_EVENTS = [
   "plugin-load",
   "recovery-paused",
-  "recovery-continued",
   "resumed",
   "pass-start",
   "head",
@@ -82,8 +86,8 @@ export interface DiagnosticRecord {
   /** Set from before a pass does any work until it settles. Left set by a killed process. */
   active: ActivePass | null;
   /**
-   * The 1.1.4–1.1.6 durable pause. Never set by this build, and written as `null` so an older
-   * build can still parse the record; a stored one is lifted on load (`streak` 1).
+   * The 1.1.4–1.1.6 durable pause. Never set by this build, and written as `null` because
+   * 1.1.6 requires the key; a stored one is lifted on load (`streak` 1).
    */
   paused: { since: number; interrupted: ActivePass } | null;
   /** Passes in a row that started and never settled. Any settled pass resets it to 0. */
@@ -309,16 +313,28 @@ export class SyncDiagnostics {
 
   /**
    * Automatic sync is waiting out a cooldown after repeated interruptions. Read against the
-   * clock each time, so an expired cooldown stops holding anything without a write. No wait is
-   * ever honoured beyond the 4-hour cap — neither a stored deadline past `since` + cap, nor one
-   * more than the cap away because the clock was set back — so the brake always ends by itself.
+   * clock each time, and expiry is irreversible: the first check that finds the deadline passed
+   * — or the clock reading before the cooldown began, which can only be a correction — retires
+   * the cooldown in memory, and the next write persists that, so no later clock step revives
+   * it. A stored deadline past `since` + the 4-hour cap is never honoured.
+   *
+   * Limitation: with no monotonic clock across reloads, a backward step *during* a live
+   * cooldown that still lands after `since` lengthens that one cooldown by the step — bounded
+   * by the cap plus the step.
    */
   get coolingDown(): boolean {
+    return this.cooldownRemainingMs > 0;
+  }
+
+  /** How long automatic sync still waits; 0 once the cooldown has ended (see `coolingDown`). */
+  get cooldownRemainingMs(): number {
     const cooldown = this.#record.cooldown;
-    if (cooldown === null) return false;
+    if (cooldown === null) return 0;
+    const now = this.#now();
     const deadline = Math.min(cooldown.until, cooldown.since + COOLDOWN_MAX_MS);
-    const remaining = deadline - this.#now();
-    return remaining > 0 && remaining <= COOLDOWN_MAX_MS;
+    if (now >= cooldown.since && now < deadline) return deadline - now;
+    this.#record.cooldown = null;
+    return 0;
   }
 
   get failure(): DiagnosticFailure | null {
@@ -382,7 +398,9 @@ export class SyncDiagnostics {
   /**
    * Consumes an old active marker into the streak, and lifts a 1.1.4–1.1.6 pause (already
    * counted as one by `parseRecord`). Up to `FREE_INTERRUPTIONS` in a row, automatic sync just
-   * continues; past it, a cooldown starts from now. Persisted in one write, or not at all.
+   * continues — `streak` and `lastInterrupted` are the evidence; there is deliberately no trace
+   * event for it (see `TRACE_EVENTS`). Past it, a cooldown starts from now. Persisted in one
+   * write, or not at all.
    */
   async #consumeInterrupted(): Promise<boolean> {
     const interrupted = this.#record.active;
@@ -401,7 +419,7 @@ export class SyncDiagnostics {
       waitMs = cooldownMs(this.#record.streak);
       this.#record.cooldown = waitMs > 0 ? { since: at, until: at + waitMs } : null;
     }
-    this.#push(waitMs > 0 ? "recovery-paused" : "recovery-continued", at);
+    if (waitMs > 0) this.#push("recovery-paused", at);
     try {
       await this.#write();
     } catch (e) {
