@@ -292,20 +292,20 @@ async function until(condition: () => boolean, what: string): Promise<void> {
 }
 
 /**
- * Passes that settled (completed or failed) on `device`, read from the record writes it made:
- * each is the write that took the active marker away with `pass-complete`/`pass-failed`.
+ * Passes that completed successfully on `device`, read from the record writes it made: each
+ * is the write that took the active marker away with `pass-complete`. A pass that failed is
+ * not counted, so waiting on this also asserts the pass succeeded.
  */
-function settledPasses(device: Device): number {
-  let settled = 0;
+function completedPasses(device: Device): number {
+  let completed = 0;
   let wasActive = false;
   for (const write of device.app.vault.configWrites) {
     const parsed = parseRecord(write.data);
     if (parsed === null) continue;
-    const last = parsed.trace.at(-1)?.event;
-    if (wasActive && parsed.active === null && (last === "pass-complete" || last === "pass-failed")) settled++;
+    if (wasActive && parsed.active === null && parsed.trace.at(-1)?.event === "pass-complete") completed++;
     wasActive = parsed.active !== null;
   }
-  return settled;
+  return completed;
 }
 
 function layoutReady(app: LifecycleApp): void {
@@ -469,12 +469,12 @@ describe("active marker around every scheduled pass", () => {
     device.vault.content.set(PATHS[0], text(PATHS[0], 2));
     device.app.vault.fire("modify", { path: PATHS[0] });
     await elapse(DEBOUNCE_MS * 2);
-    await until(() => settledPasses(device) === 1, "the file-event pass to settle");
+    await until(() => completedPasses(device) === 1, "the file-event pass to complete");
     expect(headCalls()).toBe(1);
     expect(starts()).toBe(1);
 
     windowTimers.find((t) => t.kind === "interval" && t.ms === INTERVAL_MINUTES * 60_000)!.fn();
-    await until(() => settledPasses(device) === 2, "the timer pass to settle");
+    await until(() => completedPasses(device) === 2, "the timer pass to complete");
     expect(headCalls()).toBe(2);
     expect(starts()).toBe(2);
 
@@ -944,14 +944,14 @@ describe("a pass that never settled", () => {
     // The row is gone once it no longer applies.
     expect(tab.containerEl.log.settings.map((s) => s.name)).not.toContain(RESUME_AUTOMATIC_LABEL);
     // The startup pass the cooldown refused is answered now, not at the old deadline.
-    await until(() => settledPasses(device) === 1, "the owed pass");
+    await until(() => completedPasses(device) === 1, "the owed pass to complete");
     expect(headCalls()).toBe(1);
 
     // A file event now syncs, and the next launch is not held.
     device.vault.content.set(PATHS[2], text(PATHS[2], 3));
     device.app.vault.fire("modify", { path: PATHS[2] });
     await elapse(DEBOUNCE_MS * 2);
-    await until(() => settledPasses(device) === 2, "the file-event pass");
+    await until(() => completedPasses(device) === 2, "the file-event pass to complete");
     expect(headCalls()).toBe(2);
 
     device.plugin.onunload();
@@ -1026,11 +1026,13 @@ describe("a pass that never settled", () => {
 
 describe("marker ownership across unload", () => {
   it("does not clear the marker on unload, and a finishing old instance cannot overwrite the reload", async () => {
-    const first = boot(data());
+    // A pass started by hand, so the test holds its promise and can await its real end.
+    const first = boot(data({ syncOnStartup: false }));
     let release!: () => void;
     first.server.hold = new Promise<void>((resolve) => (release = resolve));
     await first.plugin.onload();
     layoutReady(first.app);
+    const retiredPass = first.plugin.syncNow();
     await until(() => headCalls() === 1, "the pass to reach the server");
 
     first.plugin.onunload();
@@ -1045,10 +1047,11 @@ describe("marker ownership across unload", () => {
     const writesBefore = second.app.vault.configWrites.length;
     const countedRecord = disk.get(RECORD_PATH);
 
-    // The old instance's pass now settles; it must not write over the new instance's record,
-    // and in particular must not reset the streak it never owned.
+    // The old instance's pass now settles — awaited to its real end, WebCrypto and its final
+    // write attempt included. It must not write over the new instance's record, and in
+    // particular must not reset the streak it never owned.
     release();
-    await elapse(50);
+    await retiredPass;
     expect(first.app.vault.configWrites.at(-1)?.data).not.toContain("pass-complete");
     expect(disk.get(RECORD_PATH)).toBe(countedRecord);
     expect(second.app.vault.configWrites.length).toBe(writesBefore);
@@ -1392,19 +1395,29 @@ describe("recovery logging failures", () => {
   // PIN: owner 2026-09-25 — a logging-only failure must offer the settings resume row, not
   // just the command palette (Codex review finding #3, docs/260925-eval-CODEX_REVIEW_1_1_4.md).
   it("offers the settings resume row after a transient write failure mid-pass, and it restores automatic sync", async () => {
-    const device = boot(data());
+    // A pass started by hand, so the test holds its promise and can await its real end.
+    const device = boot(data({ syncOnStartup: false }));
     let release!: () => void;
     device.server.hold = new Promise<void>((resolve) => (release = resolve));
     await device.plugin.onload();
     layoutReady(device.app);
-    await until(() => headCalls() === 1, "the startup pass to reach the server");
-    expect(record(device.app.vault.configFiles).active).not.toBeNull();
+    const pass = device.plugin.syncNow();
+    await until(() => headCalls() === 1, "the pass to reach the server");
+    const marker = record(device.app.vault.configFiles).active;
+    expect(marker).not.toBeNull();
 
     // Storage fails while the pass runs: its checkpoints and its finish cannot be written.
+    // The pass itself still completes (a trace gap never fails a pass) — awaited to its end
+    // while storage is still faulty, so the finish write has really been attempted and lost.
     device.app.vault.configFaults.write = new Error("synthetic transient write failure");
     release();
-    await until(() => device.plugin.automaticSyncPaused, "the failed checkpoint");
-    for (let i = 0; i < 50; i++) await elapse(1);
+    await pass;
+    expect(commitCalls()).toBe(1);
+    expect(device.plugin.automaticSyncPaused).toBe(true);
+    // What the disk holds is the stale marker from before the failure, not the settled pass.
+    const stale = record(device.app.vault.configFiles);
+    expect(stale.active).toEqual(marker);
+    expect(stale.lastCompleted).toBeNull();
     expect(device.plugin.recoveryPaused).toBe(false);
     expect(Notice.shown.filter((n) => n === RECOVERY_LOG_FAILED_NOTICE)).toHaveLength(1);
     expect(RECOVERY_LOG_FAILED_NOTICE).toContain(RESUME_AUTOMATIC_LABEL);
@@ -1418,16 +1431,14 @@ describe("recovery logging failures", () => {
     expect(tab.containerEl.log.settings[rowAt].desc).toBe(RESUME_AFTER_LOG_FAILURE_DESC);
     expect(tab.containerEl.log.settings[rowAt].section).toBe("Troubleshooting");
 
-    // Storage recovers; the row's button clears the failure and rewrites the record.
+    // Storage recovers; the row's button clears the failure and rewrites the record. Nothing
+    // else is running, so only Resume can be what replaces the stale marker.
     device.app.vault.configFaults = {};
     await tab.containerEl.log.rows[rowAt].buttons[0].click();
-    await until(
-      () => {
-        const r = recordOrNull(device.app.vault.configFiles);
-        return r !== null && r.active === null && r.paused === null && r.lastCompleted !== null;
-      },
-      "the resumed record on disk"
-    );
+    const resumed = record(device.app.vault.configFiles);
+    expect(resumed.active).toBeNull();
+    expect(resumed.lastCompleted?.status).toBe("committed");
+    expect(resumed.trace.at(-1)?.event).toBe("resumed");
     expect(device.plugin.automaticSyncPaused).toBe(false);
     expect(tab.containerEl.log.settings.map((s) => s.name)).not.toContain(RESUME_AUTOMATIC_LABEL);
 
