@@ -88,7 +88,30 @@ function installGlobals(): void {
   Object.assign(globalThis, { window: win, document: { visibilityState: "visible" } });
 }
 
-const SERVER = "https://synthetic-vault.example.workers.dev";
+/**
+ * This test's server. Each test gets its own host, because `requestUrlMock` is one global: a
+ * pass a previous test left running would otherwise carry on against whichever server the
+ * newest `boot()` installed — committing there, so this test's device found a head it never
+ * wrote and failed its pass (the 1.1.7 Release run). The URL is the only thing a request
+ * carries that says which device sent it, so it is what the fence checks.
+ */
+let SERVER = "https://synthetic-vault-0.example.workers.dev";
+let testSerial = 0;
+/** Which test each server host belonged to, so a stray request names the test that leaked. */
+const serverOwners = new Map<string, string>();
+
+/**
+ * Requests that reached this test from a pass started in an earlier one. Each is answered
+ * with a promise that never settles, as for a killed process, so the stray pass stops where
+ * it is and touches nothing here; `afterEach` then fails the run naming the test it came from.
+ */
+let strays: string[] = [];
+
+function stray(url: string): Promise<never> {
+  const host = /^https:\/\/[^/]+/.exec(url)?.[0] ?? url;
+  strays.push(`${serverOwners.get(host) ?? host} -> ${url.slice(host.length)}`);
+  return new Promise<never>(() => {});
+}
 const TOKEN = "synthetic-access-token-0123";
 const RECORD_PATH = ".obsidian/plugins/cloudflare-rdo-sync/sync-recovery.json";
 const UNREADABLE_PATH = ".obsidian/plugins/cloudflare-rdo-sync/sync-recovery.unreadable.txt";
@@ -139,13 +162,19 @@ interface ServerControl {
   commitHold: Promise<void> | null;
 }
 
-/** Serves only this device's own commits, so a pass never has anything to pull. */
-function steadyServer(app: LifecycleApp): ServerControl {
+/**
+ * Serves only this device's own commits, so a pass never has anything to pull. It starts at
+ * the head the launch last synced: a reload is the same device against the same vault, so a
+ * relaunch after a commit must not find the server rolled back to a head it moved past.
+ */
+function steadyServer(app: LifecycleApp, startHead: string): ServerControl {
   const control: ServerControl = { hold: null, onHead: null, headStatus: 200, commitHold: null };
-  let head = "01HEAD";
+  let head = startHead;
   let commits = 0;
+  const own = `${SERVER}/`;
   requestUrlMock.impl = async (req) => {
     const url = (req as { url: string }).url;
+    if (!url.startsWith(own)) return await stray(url);
     if (url.endsWith("/api/head")) {
       control.onHead?.(app.vault.configFiles.get(RECORD_PATH));
       if (control.hold !== null) await control.hold;
@@ -168,10 +197,11 @@ function steadyServer(app: LifecycleApp): ServerControl {
   return control;
 }
 
-const headCalls = () =>
-  requestUrlMock.calls.filter((c) => (c as { url: string }).url.endsWith("/api/head")).length;
-const commitCalls = () =>
-  requestUrlMock.calls.filter((c) => (c as { url: string }).url.endsWith("/api/commit")).length;
+/** Requests this test's devices made; a stray from an earlier test is not one of them. */
+const ownCalls = () =>
+  requestUrlMock.calls.filter((c) => (c as { url: string }).url.startsWith(`${SERVER}/`));
+const headCalls = () => ownCalls().filter((c) => (c as { url: string }).url.endsWith("/api/head")).length;
+const commitCalls = () => ownCalls().filter((c) => (c as { url: string }).url.endsWith("/api/commit")).length;
 
 function settings(over: Partial<Settings> = {}): Partial<Settings> {
   return {
@@ -223,7 +253,8 @@ function boot(dataJson: unknown, disk = new Map<string, string>(), manifest: Rec
   } as never);
   (plugin as unknown as { persisted: unknown }).persisted = dataJson;
   const vault = countingVault(app);
-  const server = steadyServer(app);
+  const synced = (dataJson as { state?: { lastSyncedHead?: string | null } } | null)?.state?.lastSyncedHead;
+  const server = steadyServer(app, synced ?? "01HEAD");
   return { plugin, app, vault, server };
 }
 
@@ -274,17 +305,25 @@ async function elapse(ms: number): Promise<void> {
 /** The real `setTimeout`, captured before any test fakes it. */
 const realSetTimeout = globalThis.setTimeout;
 
+/** How long `until` waits in real time before it calls a condition unreachable. */
+const UNTIL_BUDGET_MS = 15_000;
+// Every test here may wait out a full `until` budget, so the test timeout sits explicitly
+// above it rather than leaving the budget to squeeze in under vitest's 5 s default.
+vi.setConfig({ testTimeout: 2 * UNTIL_BUDGET_MS });
+
 /**
  * Waits for a condition the app reaches on its own time. Fake time advances at most 200 ms (a
  * debounce or retry timer is never fired by accident); real time is yielded as well, for up
- * to 4 s (inside vitest's 5 s test timeout), because a pass awaits real macrotasks —
- * WebCrypto digests — that no fake-timer tick can hurry. A slow runner needs more of them,
- * which is why no assertion that a pass ran may follow a fixed number of ticks (AGENTS.md,
- * "UI and testing gotchas").
+ * to `UNTIL_BUDGET_MS`, because a pass awaits real macrotasks — WebCrypto digests — that no
+ * fake-timer tick can hurry. A slow runner needs more of them, which is why no assertion that
+ * a pass ran may follow a fixed number of ticks (AGENTS.md, "UI and testing gotchas").
+ *
+ * A pass a test starts must also have settled by the time the test ends: `headCalls()`
+ * reaching a count says the pass has begun, not that it is over.
  */
 async function until(condition: () => boolean, what: string): Promise<void> {
   const started = performance.now();
-  for (let fakeMs = 0; !condition() && performance.now() - started < 4_000; fakeMs++) {
+  for (let fakeMs = 0; !condition() && performance.now() - started < UNTIL_BUDGET_MS; fakeMs++) {
     await new Promise<void>((resolve) => realSetTimeout(resolve, 0));
     await vi.advanceTimersByTimeAsync(fakeMs < 200 ? 1 : 0);
   }
@@ -398,7 +437,11 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   Notice.shown.length = 0;
   Modal.shown.length = 0;
-  requestUrlMock.impl = null;
+  SERVER = `https://synthetic-vault-${++testSerial}.example.workers.dev`;
+  serverOwners.set(SERVER, expect.getState().currentTestName ?? SERVER);
+  strays = [];
+  // Until this test boots a device, every request is a stray.
+  requestUrlMock.impl = async (req) => await stray((req as { url: string }).url);
   requestUrlMock.calls.length = 0;
   Platform.isMobile = true;
 });
@@ -407,6 +450,10 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   Platform.isMobile = false;
+  // A pass an earlier test left running reached this one. It was stopped at the fence, so
+  // nothing here was affected — but the test named here ended before its pass did, and must
+  // wait for it to settle. Checked last, so the teardown above still runs.
+  if (strays.length > 0) throw new Error(`a pass outlived its test and reached this one: ${strays.join("; ")}`);
 });
 
 // --- marking ----------------------------------------------------------------------------
@@ -524,7 +571,8 @@ describe("active marker around every scheduled pass", () => {
     expect(record(next.app.vault.configFiles).streak).toBe(0);
     expect(next.plugin.automaticSyncPaused).toBe(false);
     layoutReady(next.app);
-    await until(() => headCalls() === 1, "the startup pass");
+    await until(() => completedPasses(next) === 1, "the startup pass to complete");
+    expect(headCalls()).toBe(1);
   });
 
   it("keeps the record free of file names, the server URL and the access token", async () => {
@@ -543,7 +591,7 @@ describe("active marker around every scheduled pass", () => {
     const device = boot(data(), new Map(), { dir: ".obsidian/plugins/renamed-folder" });
     await device.plugin.onload();
     layoutReady(device.app);
-    await until(() => device.app.vault.configWrites.length > 0, "a record write");
+    await until(() => completedPasses(device) === 1, "the startup pass to complete");
     expect(device.app.vault.configWrites.every((w) => w.path === ".obsidian/plugins/renamed-folder/sync-recovery.json")).toBe(true);
   });
 });
@@ -608,7 +656,7 @@ describe("a pass that never settled", () => {
     expect(statusText(device)).toContain(RECOVERY_PAUSED_STATUS);
     await fireEveryAutomaticSource(device);
     expect(headCalls()).toBe(0);
-    expect(requestUrlMock.calls).toEqual([]);
+    expect(ownCalls()).toEqual([]);
     expect(device.vault.reads).toEqual([]);
     expect(device.vault.lists).toBe(0);
 
@@ -667,7 +715,8 @@ describe("a pass that never settled", () => {
     // The next ordinary trigger is simply allowed again.
     device.app.vault.fire("modify", { path: PATHS[0] });
     await elapse(DEBOUNCE_MS * 2);
-    await until(() => headCalls() === 1, "the file-event pass");
+    await until(() => completedPasses(device) === 1, "the file-event pass to complete");
+    expect(headCalls()).toBe(1);
   });
 
   it("runs the owed pass on mobile resume when the deadline passed while timers were suspended", async () => {
@@ -830,7 +879,8 @@ describe("a pass that never settled", () => {
     device.vault.content.set(PATHS[2], text(PATHS[2], 3));
     device.app.vault.fire("modify", { path: PATHS[2] });
     await elapse(DEBOUNCE_MS * 2);
-    await until(() => headCalls() === 2, "the file-event pass");
+    await until(() => completedPasses(device) === 2, "the file-event pass to complete");
+    expect(headCalls()).toBe(2);
   });
 
   it("ends the cooldown on a pass that failed with an error, which is not an interruption", async () => {
@@ -849,7 +899,8 @@ describe("a pass that never settled", () => {
     device.server.headStatus = 200;
     device.app.vault.fire("modify", { path: PATHS[2] });
     await elapse(DEBOUNCE_MS * 2);
-    await until(() => headCalls() === 2, "the file-event pass");
+    await until(() => completedPasses(device) === 1, "the file-event pass to complete");
+    expect(headCalls()).toBe(2);
   });
 
   it("makes the next wait longer when a manual pass during the cooldown is interrupted", async () => {
@@ -961,7 +1012,8 @@ describe("a pass that never settled", () => {
     await next.plugin.onload();
     expect(cooldownNotices()).toEqual([]);
     layoutReady(next.app);
-    await until(() => headCalls() === 1, "the startup pass");
+    await until(() => completedPasses(next) === 1, "the startup pass to complete");
+    expect(headCalls()).toBe(1);
   });
 
   it("drops the resume row and command once the cooldown expires", async () => {
@@ -1241,7 +1293,8 @@ describe("recovery logging failures", () => {
 
     device.app.vault.fire("modify", { path: PATHS[0] });
     await elapse(DEBOUNCE_MS * 2);
-    await until(() => headCalls() === 1, "the file-event pass");
+    await until(() => completedPasses(device) === 1, "the file-event pass to complete");
+    expect(headCalls()).toBe(1);
   });
 
   it("bounds a large unreadable sidecar at 64 KiB and records the original byte length", async () => {
@@ -1389,7 +1442,8 @@ describe("recovery logging failures", () => {
     expect(device.plugin.automaticSyncPaused).toBe(false);
     device.app.vault.fire("modify", { path: PATHS[0] });
     await elapse(DEBOUNCE_MS * 2);
-    await until(() => headCalls() === 1, "the file-event pass");
+    await until(() => completedPasses(device) === 1, "the file-event pass to complete");
+    expect(headCalls()).toBe(1);
   });
 
   // PIN: owner 2026-09-25 — a logging-only failure must offer the settings resume row, not
@@ -1442,11 +1496,13 @@ describe("recovery logging failures", () => {
     expect(device.plugin.automaticSyncPaused).toBe(false);
     expect(tab.containerEl.log.settings.map((s) => s.name)).not.toContain(RESUME_AUTOMATIC_LABEL);
 
-    // Automatic sync runs again.
+    // Automatic sync runs again. The first pass's finish write was lost to the fault, so this
+    // is the first completion on record.
     device.vault.content.set(PATHS[2], text(PATHS[2], 3));
     device.app.vault.fire("modify", { path: PATHS[2] });
     await elapse(DEBOUNCE_MS * 2);
-    await until(() => headCalls() === 2, "the file-event pass");
+    await until(() => completedPasses(device) === 1, "the file-event pass to complete");
+    expect(headCalls()).toBe(2);
   });
 
   it.each([
