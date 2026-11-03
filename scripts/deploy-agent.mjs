@@ -326,6 +326,21 @@ export function supersededTokenIds(agentEnv, minted, opts = {}) {
   return ids.filter((id) => id && !minted.includes(id));
 }
 
+/**
+ * Every token id this run must retire: the pair it superseded plus any a previous run deferred
+ * (`PENDING_REVOKE_TOKEN_IDS`), never one of the ids now live.
+ *
+ * Deferral exists because a run whose /health failed must revoke nothing, yet it has already
+ * recorded the new ids in place of the old ones. Without carrying the old ids forward, the next
+ * healthy run would find nothing superseded and leave permanent full-vault credentials live.
+ */
+export function retirementPlan(agentEnv, minted, opts = {}) {
+  const pending = (agentEnv.PENDING_REVOKE_TOKEN_IDS ?? "").split(",").filter((id) => id !== "");
+  const active = new Set((opts.activeIds ?? []).filter((id) => id));
+  const ids = [...supersededTokenIds(agentEnv, minted, opts), ...pending];
+  return [...new Set(ids)].filter((id) => !active.has(id));
+}
+
 export async function deployAgent(opts) {
   return withDeployLock(ROOT, opts.vault, () => deployAgentLocked(opts));
 }
@@ -684,6 +699,20 @@ async function deployAgentLocked(opts) {
     throw error;
   }
 
+  const readTokenId = readToken === undefined ? (agentEnv.READ_TOKEN_ID ?? "") : tokenIdOf(readToken);
+  const writeTokenId = !opts.writable
+    ? ""
+    : writeToken === null
+      ? (agentEnv.WRITE_TOKEN_ID ?? "")
+      : tokenIdOf(writeToken);
+  // Computed from the env as it stood before this run, and written in the same update as the
+  // new ids, so no crash between two writes can lose the old ones.
+  const retire = retirementPlan(agentEnv, minted, {
+    writable: opts.writable,
+    minted: minted.length > 0,
+    activeIds: [readTokenId, writeTokenId],
+  });
+
   upsertEnvFile(ROOT, {
     AGENT_URL: url,
     // Recorded so redeploys reuse it. Renaming later is not an edit: it is a second Worker,
@@ -694,12 +723,10 @@ async function deployAgentLocked(opts) {
     VAULT_NAME: vault,
     AGENT_DENY: deny,
     // The id of whatever is live now: this run's, or the one it chose to keep.
-    READ_TOKEN_ID: readToken === undefined ? (agentEnv.READ_TOKEN_ID ?? "") : tokenIdOf(readToken),
-    WRITE_TOKEN_ID: !opts.writable
-      ? ""
-      : writeToken === null
-        ? (agentEnv.WRITE_TOKEN_ID ?? "")
-        : tokenIdOf(writeToken),
+    READ_TOKEN_ID: readTokenId,
+    WRITE_TOKEN_ID: writeTokenId,
+    // Still owed a revocation until a healthy run clears it.
+    PENDING_REVOKE_TOKEN_IDS: retire.join(","),
   }, agentEnvName);
 
   // --- retire the pair this deployment replaced --------------------------------
@@ -713,20 +740,21 @@ async function deployAgentLocked(opts) {
     // list, not the ids). Keeping the old pair alive costs only an extra live token until a
     // redeploy that passes /health retires it.
     throw new Error(
-      `${url}/health did not answer ok; the superseded vault token(s) were NOT revoked. ` +
-        "Re-run the deploy once the Worker is healthy."
+      `${url}/health did not answer ok; the superseded vault token(s) were NOT revoked ` +
+        `(recorded in ${agentEnvName} for the next run). Re-run the deploy once the Worker is healthy.`
     );
   }
-  const superseded = supersededTokenIds(agentEnv, minted, { writable: opts.writable, minted: minted.length > 0 });
   const orphaned = [];
-  for (const id of superseded) {
+  for (const id of retire) {
     const gone = await revoke(id).catch(() => false);
     if (!gone) orphaned.push(id);
   }
-  if (superseded.length > 0) {
+  // A revocation that failed stays owed, so the next run tries again rather than forgetting it.
+  upsertEnvFile(ROOT, { PENDING_REVOKE_TOKEN_IDS: orphaned.join(",") }, agentEnvName);
+  if (retire.length > 0) {
     log(
       orphaned.length === 0
-        ? `revoked ${superseded.length} superseded vault token(s)`
+        ? `revoked ${retire.length} superseded vault token(s)`
         : `COULD NOT REVOKE superseded token(s): ${orphaned.join(", ")} — revoke by hand`
     );
   }

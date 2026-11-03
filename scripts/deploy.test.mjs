@@ -292,6 +292,37 @@ test("a redeploy keeps the vault tokens unless a rotation was asked for", async 
   );
 });
 
+test("a deploy whose /health failed defers the old pair's revocation instead of forgetting it", async () => {
+  const { retirementPlan } = await import("./deploy-agent.mjs");
+  // Run 1: --rotate-tokens minted new-r/new-w, recorded them, then /health failed. It revokes
+  // nothing and records the old pair as owed.
+  const before = { READ_TOKEN_ID: "old-r", WRITE_TOKEN_ID: "old-w" };
+  const owed = retirementPlan(before, ["new-r", "new-w"], {
+    writable: true,
+    minted: true,
+    activeIds: ["new-r", "new-w"],
+  });
+  assert.deepEqual(owed, ["old-r", "old-w"]);
+
+  // Run 2: healthy, mints nothing. Without the carried ids nothing would be superseded.
+  const after = { READ_TOKEN_ID: "new-r", WRITE_TOKEN_ID: "new-w", PENDING_REVOKE_TOKEN_IDS: owed.join(",") };
+  assert.deepEqual(retirementPlan(after, [], { writable: true, minted: false, activeIds: ["new-r", "new-w"] }), [
+    "old-r",
+    "old-w",
+  ]);
+
+  // A failed read-only downgrade owes the write token the same way.
+  assert.deepEqual(
+    retirementPlan(before, [], { writable: false, minted: false, activeIds: ["old-r", ""] }),
+    ["old-w"]
+  );
+  // A live id is never on the list, even if a stale pending entry names it.
+  assert.deepEqual(
+    retirementPlan({ READ_TOKEN_ID: "r", PENDING_REVOKE_TOKEN_IDS: "r,x" }, [], { writable: true, activeIds: ["r"] }),
+    ["x"]
+  );
+});
+
 test("minting is the exception, and a read-only redeploy really removes write", () => {
   const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
   // Mint only on request, on a first deploy, or when write is newly needed — and decide that
@@ -327,10 +358,11 @@ test("superseded tokens are revoked only after the new deployment is recorded an
   // Revoking before /health would blind a working agent to save a failed deploy; revoking
   // before the env file is written would risk losing the ids of the credentials now in use.
   const health = source.indexOf("await waitForHealth(");
-  const record = source.indexOf("READ_TOKEN_ID: readToken === undefined");
-  const retire = source.indexOf("const superseded = supersededTokenIds(");
+  const record = source.indexOf("READ_TOKEN_ID: readTokenId,");
+  const unhealthy = source.indexOf("if (!healthy) {");
+  const retire = source.indexOf("for (const id of retire) {");
   assert.ok(health < record, "env file is written after the smoke test");
-  assert.ok(record < retire, "superseded tokens are retired after the new ids are on disk");
+  assert.ok(record < unhealthy && unhealthy < retire, "nothing is revoked unless /health passed, and only after the new ids are on disk");
   // A revocation that fails is reported by id, because nothing else can name it afterwards.
   assert.match(source, /COULD NOT REVOKE/);
 });
