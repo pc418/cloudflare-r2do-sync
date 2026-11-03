@@ -11,4 +11,4 @@ docs/
 testvault/
 
 # Credentials handed over by a deploy, in plaintext, for the operator to store and remove.
-DEPLOY-CREDENTIALS*.txt
+DEPLOY-CREDENTIALS*

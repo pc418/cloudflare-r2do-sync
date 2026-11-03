@@ -501,6 +501,7 @@ async function deployAgentLocked(opts) {
   let writeToken = null;
   let bearer;
   let url;
+  let healthy = false;
   try {
     // **Minted only when asked, or when there is nothing to keep.** A redeploy used to mint a
     // fresh pair every time, which is how the dummy reached 51 live full-vault credentials.
@@ -663,7 +664,7 @@ async function deployAgentLocked(opts) {
 
     url = `https://${scriptName}.${subdomain}.workers.dev`;
     log(`smoke testing ${url}/health ...`);
-    await waitForHealth({ workerUrl: url });
+    healthy = await waitForHealth({ workerUrl: url });
   } catch (error) {
     // Rollback, and loud about its own failure: an id that could not be revoked is the one
     // thing here an operator must act on by hand, and it is unrecoverable from any file.
@@ -706,6 +707,16 @@ async function deployAgentLocked(opts) {
   // Last, and deliberately: the new ids are already on disk, so a failure here costs a manual
   // revocation rather than an agent nobody can find the credentials for. Before /health passed
   // this would have been sabotage — the old token is what a working agent is still using.
+  if (!healthy) {
+    // Not a rollback: the uploaded script already holds this run's tokens, so revoking them
+    // would leave it holding dead credentials that the next run keeps (it reads the secret
+    // list, not the ids). Keeping the old pair alive costs only an extra live token until a
+    // redeploy that passes /health retires it.
+    throw new Error(
+      `${url}/health did not answer ok; the superseded vault token(s) were NOT revoked. ` +
+        "Re-run the deploy once the Worker is healthy."
+    );
+  }
   const superseded = supersededTokenIds(agentEnv, minted, { writable: opts.writable, minted: minted.length > 0 });
   const orphaned = [];
   for (const id of superseded) {
