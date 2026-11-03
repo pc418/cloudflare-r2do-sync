@@ -10,13 +10,13 @@ import { SyncApi } from "../../plugin/src/api";
 import { callTool, type ToolContext } from "../src/tools";
 import { VaultView } from "../src/vault";
 import { VaultWriter, type WriteOp } from "../src/write";
-import { fakeVault, seed, testCrypto } from "./helpers";
+import { fakeVault, policyDoc, seed, testCrypto } from "./helpers";
 
-async function build(notes: Record<string, string>, settings?: unknown) {
+async function build(notes: Record<string, string>, policy?: Record<string, unknown>) {
   const vault = fakeVault();
   const crypto = await testCrypto();
   await seed(vault, crypto, notes);
-  if (settings !== undefined) vault.settings = settings;
+  if (policy !== undefined) vault.settings = await policyDoc(crypto, 1, policy);
   const client = () => new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });
   const view = new VaultView({ api: client(), writeApi: client(), crypto });
   const writer = new VaultWriter({ view, device: "agent" });
@@ -34,7 +34,7 @@ describe("a refusal must not name what the agent cannot see", () => {
   it("never names an excluded file in a folder-conflict message", async () => {
     const { ctx } = await build(
       { "Welcome.md": "hi\n", "Credentials/keys.md": "AWS_SECRET=hunter2\n" },
-      { v: 1 as const, updatedAt: 1_754_000_000_000, device: "laptop", rev: 1, plain: { excludes: "Credentials/**" } }
+      { excludes: "Credentials/**" }
     );
     // `Credentials/**` does not match the bare folder, so this passes the scope gate.
     const err = await callTool("write", { path: "Credentials", content: "x\n" }, ctx).then(
@@ -69,13 +69,7 @@ describe("policy changing under a CAS retry", () => {
     vault.before = async (path) => {
       if (path === "/api/commit" && !raced) {
         raced = true;
-        vault.settings = {
-          v: 1 as const,
-          updatedAt: 1_754_000_001_000,
-          device: "laptop",
-          rev: 2,
-          plain: { excludes: "Secret.md" },
-        };
+        vault.settings = await policyDoc(crypto, 2, { excludes: "Secret.md" }, { updatedAt: 1_754_000_001_000 });
         // The whole map the other device published — seeding replaces it, so the notes that
         // survive its commit have to be named here.
         await seed(vault, crypto, {
@@ -98,16 +92,14 @@ describe("policy changing under a CAS retry", () => {
   });
 });
 
-const doc = (rev: number, plain: Record<string, unknown>) => ({
-  v: 1 as const, updatedAt: 1_754_000_000_000 + rev, device: "laptop", rev, plain,
-});
+const doc = async (rev: number, plain: Record<string, unknown>) => policyDoc(await testCrypto(), rev, plain);
 
 describe("policy moving between the snapshot and the scope gate", () => {
   it("never treats a carried-but-hidden note as absent and replaces it", async () => {
     const vault = fakeVault();
     const crypto = await testCrypto();
     await seed(vault, crypto, { "Secret.md": "the original content\n" });
-    vault.settings = doc(1, { excludes: "Secret.md" });
+    vault.settings = await doc(1, { excludes: "Secret.md" });
 
     // Flip the policy to ALLOW the path on the second settings read — i.e. between the
     // snapshot that built `seen` and the scope() call that gates the write.
@@ -115,7 +107,7 @@ describe("policy moving between the snapshot and the scope gate", () => {
     vault.before = async (path) => {
       if (path === "/api/settings") {
         reads++;
-        if (reads >= 2) vault.settings = doc(2, { excludes: "" });
+        if (reads >= 2) vault.settings = await doc(2, { excludes: "" });
       }
     };
 

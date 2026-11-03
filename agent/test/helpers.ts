@@ -8,7 +8,7 @@
  * a stale `expectedHead` is a 409, an unknown blob is a 404.
  */
 import type { HttpClient } from "../../plugin/src/api";
-import { VaultCrypto, generateMasterKey, manifestAad } from "../../plugin/src/crypto";
+import { VaultCrypto, generateMasterKey, manifestAad, settingsAad } from "../../plugin/src/crypto";
 import { sha256Hex } from "../../plugin/src/hash";
 import { buildManifest, type FileEntry, type Manifest } from "../../plugin/src/types";
 import { ulid } from "../src/ulid";
@@ -160,3 +160,25 @@ export async function seed(
 export const TEST_KEY = generateMasterKey();
 
 export const testCrypto = (): Promise<VaultCrypto> => VaultCrypto.fromText(TEST_KEY);
+
+/**
+ * A shared settings document as an encrypted vault's devices write it: v3, AAD-bound to its
+ * revision. The agent refuses plaintext policy (anyone with a sync token could write one), so
+ * fixtures must use the real thing.
+ */
+export async function policyDoc(
+  crypto: VaultCrypto,
+  rev: number,
+  plain: Record<string, unknown>,
+  opts: { device?: string; updatedAt?: number } = {}
+): Promise<Record<string, unknown>> {
+  const device = opts.device ?? "laptop";
+  return {
+    v: 3,
+    updatedAt: opts.updatedAt ?? 1_754_000_000_000 + rev,
+    device,
+    rev,
+    keyId: crypto.keyId,
+    enc: await crypto.encryptSettingsJson(plain, settingsAad({ v: 3, rev, device, keyId: crypto.keyId })),
+  };
+}

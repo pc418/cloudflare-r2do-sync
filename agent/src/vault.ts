@@ -282,26 +282,34 @@ export class VaultView {
     }
 
     if (!isSettingsDoc(raw)) throw new VaultError("the shared settings document is malformed");
+    // Before the cache, so a forged document cannot ride on a revision already seen. This
+    // agent always holds the vault key, so its vault is encrypted and no device of it writes
+    // plaintext settings. One that appears was written by someone *without* the key — any
+    // holder of a sync token can PUT it, and the Worker cannot tell modes apart — and its
+    // excludes would decide what this process decrypts and hands to a model. Devices refuse
+    // the same document.
+    if (raw.v === 1) {
+      throw new VaultError(
+        "the shared settings document is unencrypted, but this vault is encrypted; refusing to take its scope rules from it"
+      );
+    }
     const rev = raw.rev ?? 0;
     const fingerprint = `${rev}:${raw.updatedAt}:${this.#configDir}:${this.#denyMark}`;
     if (this.#policy?.fingerprint === fingerprint) return this.#policy;
 
-    let plain: Record<string, unknown>;
-    if (raw.v === 2 || raw.v === 3) {
-      if (this.#crypto.keyId !== raw.keyId) {
-        throw new VaultError(
-          "the shared settings were written with a different master key than this agent holds"
-        );
-      }
-      plain = await this.#crypto.decryptSettingsJson<Record<string, unknown>>(
-        raw.enc,
-        raw.v === 3
-          ? settingsAad({ v: 3, rev, device: raw.device, keyId: raw.keyId, vaultSalt: raw.vaultSalt })
-          : undefined
+    if (this.#crypto.keyId !== raw.keyId) {
+      throw new VaultError(
+        "the shared settings were written with a different master key than this agent holds"
       );
-    } else {
-      plain = raw.plain;
     }
+    // v2 settings stay readable: devices accept them too, and the document is rewritten
+    // whole on every change, so an old one survives only until the next settings save.
+    const plain = await this.#crypto.decryptSettingsJson<Record<string, unknown>>(
+      raw.enc,
+      raw.v === 3
+        ? settingsAad({ v: 3, rev, device: raw.device, keyId: raw.keyId, vaultSalt: raw.vaultSalt })
+        : undefined
+    );
 
     const scope = this.#withDeny(
       makeScopeFilter({
@@ -402,24 +410,42 @@ export class VaultView {
     return head;
   }
 
+  /**
+   * The current head's path map, from an authenticated v3 envelope only.
+   *
+   * This process holds the vault key and, when writable, signs whatever map it absorbed into
+   * a v3 snapshot on its next write. So the map it starts from must be one only a key holder
+   * could have produced. A v1 head is plaintext anyone with a sync token can commit — even an
+   * empty one would let the next write publish a signed snapshot deleting every note. A v2
+   * head binds only its ciphertext, so an old v2 map can be re-wrapped under a fresh header
+   * by someone without the key and roll the vault back. Every current writer produces v3; a
+   * vault still headed by v2 needs one new snapshot from an up-to-date device first.
+   */
   async #decryptPathMap(manifest: Manifest): Promise<Record<string, FileEntry>> {
-    if (manifest.v === 1) return manifest.files;
-    // v2 authenticates only the ciphertext; v3 authenticates the envelope it arrived in, so a
-    // spliced header fails here instead of being read as genuine content.
-    const files = parseFileEntries(
-      await this.#crypto.decryptJson(
-        manifest.enc,
-        manifest.v === 3 ? manifestAad(manifest) : undefined
-      )
-    );
-    if (manifest.v === 3) {
-      const inner = new Set(Object.values(files).map(blobKey));
-      const outer = new Set(manifest.blobs);
-      if (inner.size !== outer.size || [...inner].some((hash) => !outer.has(hash))) {
-        throw new VaultError(
-          `snapshot ${manifest.id} lists ${outer.size} blob(s) but its entries reference ${inner.size}`
-        );
-      }
+    if (manifest.v !== 3) {
+      throw new VaultError(
+        manifest.v === 1
+          ? `the current snapshot ${manifest.id} is unencrypted, but this vault is encrypted; ` +
+              "refusing to read or extend a snapshot this vault's devices never write"
+          : `the current snapshot ${manifest.id} uses the legacy v2 format, which cannot prove ` +
+              "who wrote it; publish a new snapshot from a trusted, up-to-date device (edit any " +
+              "note and sync), then retry"
+      );
+    }
+    if (manifest.keyId !== this.#crypto.keyId) {
+      throw new VaultError(
+        `the current snapshot ${manifest.id} was written with a different master key than this agent holds`
+      );
+    }
+    // v3 authenticates the envelope it arrived in, so a spliced header fails here instead of
+    // being read as genuine content.
+    const files = parseFileEntries(await this.#crypto.decryptJson(manifest.enc, manifestAad(manifest)));
+    const inner = new Set(Object.values(files).map(blobKey));
+    const outer = new Set(manifest.blobs);
+    if (inner.size !== outer.size || [...inner].some((hash) => !outer.has(hash))) {
+      throw new VaultError(
+        `snapshot ${manifest.id} lists ${outer.size} blob(s) but its entries reference ${inner.size}`
+      );
     }
     return files;
   }
