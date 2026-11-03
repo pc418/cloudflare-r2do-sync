@@ -501,7 +501,11 @@ present this path is chosen automatically; the script never silently switches ac
 node scripts/restore.mjs --out ./restored              # current head
 node scripts/restore.mjs --out ./restored --head <manifest-id>
 node scripts/restore.mjs --out ./restored --passphrase --salt <public-vault-salt>
+node scripts/restore.mjs --out ./restored --plaintext    # an unencrypted vault only
 ```
+
+An unencrypted vault needs `--plaintext`, and a snapshot that is unencrypted while you supplied
+a key is refused: an encrypted vault's devices never write one, so it is not yours to trust.
 
 It prompts for the access token and master key (or reads `ACCESS_TOKEN` / `MASTER_KEY`), so
 neither lands in shell history. It re-implements the crypto independently on purpose, and a

@@ -8,6 +8,10 @@ const os = await import(/* @vite-ignore */ "node:os" as string);
 const path = (await import(/* @vite-ignore */ "node:path" as string)).default;
 const { mkdtemp, mkdir, readFile, rm, symlink } = fs;
 const { tmpdir } = os;
+const proc = (await import(/* @vite-ignore */ "node:process" as string)).default as {
+  execPath: string;
+  env: Record<string, string | undefined>;
+};
 
 /**
  * Cross-implementation check. scripts/restore.mjs re-implements the crypto independently so
@@ -23,6 +27,8 @@ interface RestoreModule {
     vaultSalt?: string;
   }): Promise<Uint8Array>;
   passphraseModeRequested(argv?: string[]): boolean;
+  plaintextModeRequested(argv?: string[]): boolean;
+  restoreMode(input: { version: unknown; keyInput: boolean; plaintext: boolean }): "encrypted" | "plaintext";
   keyIdOf(master: Uint8Array): Promise<string>;
   decryptBlob(master: Uint8Array, plainHash: string, cipher: Uint8Array): Promise<Uint8Array>;
   decryptManifestMap(master: Uint8Array, enc: unknown, aad?: string): Promise<unknown>;
@@ -217,6 +223,97 @@ describe("restore.mjs encrypted credential selection", () => {
         "--passphrase",
       ])
     ).toThrow(/only be supplied once/);
+  });
+});
+
+describe("restore.mjs snapshot mode", () => {
+  it("decides the mode from what the operator supplied, never from the manifest alone", () => {
+    expect(restore.restoreMode({ version: 3, keyInput: true, plaintext: false })).toBe("encrypted");
+    expect(restore.restoreMode({ version: 2, keyInput: false, plaintext: false })).toBe("encrypted");
+    expect(restore.restoreMode({ version: 1, keyInput: false, plaintext: true })).toBe("plaintext");
+  });
+
+  it("refuses an unencrypted head when a key was supplied, or without --plaintext", () => {
+    expect(() => restore.restoreMode({ version: 1, keyInput: true, plaintext: false })).toThrow(
+      /unencrypted \(v1\).*master key or passphrase/
+    );
+    expect(() => restore.restoreMode({ version: 1, keyInput: false, plaintext: false })).toThrow(
+      /--plaintext/
+    );
+  });
+
+  it("refuses contradictory flags and unknown versions", () => {
+    expect(() => restore.restoreMode({ version: 3, keyInput: false, plaintext: true })).toThrow(
+      /encrypted \(v3\).*--plaintext/
+    );
+    expect(() => restore.restoreMode({ version: 1, keyInput: true, plaintext: true })).toThrow(
+      /cannot be combined/
+    );
+    for (const version of [0, 4, "1", undefined, null]) {
+      expect(() => restore.restoreMode({ version, keyInput: false, plaintext: true })).toThrow(
+        /unsupported format version/
+      );
+    }
+  });
+
+  it("treats --plaintext as a single mode flag", () => {
+    expect(restore.plaintextModeRequested(["node", "restore.mjs"])).toBe(false);
+    expect(restore.plaintextModeRequested(["node", "restore.mjs", "--plaintext"])).toBe(true);
+    expect(() =>
+      restore.plaintextModeRequested(["node", "restore.mjs", "--plaintext", "--plaintext"])
+    ).toThrow(/only be supplied once/);
+  });
+
+  it("end to end: a forged v1 head is refused when the operator holds the key, and nothing is written", async () => {
+    const http = await import(/* @vite-ignore */ "node:http" as string);
+    const { spawn } = await import(/* @vite-ignore */ "node:child_process" as string);
+    const injected = bytes("INJECTED");
+    const h = await sha256Hex(injected);
+    const id = "01HZZZZZZZZZZZZZZZZZZZZZZZ";
+    const forged = {
+      v: 1, id, parent: null, device: "x", createdAt: "2026-01-01T00:00:00.000Z",
+      files: { "note.md": { h, size: injected.length, mtime: 0 } },
+    };
+    const server = http.createServer((req: { url: string }, res: {
+      writeHead(s: number, h?: Record<string, string>): void; end(b?: string | Uint8Array): void;
+    }) => {
+      if (req.url === "/api/head") { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ head: id })); }
+      else if (req.url === `/api/manifests/${id}`) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(forged)); }
+      else if (req.url === `/api/blobs/${h}`) { res.writeHead(200); res.end(injected); }
+      else { res.writeHead(404); res.end(); }
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    const dir = await mkdtemp(path.join(tmpdir(), "restore-mode-"));
+    const run = (env: Record<string, string>, extra: string[] = []) =>
+      new Promise<{ code: number; stderr: string }>((resolve) => {
+        const child = spawn(
+          proc.execPath,
+          [new URL("../../scripts/restore.mjs", import.meta.url).pathname, "--out", path.join(dir, "out"), "--url", `http://127.0.0.1:${port}`, ...extra],
+          { env: { PATH: proc.env.PATH ?? "", ACCESS_TOKEN: "dummy", ...env }, stdio: ["ignore", "pipe", "pipe"] }
+        );
+        let stderr = "";
+        child.stderr.on("data", (d: Uint8Array) => (stderr += text(d)));
+        child.on("close", (code: number) => resolve({ code, stderr }));
+      });
+    try {
+      const keyed = await run({ MASTER_KEY: toBase64(KEY) });
+      expect(keyed.code).not.toBe(0);
+      expect(keyed.stderr).toMatch(/unencrypted \(v1\)/);
+      await expect(readFile(path.join(dir, "out", "note.md"))).rejects.toThrow();
+
+      const unflagged = await run({});
+      expect(unflagged.code).not.toBe(0);
+      expect(unflagged.stderr).toMatch(/--plaintext/);
+
+      // The explicit opt-in still restores a genuinely unencrypted vault.
+      const plain = await run({}, ["--plaintext"]);
+      expect(plain.code).toBe(0);
+      expect(text(await readFile(path.join(dir, "out", "note.md")))).toBe("INJECTED");
+    } finally {
+      server.close();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

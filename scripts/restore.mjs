@@ -3,6 +3,7 @@
 //
 //   node scripts/restore.mjs --out ./restored [--head <manifest-id>] [--url <worker-url>]
 //   node scripts/restore.mjs --out ./restored --passphrase --salt <base64-vault-salt>
+//   node scripts/restore.mjs --out ./restored --plaintext      (an unencrypted vault only)
 //
 // Credentials come from the environment (ACCESS_TOKEN and either MASTER_KEY or
 // VAULT_PASSPHRASE) or a hidden prompt, so they stay out of shell history. `--passphrase` is
@@ -266,6 +267,51 @@ function arg(name) {
   return value;
 }
 
+/**
+ * Decides how a fetched snapshot may be restored, before any of it is trusted.
+ *
+ * The manifest's own `v` is server-controlled, so it cannot be what decides whether the
+ * restore authenticates anything. A key-less holder of a sync token can commit a plaintext
+ * v1 head onto an encrypted vault (the Worker cannot tell the modes apart), and restoring
+ * that "as plaintext" would write an attacker-chosen tree with a clean exit while the key the
+ * operator supplied went unused. Synced devices refuse exactly this mix (`#modeError`).
+ *
+ * So the operator states the mode: any key input means the vault is encrypted and only an
+ * encrypted snapshot is accepted; a plaintext snapshot needs `--plaintext`, which in turn
+ * refuses key inputs and encrypted snapshots. Anything that is not v1/v2/v3 is refused.
+ */
+export function restoreMode({ version, keyInput, plaintext }) {
+  if (keyInput && plaintext) {
+    throw new Error("--plaintext cannot be combined with a master key or passphrase");
+  }
+  if (version === 2 || version === 3) {
+    if (plaintext) {
+      throw new Error(`snapshot is encrypted (v${version}), but --plaintext was given`);
+    }
+    return "encrypted";
+  }
+  if (version === 1) {
+    if (keyInput) {
+      throw new Error(
+        "snapshot is unencrypted (v1), but a master key or passphrase was supplied: this vault " +
+          "is encrypted, so an unencrypted head is not one its devices wrote. Refusing to restore it; " +
+          "pass --head with a known-good snapshot id"
+      );
+    }
+    if (!plaintext) {
+      throw new Error("snapshot is unencrypted (v1); pass --plaintext to restore an unencrypted vault");
+    }
+    return "plaintext";
+  }
+  throw new Error(`snapshot has unsupported format version ${JSON.stringify(version)}`);
+}
+
+export function plaintextModeRequested(argv = process.argv) {
+  const matches = argv.filter((value) => value === "--plaintext");
+  if (matches.length > 1) throw new Error("--plaintext may only be supplied once");
+  return matches.length === 1;
+}
+
 export function passphraseModeRequested(argv = process.argv) {
   if (argv.some((value) => value.startsWith("--passphrase="))) {
     throw new Error("--passphrase is a mode flag; do not put the passphrase in command arguments");
@@ -302,7 +348,7 @@ async function main() {
   const outDir = arg("out");
   if (!outDir) {
     console.error(
-      "usage: node scripts/restore.mjs --out <dir> [--head <id>] [--url <worker-url>] [--passphrase --salt <base64>]"
+      "usage: node scripts/restore.mjs --out <dir> [--head <id>] [--url <worker-url>] [--passphrase --salt <base64> | --plaintext]"
     );
     process.exit(2);
   }
@@ -335,8 +381,16 @@ async function main() {
 
   let files;
   let master = null;
-  if (manifest.v === 2 || manifest.v === 3) {
-    const passphraseMode = passphraseModeRequested();
+  const passphraseMode = passphraseModeRequested();
+  const mode = restoreMode({
+    version: manifest.v,
+    keyInput:
+      passphraseMode ||
+      process.env.MASTER_KEY !== undefined ||
+      process.env.VAULT_PASSPHRASE !== undefined,
+    plaintext: plaintextModeRequested(),
+  });
+  if (mode === "encrypted") {
     const vaultSalt = arg("salt") ?? process.env.VAULT_SALT?.trim();
     if (passphraseMode) {
       master = await resolveMasterKeyInput({
