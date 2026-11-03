@@ -34,6 +34,44 @@ export function selfDirs(configDir: string = DEFAULT_CONFIG_DIR): string[] {
 }
 
 /**
+ * One path segment as a filesystem may resolve it: NFC, lower-cased, and cut at the first `:`.
+ *
+ * The hard skips below protect directories, and a directory is whatever the device's
+ * filesystem says a name refers to — not the bytes of the name. The default macOS, Windows,
+ * iOS and Android volumes are case-insensitive, so `.Obsidian/plugins/x/main.js` lands in the
+ * real `.obsidian`; NTFS also resolves a stream-qualified component such as
+ * `.obsidian::$INDEX_ALLOCATION` to the directory itself. A byte-exact comparison waved both
+ * through, which let any writer of this vault — a plaintext vault's server, any key-holding
+ * device, a writable MCP agent — place files the skips exist to keep out.
+ *
+ * Only for comparisons against the protected directories. Paths are never rewritten with it,
+ * and folding a legitimate note's name never matters here, because the only things compared
+ * are this vault's config directory and the fixed names inside it.
+ */
+export function segmentKey(segment: string): string {
+  const colon = segment.indexOf(":");
+  return (colon === -1 ? segment : segment.slice(0, colon)).normalize("NFC").toLowerCase();
+}
+
+/**
+ * Whether `path` is `dir` or inside it, comparing each segment as `segmentKey` resolves it.
+ * Every check against a protected directory goes through here, so no caller can reintroduce
+ * the byte-exact comparison by hand.
+ */
+export function isUnderDir(path: string, dir: string): boolean {
+  const p = path.split("/");
+  const d = dir.split("/");
+  if (p.length < d.length) return false;
+  return d.every((segment, i) => segmentKey(p[i]) === segmentKey(segment));
+}
+
+/** Whether a first path segment names `configDir` or the default config directory. */
+function isConfigRoot(segment: string, configDir: string): boolean {
+  const key = segmentKey(segment);
+  return key === segmentKey(configDir) || key === DEFAULT_CONFIG_DIR;
+}
+
+/**
  * Directories a set of deleted files may have left empty: every strict ancestor, deepest first.
  *
  * Sync is file-only — a folder exists only as the parent of a file it holds — so a whole-tree
@@ -52,7 +90,7 @@ export function pruneCandidates(deleted: readonly string[], configDir: string): 
   const dirs = new Set<string>();
   for (const path of deleted) {
     for (const dir of ancestorDirs(path)) {
-      if (selves.some((self) => dir === self || dir.startsWith(`${self}/`))) continue;
+      if (selves.some((self) => isUnderDir(dir, self))) continue;
       dirs.add(dir);
     }
   }
@@ -110,9 +148,10 @@ const CONFIG_ENABLEMENT_FILES = new Set(["community-plugins.json"]);
 export function isConfigCodePath(path: string, configDir: string = DEFAULT_CONFIG_DIR): boolean {
   const segments = path.split("/");
   if (segments.length < 2) return false;
-  if (segments[0] !== configDir && segments[0] !== DEFAULT_CONFIG_DIR) return false;
-  if (segments.length >= 3 && CONFIG_CODE_DIRS.has(segments[1])) return true;
-  return segments.length === 2 && CONFIG_ENABLEMENT_FILES.has(segments[1]);
+  if (!isConfigRoot(segments[0], configDir)) return false;
+  const inner = segmentKey(segments[1]);
+  if (segments.length >= 3 && CONFIG_CODE_DIRS.has(inner)) return true;
+  return segments.length === 2 && CONFIG_ENABLEMENT_FILES.has(inner);
 }
 
 /** Files that are noise on every platform, matched by exact segment name. */
@@ -151,7 +190,7 @@ function isIconMarker(segment: string): boolean {
  */
 export function alwaysSkip(path: string, configDir: string = DEFAULT_CONFIG_DIR): boolean {
   for (const selfDir of selfDirs(configDir)) {
-    if (path === selfDir || path.startsWith(`${selfDir}/`)) return true;
+    if (isUnderDir(path, selfDir)) return true;
   }
   // Third-party code and the files that enable it: see `isConfigCodePath`. Here rather than
   // behind the config toggle, because the toggle is a settings choice and this is not.
@@ -160,8 +199,8 @@ export function alwaysSkip(path: string, configDir: string = DEFAULT_CONFIG_DIR)
   const segments = path.split("/");
   if (
     segments.length === 2 &&
-    (segments[0] === configDir || segments[0] === DEFAULT_CONFIG_DIR) &&
-    isWorkspaceFile(segments[1])
+    isConfigRoot(segments[0], configDir) &&
+    isWorkspaceFile(segmentKey(segments[1]))
   ) {
     return true;
   }
@@ -257,7 +296,7 @@ export function makeExcluder(globs: string[]): (path: string) => boolean {
  * content — not the config the user just agreed to publish.
  */
 export function isConfigPath(path: string, configDir: string = DEFAULT_CONFIG_DIR): boolean {
-  return path === configDir || path.startsWith(`${configDir}/`);
+  return isUnderDir(path, configDir);
 }
 
 /** One glob per line, blank lines dropped. The stored form of every glob setting. */

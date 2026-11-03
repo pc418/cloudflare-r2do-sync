@@ -28,6 +28,7 @@ import {
   pathError,
   pruneCandidates,
   restoreCopyPath,
+  isUnderDir,
   selfDirs,
 } from "./paths";
 import { DEFAULT_LANES, clampLanes, mapPool } from "./pool";
@@ -1758,6 +1759,14 @@ export class SyncEngine {
         const canonicalEntry = localEntries?.[canonical];
         if (canonicalEntry !== undefined) files[canonical] = canonicalEntry;
         protectedLocalPaths.push(canonical);
+        // Remote spellings this device never materializes cannot overwrite anything, so they
+        // are carried as they are. Parking them would rename an entry in the outgoing map —
+        // a remote mutation for a path this device does not even own, and for a hard-skipped
+        // alias of the config directory, a conflict copy offered as an ordinary note.
+        if (group.every((path) => this.#notScanned(path))) {
+          for (const path of group) files[path] = remote[path];
+          continue;
+        }
         for (const source of group) {
           park(source, canonical, "ours", canonicalEntry, remote[source]);
         }
@@ -2870,10 +2879,8 @@ export class SyncEngine {
     // limit and hand the adapter something no later sync would accept.
     const bad = pathError(path);
     if (bad !== null) return `it is not a valid vault path: ${bad}`;
-    const folded = foldPath(path);
     for (const dir of selfDirs(this.#configDir)) {
-      const self = foldPath(dir);
-      if (folded === self || folded.startsWith(`${self}/`)) {
+      if (isUnderDir(path, dir)) {
         return (
           "that is this plugin's own folder, which holds this device's credentials and is " +
           "rewritten from memory while the plugin runs"

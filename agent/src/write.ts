@@ -9,7 +9,7 @@
 import { StaleHeadError } from "../../plugin/src/api";
 import { sha256Hex } from "../../plugin/src/hash";
 import { countLines } from "../../plugin/src/lines";
-import { alwaysSkip, pathError, selfDirs } from "../../plugin/src/paths";
+import { alwaysSkip, isUnderDir, pathError, selfDirs } from "../../plugin/src/paths";
 import { blobKey, buildManifest, type FileEntry } from "../../plugin/src/types";
 import { VaultError, type VaultView } from "./vault";
 import { ulid } from "./ulid";
@@ -52,7 +52,7 @@ export function refuseWrite(path: string, configDir: string): string | null {
   const shape = pathError(path);
   if (shape !== null) return shape;
   for (const dir of selfDirs(configDir)) {
-    if (path === dir || path.startsWith(`${dir}/`)) {
+    if (isUnderDir(path, dir)) {
       return `"${path}" is inside this plugin's own folder, which holds device credentials`;
     }
   }

@@ -15,6 +15,7 @@ import {
   pathError,
   pruneCandidates,
   restoreCopyPath,
+  segmentKey,
   selfDirs,
   DEFAULT_CONFIG_DIR,
   LEGACY_PLUGIN_DIR,
@@ -135,6 +136,66 @@ describe("alwaysSkip — hard self-excludes", () => {
   it("allows Obsidian's own settings files", () => {
     expect(alwaysSkip(".obsidian/hotkeys.json")).toBe(false);
     expect(alwaysSkip(".obsidian/app.json")).toBe(false);
+  });
+});
+
+// The skips protect directories, and a directory is what the device's filesystem resolves a
+// name to. The default macOS/Windows/iOS/Android volumes fold case, and NTFS resolves a
+// stream-qualified component to the directory itself, so a byte-exact compare let any vault
+// writer place plugin code, enablement state or this plugin's credentials file under another
+// spelling of the same directory.
+describe("alias spellings of the configuration directory", () => {
+  const CUSTOM = ".config-obsidian";
+
+  it("skips executable config and enablement state under any case of the directory", () => {
+    for (const p of [
+      ".Obsidian/plugins/x/main.js",
+      ".OBSIDIAN/themes/T/theme.css",
+      ".obsidian/Snippets/a.css",
+      ".obsidian/PLUGINS/x/data.json",
+      ".Obsidian/community-plugins.json",
+      ".obsidian/Community-Plugins.json",
+    ]) {
+      expect(alwaysSkip(p), p).toBe(true);
+      expect(isConfigCodePath(p), p).toBe(true);
+    }
+  });
+
+  it("skips NTFS stream-qualified components of the directory", () => {
+    expect(alwaysSkip(".obsidian::$INDEX_ALLOCATION/community-plugins.json")).toBe(true);
+    expect(alwaysSkip(".obsidian::$INDEX_ALLOCATION/plugins/evil/main.js")).toBe(true);
+    expect(alwaysSkip(".obsidian/plugins::$INDEX_ALLOCATION/x/main.js")).toBe(true);
+  });
+
+  it("skips this plugin's own folder under any spelling", () => {
+    expect(alwaysSkip(".OBSIDIAN/plugins/cloudflare-rdo-sync/data.json")).toBe(true);
+    expect(alwaysSkip(".obsidian/plugins/CLOUDFLARE-RDO-SYNC/data.json")).toBe(true);
+    expect(alwaysSkip(".Obsidian/Plugins/Obsidian-Log-Sync/data.json")).toBe(true);
+    expect(alwaysSkip(".CONFIG-OBSIDIAN/plugins/cloudflare-rdo-sync/data.json", CUSTOM)).toBe(true);
+    expect(pruneCandidates([".OBSIDIAN/plugins/cloudflare-rdo-sync/x/y.md"], ".obsidian")).not.toContain(
+      ".OBSIDIAN/plugins/cloudflare-rdo-sync"
+    );
+  });
+
+  it("gates ordinary config behind the consent toggle under any case of the active directory", () => {
+    expect(isConfigPath(".Obsidian/appearance.json")).toBe(true);
+    expect(isConfigPath(".CONFIG-OBSIDIAN/app.json", CUSTOM)).toBe(true);
+    expect(alwaysSkip(".Obsidian/workspace.json")).toBe(true);
+  });
+
+  it("keeps the active/default distinction: after a rename, the default folder is not consent-gated", () => {
+    expect(isConfigPath(".obsidian/app.json", CUSTOM)).toBe(false);
+    expect(isConfigPath(".Obsidian/app.json", CUSTOM)).toBe(false);
+    expect(alwaysSkip(".Obsidian/plugins/x/main.js", CUSTOM)).toBe(true);
+  });
+
+  it("leaves look-alike names and ordinary notes alone", () => {
+    for (const p of [".obsidian-notes/plugins/x/main.js", "obsidian/plugins/x.md", "Notes/.Obsidian.md", "a:b/c.md"]) {
+      expect(alwaysSkip(p), p).toBe(false);
+      expect(isConfigPath(p), p).toBe(false);
+    }
+    expect(alwaysSkip(".obsidian/hotkeys.json")).toBe(false);
+    expect(segmentKey("Plugins::$INDEX_ALLOCATION")).toBe("plugins");
   });
 });
 

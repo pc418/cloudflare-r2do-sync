@@ -617,6 +617,67 @@ describe("SyncEngine.sync — direction modes", () => {
   });
 });
 
+describe("SyncEngine.sync — config-directory alias spellings", () => {
+  // A remote writer naming `.Obsidian/...` reaches the real `.obsidian` on a case-insensitive
+  // device. The fake vault is case-sensitive, so these assert what is planned and published,
+  // not where a real filesystem would put it.
+  const ALIASES = {
+    ".Obsidian/plugins/x/data.json": "{\"run\":\"evil\"}",
+    ".Obsidian/snippets/a.css": "body{}",
+    ".obsidian::$INDEX_ALLOCATION/community-plugins.json": "[\"evil\"]",
+    ".OBSIDIAN/plugins/cloudflare-rdo-sync/data.json": "{}",
+    ".Obsidian/appearance.json": "{}",
+  };
+
+  it("never writes an alias of the config directory, and carries the entries unchanged", async () => {
+    vault.set("notes/mine.md", "mine");
+    await engine.sync();
+    await server.seedRemoteCommit({ ...ALIASES, "notes/mine.md": "mine", "notes/ok.md": "ok" });
+    const seeded = { ...plainFiles(server.manifests.get(server.head!)!) };
+    vault.writes.length = 0;
+
+    const pulled = await engine.sync();
+    expect(pulled.status, JSON.stringify(pulled)).toBe("pulled");
+    expect(vault.writes).toEqual(["notes/ok.md"]);
+
+    // An unrelated local edit forces a commit: every alias entry must survive it verbatim.
+    vault.set("notes/mine.md", "edited", now + 1000);
+    const res = await engine.sync();
+    expect(res.status).toBe("committed");
+    const published = plainFiles(server.manifests.get(server.head!)!);
+    for (const path of Object.keys(ALIASES)) expect(published[path], path).toEqual(seeded[path]);
+    expect(res.conflicts).toEqual([]);
+  });
+
+  it("carries an alias that collides with a real local config file instead of parking it", async () => {
+    vault.set(".obsidian/community-plugins.json", "[\"good\"]");
+    vault.set("notes/mine.md", "mine");
+    await engine.sync();
+    await server.seedRemoteCommit({
+      "notes/mine.md": "mine",
+      ".Obsidian/community-plugins.json": "[\"evil\"]",
+    });
+    const seeded = plainFiles(server.manifests.get(server.head!)!)[".Obsidian/community-plugins.json"];
+    vault.writes.length = 0;
+
+    vault.set("notes/mine.md", "edited", now + 1000);
+    const res = await engine.sync();
+
+    expect(vault.text(".obsidian/community-plugins.json")).toBe("[\"good\"]");
+    expect(vault.writes.filter((p) => p.toLowerCase().startsWith(".obsidian"))).toEqual([]);
+    expect(res.conflicts).toEqual([]);
+    const published = plainFiles(server.manifests.get(server.head!)!);
+    expect(published[".Obsidian/community-plugins.json"]).toEqual(seeded);
+  });
+
+  it("still syncs ordinary config under an alias spelling only when config sync is on", async () => {
+    const withConfig = makeEngine({ excludes: [], syncConfigDir: true });
+    await server.seedRemoteCommit({ ".Obsidian/appearance.json": "{}", ".Obsidian/plugins/x/main.js": "evil()" });
+    await withConfig.sync();
+    expect(vault.writes).toEqual([".Obsidian/appearance.json"]);
+  });
+});
+
 describe("SyncEngine.sync — pull", () => {
   it("parks a case-variant remote path instead of overwriting a local path", async () => {
     vault.set("Note.md", "local");
