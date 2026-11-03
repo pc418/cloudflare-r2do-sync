@@ -362,6 +362,29 @@ describe("runGc", () => {
     expect(rebuilt.deletedManifests).toBe(0);
   });
 
+  it("rebuilds rather than wedging when the hole is the head itself", async () => {
+    // What the old migration left when a commit landed between steps and none followed: the
+    // head is in R2, the index is marked complete, and the head has no row.
+    const now = Date.now() + 10 * DAY;
+    const a = await seedBlob("kept");
+    const c1 = manifest(ulid(Date.now() - 2 * DAY), null, Date.now() - 2 * DAY, { "a.md": a });
+    const c2 = manifest(ulid(Date.now() - DAY), c1.id, Date.now() - DAY, { "a.md": a });
+    await publish(c1, null);
+    await publish(c2, c1.id);
+    const lock = env.VAULT_LOCK.getByName("default");
+    await runInDurableObject(lock, (_instance: VaultLock, state) => {
+      state.storage.sql.exec("DELETE FROM manifest_index WHERE id = ?", c2.id);
+    });
+
+    const holed = await runGc(env, { now, minAgeMs: 0, keepCount: 1, keepDays: 0 });
+    expect(holed.skipped).toBe("index_rebuilding");
+    expect(holed.deletedManifests).toBe(0);
+
+    const rebuilt = await runGc(env, { now, minAgeMs: 0, keepCount: 100, keepDays: 30, indexChunk: 100 });
+    expect(rebuilt.skipped).toBeNull();
+    expect(rebuilt.retainedManifests).toBe(2);
+  });
+
   /**
    * The migration cannot assume any one invocation can finish it: a request gets 10 ms of CPU
    * on the free plan, and a chain is one R2 GET and one JSON parse per link. Driven one link

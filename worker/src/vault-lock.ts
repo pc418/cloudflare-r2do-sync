@@ -1076,15 +1076,17 @@ export class VaultLock extends DurableObject<Env> {
       visited.add(cursor);
       const row = this.#indexRow(cursor);
       if (row === undefined) {
-        if (depth === 0) throw new Error(`head manifest ${cursor} is missing from the GC index`);
         // An ancestor the index lacks is the end of retained history only if a sweep
         // collected it. One R2 still holds is a hole — a snapshot the index never learned
         // about — and planning past it would read everything older as garbage and delete it.
+        // The head itself can be such a hole (a commit the old migration skipped, with none
+        // since), and rebuilding is the way out of that too; only a head R2 lost is fatal.
         if ((await this.env.VAULT.head(`manifests/${cursor}.json`)) !== null) {
           const reason = `manifest ${cursor} is in R2 but missing from the GC index`;
           await this.#invalidateGcIndex(reason);
           return { head, retainedIds: [], liveHashes: [], retainedEtags: [], splices: [], thinned: 0, incomplete: reason };
         }
+        if (depth === 0) throw new Error(`head manifest ${cursor} is missing from R2 and the GC index`);
         // A splice promises its parent was kept; finding it collected is corruption.
         if (viaSplice) throw new Error(`splice parent ${cursor} is missing from R2 and the GC index`);
         break;
