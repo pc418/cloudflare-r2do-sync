@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { StaleHeadError } from "../src/api";
+import { ApiError, StaleHeadError } from "../src/api";
 import { sha256Hex } from "../src/hash";
 import {
   SyncEngine,
@@ -8,7 +8,7 @@ import {
   type SyncApiLike,
 } from "../src/sync";
 import type { Manifest } from "../src/types";
-import { VaultCrypto } from "../src/crypto";
+import { VaultCrypto, manifestAad } from "../src/crypto";
 import { FakeServer, FakeStore, FakeVault } from "./fakes";
 
 let vault: FakeVault;
@@ -417,6 +417,119 @@ describe("head-descent verification on an encrypted vault", () => {
     expect((await engine.sync()).status).toBe("needs-continuity");
     expect(asked[0].reason).toBe("unauthenticated");
     expect(vault.text("a.md")).toBe("three");
+  });
+
+  /**
+   * The downgrade the head-graded walk could not see. A v3 head binds its envelope to its
+   * ciphertext; a v2 head binds only the ciphertext, so anyone holding a sync token — no key
+   * needed — can lift an old v2 map into a fresh header naming this device's last snapshot as
+   * parent, and every unedited note rolls back as ordinary remote edits.
+   */
+  describe("an unauthenticated head after an authenticated base", () => {
+    const FORGED = "01HZZZZZZZZZZZZZZZZZZZZZZY";
+
+    /** The device's oldest map, re-encrypted without AAD the way a pre-v3 device wrote it. */
+    async function replayedV2(crypto: VaultCrypto, from: string, parent: string): Promise<Manifest> {
+      const old = server.manifests.get(from)!;
+      if (old.v !== 3) throw new Error("expected v3");
+      const files = await crypto.decryptJson(old.enc, manifestAad(old));
+      return {
+        v: 2, id: FORGED, parent, device: "attacker", createdAt: new Date(now).toISOString(),
+        keyId: old.keyId, blobs: old.blobs, enc: await crypto.encryptJson(files),
+      };
+    }
+
+    for (const answer of ["stop", null] as const) {
+      it(`asks instead of rolling back a re-wrapped v2 map (answer: ${answer ?? "nobody watching"})`, async () => {
+        const crypto = await VaultCrypto.create(KEY);
+        const engine = makeEngine({ crypto }, answer);
+        const { h1, h3 } = await threeSnapshots(engine);
+        server.manifests.set(FORGED, await replayedV2(crypto, h1, h3));
+        server.head = FORGED;
+        vault.writes.length = 0;
+        const before = store.state?.lastSyncedHead;
+
+        const result = await engine.sync();
+
+        expect(result.status).toBe("needs-continuity");
+        if (answer === "stop") expect(asked.map((q) => q.reason)).toEqual(["unauthenticated"]);
+        expect(vault.text("a.md")).toBe("three");
+        expect(vault.writes).toEqual([]);
+        expect(server.head).toBe(FORGED);
+        expect(store.state?.lastSyncedHead).toBe(before);
+        expect(before).toBe(h3);
+      });
+    }
+
+    it("asks about an empty v1 head even when the mass-delete guard is switched off", async () => {
+      const crypto = await VaultCrypto.create(KEY);
+      const engine = makeEngine({ crypto, protectPercent: 100 }, "stop");
+      const { h3 } = await threeSnapshots(engine);
+      server.manifests.set(FORGED, {
+        v: 1, id: FORGED, parent: h3, device: "attacker", createdAt: new Date(now).toISOString(), files: {},
+      });
+      server.head = FORGED;
+
+      expect((await engine.sync()).status).toBe("needs-continuity");
+      expect(asked.map((q) => q.reason)).toEqual(["unauthenticated"]);
+      expect(vault.text("a.md")).toBe("three");
+    });
+
+    it("still lets the owner accept it explicitly", async () => {
+      const crypto = await VaultCrypto.create(KEY);
+      const engine = makeEngine({ crypto }, "continue");
+      const { h1, h3 } = await threeSnapshots(engine);
+      server.manifests.set(FORGED, await replayedV2(crypto, h1, h3));
+      server.head = FORGED;
+
+      await engine.sync();
+      expect(asked.map((q) => q.reason)).toEqual(["unauthenticated"]);
+      expect(vault.text("a.md")).toBe("one");
+    });
+
+    it("keeps the best-effort grade for a genuinely legacy base", async () => {
+      const crypto = await VaultCrypto.create(KEY);
+      const engine = makeEngine({ crypto }, "stop");
+      const { h1, h3 } = await threeSnapshots(engine);
+      // The snapshot this device last stood on is itself v2, as on a vault older than v3.
+      const base = server.manifests.get(h3)!;
+      if (base.v !== 3) throw new Error("expected v3");
+      server.manifests.set(h3, {
+        ...base, v: 2, enc: await crypto.encryptJson(await crypto.decryptJson(base.enc, manifestAad(base))),
+      });
+      server.manifests.set(FORGED, await replayedV2(crypto, h1, h3));
+      server.head = FORGED;
+
+      await engine.sync();
+      expect(asked).toEqual([]);
+      expect(vault.text("a.md")).toBe("one");
+    });
+
+    it("keeps the best-effort grade when the base was collected (404)", async () => {
+      const crypto = await VaultCrypto.create(KEY);
+      const engine = makeEngine({ crypto }, "stop");
+      const { h1, h3 } = await threeSnapshots(engine);
+      server.manifests.set(FORGED, await replayedV2(crypto, h1, h3));
+      server.manifests.delete(h3);
+      server.head = FORGED;
+
+      await engine.sync();
+      expect(asked).toEqual([]);
+    });
+
+    it("fails the pass, not the check, when the base fetch fails for another reason", async () => {
+      const crypto = await VaultCrypto.create(KEY);
+      const engine = makeEngine({ crypto }, "stop");
+      const { h1, h3 } = await threeSnapshots(engine);
+      server.manifests.set(FORGED, await replayedV2(crypto, h1, h3));
+      server.failManifest.set(h3, new ApiError("upstream", 503));
+      server.head = FORGED;
+
+      const result = await engine.sync().catch((e: unknown) => e);
+      expect(asked).toEqual([]);
+      expect(vault.text("a.md")).toBe("three");
+      expect(result instanceof ApiError || (result as { status?: string }).status !== "pulled").toBe(true);
+    });
   });
 
   it("walks a genuine v3 chain without complaint", async () => {

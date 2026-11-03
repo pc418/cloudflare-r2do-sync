@@ -2199,6 +2199,17 @@ export class SyncEngine {
       alreadyApplied,
     });
 
+    // The grade comes from the head, so a head that cannot prove anything would otherwise
+    // be trusted on its own say-so. That is a downgrade when this device last stood on an
+    // authenticated snapshot: anyone with a sync token, key or not, can re-wrap an old v2 map
+    // under a fresh header naming `lastHead` as parent — or post an empty v1 head — and every
+    // unedited note would roll back as ordinary remote edits. Checked before the parent
+    // shortcut below, because naming `lastHead` is exactly what such a head does. Costs one
+    // request, and only for a head that is not v3 under this key.
+    if (verifier === null && this.#crypto !== null && (await this.#authenticatedBase(lastHead))) {
+      return gap("unauthenticated");
+    }
+
     for (;;) {
       if (parent === lastHead) return null;
       if (parent === null) return gap("replaced");
@@ -2228,6 +2239,25 @@ export class SyncEngine {
       parent = ancestor.parent;
       walked++;
     }
+  }
+
+  /**
+   * Whether `lastHead` is a v3 snapshot under this device's key whose envelope authenticates.
+   * A 404 means it was collected, which says nothing either way, so the caller keeps its
+   * best-effort grade. Any other failure propagates — a 5xx is not evidence about history —
+   * and so does an envelope under our own key that fails to authenticate, which is tampering.
+   */
+  async #authenticatedBase(lastHead: string): Promise<boolean> {
+    let base: Manifest;
+    try {
+      base = await this.#api.getManifest(lastHead);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) return false;
+      throw e;
+    }
+    if (!this.#envelopeIsAuthenticated(base)) return false;
+    await this.#crypto!.decryptJson(base.enc, manifestAad(base));
+    return true;
   }
 
   /**
