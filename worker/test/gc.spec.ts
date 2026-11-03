@@ -292,6 +292,77 @@ describe("runGc", () => {
   });
 
   /**
+   * A device keeps committing while the migration runs one bounded step per call. A commit
+   * that landed between two steps used to get no index row, and the first commit after the
+   * migration then left a hole the sweep read as the end of history — deleting every older
+   * snapshot and the blobs the head still referenced.
+   */
+  it("indexes commits that land between migration steps, so the sweep keeps their history", async () => {
+    const now = Date.now() + 10 * DAY;
+    const a = await seedBlob("in every snapshot");
+    const b = await seedBlob("introduced mid-migration");
+    const l1 = manifest(ulid(Date.now() - 3 * DAY), null, Date.now() - 3 * DAY, { "a.md": a });
+    const l2 = manifest(ulid(Date.now() - 2 * DAY), l1.id, Date.now() - 2 * DAY, { "a.md": a });
+    const l3 = manifest(ulid(Date.now() - DAY), l2.id, Date.now() - DAY, { "a.md": a });
+    for (const m of [l1, l2, l3]) await env.VAULT.put(`manifests/${m.id}.json`, JSON.stringify(m));
+    const lock = env.VAULT_LOCK.getByName("default");
+    await runInDurableObject(lock, (_instance: VaultLock, state) => {
+      state.storage.sql.exec("INSERT INTO meta (key, value) VALUES ('head', ?)", l3.id);
+    });
+
+    expect(await lock.advanceGcIndex({ maxManifests: 1 })).toMatchObject({ done: false });
+    const m1 = manifest(ulid(), l3.id, Date.now(), { "a.md": a, "b.md": b });
+    await publish(m1, l3.id);
+    for (let i = 0; !(await lock.advanceGcIndex({ maxManifests: 1 })).done; i++) {
+      if (i > 10) throw new Error("index walk did not converge");
+    }
+    const m2 = manifest(ulid(), m1.id, Date.now(), { "a.md": a, "b.md": b });
+    await publish(m2, m1.id);
+
+    const report = await runGc(env, { now, minAgeMs: 0, keepCount: 100, keepDays: 30 });
+
+    expect(report.skipped).toBeNull();
+    expect(report.deletedManifests).toBe(0);
+    expect(report.retainedManifests).toBe(5);
+    expect(await env.VAULT.head(`blobs/${b}`)).not.toBeNull();
+    await runInDurableObject(lock, (_instance: VaultLock, state) => {
+      const refs = state.storage.sql.exec<{ hash: string }>("SELECT hash FROM current_blob_refs").toArray();
+      expect(refs.map((r) => r.hash).sort()).toEqual([a, b].sort());
+    });
+  });
+
+  /**
+   * An index with a hole already in it — left by the bug above, or anything else — must not
+   * be swept against, and must not wedge GC either: the sweep deletes nothing, throws the
+   * index away, and the following runs rebuild it from the chain.
+   */
+  it("refuses to sweep past a snapshot R2 still holds but the index lacks, then rebuilds", async () => {
+    const now = Date.now() + 10 * DAY;
+    const a = await seedBlob("kept");
+    const c1 = manifest(ulid(Date.now() - 3 * DAY), null, Date.now() - 3 * DAY, { "a.md": a });
+    const c2 = manifest(ulid(Date.now() - 2 * DAY), c1.id, Date.now() - 2 * DAY, { "a.md": a });
+    const c3 = manifest(ulid(Date.now() - DAY), c2.id, Date.now() - DAY, { "a.md": a });
+    await publish(c1, null);
+    await publish(c2, c1.id);
+    await publish(c3, c2.id);
+    const lock = env.VAULT_LOCK.getByName("default");
+    await runInDurableObject(lock, (_instance: VaultLock, state) => {
+      state.storage.sql.exec("DELETE FROM manifest_index WHERE id = ?", c2.id);
+    });
+
+    const holed = await runGc(env, { now, minAgeMs: 0, keepCount: 1, keepDays: 0 });
+    expect(holed.skipped).toBe("index_rebuilding");
+    expect(holed.deletedManifests).toBe(0);
+    for (const m of [c1, c2, c3]) expect(await env.VAULT.head(`manifests/${m.id}.json`)).not.toBeNull();
+
+    // The next run rebuilds and sweeps against a complete index: c2 is dense-tier history now.
+    const rebuilt = await runGc(env, { now, minAgeMs: 0, keepCount: 100, keepDays: 30, indexChunk: 100 });
+    expect(rebuilt.skipped).toBeNull();
+    expect(rebuilt.retainedManifests).toBe(3);
+    expect(rebuilt.deletedManifests).toBe(0);
+  });
+
+  /**
    * The migration cannot assume any one invocation can finish it: a request gets 10 ms of CPU
    * on the free plan, and a chain is one R2 GET and one JSON parse per link. Driven one link
    * at a time it must reach exactly the index a single pass would have built.

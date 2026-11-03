@@ -29,6 +29,11 @@ export interface GcPlan {
   splices: GcSplice[];
   /** Snapshots the generational rule dropped this run; they become deletion candidates. */
   thinned: number;
+  /**
+   * Set when the walk found the index missing a snapshot R2 still holds. The index was
+   * invalidated so the next run rebuilds it, and this plan must delete nothing.
+   */
+  incomplete?: string;
 }
 
 /**
@@ -481,6 +486,38 @@ export class VaultLock extends DurableObject<Env> {
 
   #gcIndexReady(): boolean {
     return this.#meta("gc_index_backfilled") === "1";
+  }
+
+  /**
+   * True between the first bounded migration call and the one that finishes it. From the
+   * first call on, `current_blob_refs` holds the start head's set and every later head is a
+   * descendant, so a commit landing between two calls can — and must — be recorded like any
+   * other. Skipping it left a snapshot the finished index never knew about.
+   */
+  #gcIndexMigrating(): boolean {
+    const cursor = this.#meta("gc_index_cursor");
+    return !this.#gcIndexReady() && cursor !== null && cursor !== "";
+  }
+
+  /**
+   * Throws away a reference index that turned out not to describe the chain, so the next
+   * bounded migration call rebuilds it from the current head. Serialized with commits, and
+   * refused under a live lease rather than pulling the index out from under a sweep.
+   * `manifest_splices` survives, as it does every reset.
+   */
+  async #invalidateGcIndex(reason: string): Promise<void> {
+    const run = this.#commitChain.then(() => {
+      if (this.#gcLeaseUntil() > Date.now()) {
+        throw new Error(`GC reference index is incomplete (${reason}) while a GC lease is held`);
+      }
+      this.ctx.storage.transactionSync(() => {
+        this.#resetGcIndex();
+        this.#setMeta("gc_index_backfilled", "");
+      });
+      console.log(JSON.stringify({ event: "gc_index_invalidated", reason }));
+    });
+    this.#commitChain = run.catch(() => {});
+    await run;
   }
 
   /**
@@ -1028,6 +1065,7 @@ export class VaultLock extends DurableObject<Env> {
     let thinned = 0;
     let cursor: string | null = head;
     let depth = 0;
+    let viaSplice = false;
     // The newest retained snapshot so far, and the run of pruned ones found since. An empty
     // run is the ordinary parent-to-parent step; a non-empty one is a splice.
     let survivor: { id: string; spliced: number } | null = null;
@@ -1039,6 +1077,16 @@ export class VaultLock extends DurableObject<Env> {
       const row = this.#indexRow(cursor);
       if (row === undefined) {
         if (depth === 0) throw new Error(`head manifest ${cursor} is missing from the GC index`);
+        // An ancestor the index lacks is the end of retained history only if a sweep
+        // collected it. One R2 still holds is a hole — a snapshot the index never learned
+        // about — and planning past it would read everything older as garbage and delete it.
+        if ((await this.env.VAULT.head(`manifests/${cursor}.json`)) !== null) {
+          const reason = `manifest ${cursor} is in R2 but missing from the GC index`;
+          await this.#invalidateGcIndex(reason);
+          return { head, retainedIds: [], liveHashes: [], retainedEtags: [], splices: [], thinned: 0, incomplete: reason };
+        }
+        // A splice promises its parent was kept; finding it collected is corruption.
+        if (viaSplice) throw new Error(`splice parent ${cursor} is missing from R2 and the GC index`);
         break;
       }
       const dense = depth < opts.keepCount || row.uploadedAt >= opts.ageCutoff;
@@ -1077,6 +1125,7 @@ export class VaultLock extends DurableObject<Env> {
         pruned.push({ id: row.id, spliced: row.spliced });
         thinned++;
       }
+      viaSplice = row.spliceParent !== null && row.spliceParent !== undefined;
       cursor = row.spliceParent ?? row.parent;
       depth++;
     }
@@ -1163,8 +1212,9 @@ export class VaultLock extends DurableObject<Env> {
     // A vault whose pre-index history has not been translated yet has no consistent index to
     // extend, and extending it anyway would leave `current_blob_refs` missing every hash this
     // snapshot inherited — a live set that GC would delete against. The scheduled backfill
-    // reads this manifest off the head chain instead.
-    if (!this.#gcIndexReady()) return;
+    // reads this manifest off the head chain instead. Once the migration has *started*, the
+    // live set is the start head's, so commits from then on extend it (`#gcIndexMigrating`).
+    if (!this.#gcIndexReady() && !this.#gcIndexMigrating()) return;
     const next = new Set(manifestHashes(manifest));
     this.#writeIndexRow({
       id: manifest.id,

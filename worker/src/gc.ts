@@ -185,6 +185,12 @@ export async function runGc(env: Env, opts: GcOptions = {}): Promise<GcReport> {
     return report;
   }
   const plan = await lock.getGcPlan({ keepCount, ageCutoff, dailyCutoff });
+  if (plan.incomplete !== undefined) {
+    logPhase("gc_plan", gcStartedAt, { indexComplete: false, invalidated: true });
+    console.log(`gc: ${plan.incomplete}; index invalidated for rebuild, deleting nothing`);
+    report.skipped = "index_rebuilding";
+    return report;
+  }
   logPhase("gc_plan", gcStartedAt, {
     retainedManifests: plan.retainedIds.length,
     retainedBlobs: plan.liveHashes.length,
