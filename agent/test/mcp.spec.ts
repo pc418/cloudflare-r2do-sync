@@ -171,11 +171,29 @@ describe("tools/list", () => {
       "list",
       "append",
       "edit",
-      "write",
       "move",
       "delete",
     ]);
     for (const tool of body.result.tools) expect(tool.title).toBeTruthy();
+  });
+
+  // Owner, 2026-11-03: "no write". The retired name gets the ordinary unknown-tool answer on a
+  // writable deployment too, and never reaches a handler that could commit.
+  it("answers a call to the retired write tool as an unknown tool", async () => {
+    let called = false;
+    const res = await rpc(
+      req("tools/call", { name: "write", arguments: { path: "a.md", content: "x" } }),
+      {
+        writable: async () => true,
+        call: async () => {
+          called = true;
+          return "replaced a.md";
+        },
+      }
+    );
+    const body = await res.json<{ error?: { code: number; message: string } }>();
+    expect(body.error).toEqual({ code: -32602, message: "Unknown tool: write" });
+    expect(called).toBe(false);
   });
 
   it("refuses a write tool call that is not advertised", async () => {

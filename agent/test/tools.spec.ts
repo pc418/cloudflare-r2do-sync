@@ -83,11 +83,11 @@ describe("tool surface", () => {
     const contracts: Record<string, RegExp> = {
       search: /Substring by default, or pass `regex: true`/,
       read: /Line numbers are display only/,
-      append: /Creating if missing/,
+      // The create path as well as the add path: there is no `write` (owner, 2026-11-03).
+      append: /^Add to a note, creating it if missing\./,
       list: /List note paths, sizes and times/,
       edit: /fails unless it appears exactly once/,
       recent: /notes changed in N days, newest first/,
-      write: /overwrite if exists/,
       move: /Folders are derived from path\. Cannot overwrite/,
       delete: /Delete a note/,
     };
@@ -315,6 +315,8 @@ describe("write tools", () => {
     );
     const snap = await view.snapshot({ fresh: true });
     expect(Object.keys(snap.files)).toContain("Inbox/new.md");
+    // Created with exactly the text given: no leading newline, nothing else added.
+    expect(new TextDecoder().decode(await view.read(snap.files["Inbox/new.md"]))).toBe("captured\n");
   });
 
   it("carries every untouched entry through unchanged", async () => {
@@ -366,29 +368,38 @@ describe("write tools", () => {
     ).rejects.toThrow(/appears 2 times/);
   });
 
-  it("creates a new note with write", async () => {
-    const { ctx } = await context();
-    expect(await callTool("write", { path: "Fresh.md", content: "brand new\n" }, ctx)).toContain(
-      "created Fresh.md"
-    );
+  // Owner, 2026-11-03: "no write. Use append as write". Nothing on the surface can overwrite a
+  // note in one call; `append` is how a note is created. Pinned so a whole-note overwrite does
+  // not quietly come back under its old name.
+  it("has no write tool, and a call naming it is refused and commits nothing", async () => {
+    const { ctx, vault, view } = await context();
+    expect(TOOLS.map((t) => t.name)).not.toContain("write");
+    const head = vault.head;
+    const manifests = vault.manifests.size;
+    await expect(
+      callTool("write", { path: "Welcome.md", content: "replaced\n" }, ctx)
+    ).rejects.toThrow(/unknown tool "write"/);
+    expect(vault.head).toBe(head);
+    expect(vault.manifests.size).toBe(manifests);
+    const snap = await view.snapshot({ fresh: true });
+    expect(new TextDecoder().decode(await view.read(snap.files["Welcome.md"]))).toContain("# Welcome");
   });
 
-  // Filesystem semantics, owner's call 2026-08-31: `write` replaces unconditionally, like
-  // `fs.writeFile`. The version-bound overwrite this surface used to require is retired, and
-  // the trade is history within GC retention. Pinned so nobody restores the guard by accident
-  // — and so the schema cannot quietly regrow an `expected_hash` nothing reads.
-  it("replaces an existing note unconditionally, with no hash anywhere on the tool", async () => {
+  // Replacing a note is two explicit steps, never one. The schema stays hash-free, as it was
+  // under filesystem semantics (2026-08-31).
+  it("replaces a note only as delete then append", async () => {
     const { ctx, view } = await context();
-    expect(
-      await callTool("write", { path: "Welcome.md", content: "replaced\n" }, ctx)
-    ).toContain("replaced Welcome.md");
+    expect(await callTool("delete", { path: "Welcome.md" }, ctx)).toContain("deleted Welcome.md");
+    expect(await callTool("append", { path: "Welcome.md", text: "replaced\n" }, ctx)).toContain(
+      "created Welcome.md"
+    );
     const snap = await view.snapshot({ fresh: true });
     expect(new TextDecoder().decode(await view.read(snap.files["Welcome.md"]))).toBe("replaced\n");
 
-    const schema = TOOLS.find((t) => t.name === "write")!.inputSchema as {
+    const schema = TOOLS.find((t) => t.name === "append")!.inputSchema as {
       properties: Record<string, unknown>;
     };
-    expect(Object.keys(schema.properties)).toEqual(["path", "content"]);
+    expect(Object.keys(schema.properties)).toEqual(["path", "text"]);
   });
 
   it("deletes one note and leaves every other entry identical", async () => {
@@ -462,8 +473,8 @@ describe("write tools", () => {
     await expect(
       callTool("move", { from: "Welcome.md", to: "Projects" }, ctx)
     ).rejects.toThrow(/is a folder in this vault/);
-    // write turning an existing folder into a note
-    await expect(callTool("write", { path: "Projects", content: "x\n" }, ctx)).rejects.toThrow(
+    // append creating a note where a folder already is
+    await expect(callTool("append", { path: "Projects", text: "x\n" }, ctx)).rejects.toThrow(
       /is a folder in this vault/
     );
     // append below an existing note, which is the same clash from the other side
@@ -488,7 +499,7 @@ describe("write tools", () => {
 
     // Written first, so a per-op check fires on an intermediate state that never reaches R2.
     await writer.apply([
-      { kind: "write", path: "Projects", content: "now a note\n" },
+      { kind: "append", path: "Projects", text: "now a note\n" },
       { kind: "delete", path: "Projects/Roadmap.md" },
     ]);
     const after = await view.snapshot({ fresh: true });
@@ -496,7 +507,7 @@ describe("write tools", () => {
 
     // The genuinely unmaterializable batch still fails, and commits nothing.
     await expect(
-      writer.apply([{ kind: "write", path: "Projects/again.md", content: "x\n" }])
+      writer.apply([{ kind: "append", path: "Projects/again.md", text: "x\n" }])
     ).rejects.toThrow(/is a note, so/);
   });
 
@@ -647,8 +658,8 @@ describe("the agent trusts only authenticated vault state", () => {
     }
     const { vault, ctx } = await build({ "Welcome.md": "hi\n" });
     const head = vault.head;
-    await expect(callTool("write", { path: ".Obsidian/appearance.json", content: "{}" }, ctx)).rejects.toThrow();
-    await expect(callTool("write", { path: ".Obsidian/snippets/a.css", content: "a{}" }, ctx)).rejects.toThrow();
+    await expect(callTool("append", { path: ".Obsidian/appearance.json", text: "{}" }, ctx)).rejects.toThrow();
+    await expect(callTool("append", { path: ".Obsidian/snippets/a.css", text: "a{}" }, ctx)).rejects.toThrow();
     expect(vault.head).toBe(head);
   });
 });
@@ -1382,7 +1393,7 @@ describe("AGENT_DENY: paths this connector has no permission on", () => {
   it("refuses writes with its own reason, not the vault-policy one", async () => {
     const { ctx } = await denied();
     for (const [name, args] of [
-      ["write", { path: "Vault Keys/new.md", content: "x" }],
+      ["append", { path: "Vault Keys/new.md", text: "x" }],
       ["append", { path: "Vault Keys/aws.md", text: "x" }],
       ["delete", { path: "Vault Keys/aws.md" }],
       ["move", { from: "Notes/ok.md", to: "Vault Keys/moved.md" }],
@@ -1398,7 +1409,7 @@ describe("AGENT_DENY: paths this connector has no permission on", () => {
   // denied file — the same P1 the first review found for excludes.
   it("does not delete denied files when it commits an allowed one", async () => {
     const { vault, crypto, ctx } = await denied();
-    await callTool("write", { path: "Notes/second.md", content: "new\n" }, ctx);
+    await callTool("append", { path: "Notes/second.md", text: "new\n" }, ctx);
     // Read the committed manifest back through a view with NO deny list: the entries must be
     // there, byte for byte.
     const api = new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http });

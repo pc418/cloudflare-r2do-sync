@@ -17,7 +17,6 @@ import { ulid } from "./ulid";
 export type WriteOp =
   | { kind: "append"; path: string; text: string }
   | { kind: "edit"; path: string; oldText: string; newText: string; replaceAll?: boolean }
-  | { kind: "write"; path: string; content: string }
   | { kind: "delete"; path: string }
   | { kind: "move"; from: string; to: string };
 
@@ -70,15 +69,15 @@ export function refuseWrite(path: string, configDir: string): string | null {
  * server cannot catch it either: on an encrypted vault it never sees a path.
  *
  * Judged **once, on the finished map**, never per operation. A per-op check rejected
- * `write Projects` followed by `delete Projects/Roadmap.md` — a batch whose result is perfectly
+ * `append Projects` followed by `delete Projects/Roadmap.md` — a batch whose result is perfectly
  * materializable — purely because of the order the two arrived in. What is committed is the
  * only thing that has to be legal.
  *
  * Only paths the batch *introduced* are checked, so a clash already sitting in the vault from
  * some other source does not start failing every unrelated agent write.
  *
- * Found by adversarial review on `move`; it was never specific to `move`. `write` and `append`
- * reach it with one mistyped path, which is why this guards the batch rather than one case.
+ * Found by adversarial review on `move`; it was never specific to `move`. `append` reaches it
+ * with one mistyped path, which is why this guards the batch rather than one case.
  */
 function assertMaterializable(
   touched: Iterable<string>,
@@ -266,7 +265,7 @@ export class VaultWriter {
   /**
    * Applies one op to the in-progress path map and says what it did.
    *
-   * It mutates `files` itself because two of the five ops change no content at all: `delete`
+   * It mutates `files` itself because two of the four ops change no content at all: `delete`
    * removes a key and `move` renames one. Routing those through a "here is the new entry"
    * return would have needed a second shape for "and here is the key to drop", which is how a
    * map mutation ends up expressed in two places.
@@ -322,7 +321,7 @@ export class VaultWriter {
   }
 
   async #nextContent(
-    op: Extract<WriteOp, { kind: "append" | "edit" | "write" }>,
+    op: Extract<WriteOp, { kind: "append" | "edit" }>,
     files: Record<string, FileEntry>
   ): Promise<{ entry: FileEntry; bytes: Uint8Array; summary: string }> {
     const existing = files[op.path];
@@ -373,17 +372,6 @@ export class VaultWriter {
         }
         text = current.replace(op.oldText, op.newText);
         summary = `edited ${op.path}`;
-        break;
-      }
-      case "write": {
-        // Unconditional create-or-replace, like `fs.writeFile` (owner's filesystem-semantics
-        // call, 2026-08-31). The version-bound overwrite this used to require is retired for
-        // the agent surface, and the trade is stated rather than hidden: a device edit racing
-        // this write can be replaced without warning, recoverable only from snapshot history
-        // within GC retention. Sync correctness is unaffected — the CAS mini-pass around this
-        // still absorbs the live head and re-applies.
-        text = op.content;
-        summary = current === null ? `created ${op.path}` : `replaced ${op.path}`;
         break;
       }
     }

@@ -166,14 +166,15 @@ and re-add the connector.
 
 ### What it can do
 
-Read-only gives `search`, `read`, `list` and `recent`. Writable adds `append`, `edit`, `write`,
-`delete` and `move` on a second, separately revocable credential.
+Read-only gives `search`, `read`, `list` and `recent`. Writable adds `append`, `edit`, `delete`
+and `move` on a second, separately revocable credential.
 
-The write tools behave like a file system: `write` replaces a note outright, `delete` removes
-one, neither asks for confirmation, and folders come and go with the notes in them. **Your undo
-is snapshot history**, so the retention window is what a mistake costs, and recovery is done from
-the plugin — the assistant cannot do it for you. `move` is the exception to the plain-`rm`
-reading: it refuses to land on a path that already exists.
+The write tools behave like a file system, minus one-call overwrite: `append` adds to a note and
+creates it if missing, `edit` changes one exact string, and replacing a whole note is `delete`
+then `append`. `delete` asks for no confirmation, and folders come and go with the notes in
+them. **Your undo is snapshot history**, so the retention window is what a mistake costs, and
+recovery is done from the plugin — the assistant cannot do it for you. `move` is the exception
+to the plain-`rm` reading: it refuses to land on a path that already exists.
 
 Dates it reports are your vault's, not the server's — the deploy records your machine's timezone,
 so "yesterday" means what you mean.

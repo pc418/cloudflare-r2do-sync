@@ -89,7 +89,7 @@ const WRITES = (destructive: boolean): ToolAnnotations => ({
  *
  * On **every** tool, not the two entry points it started on. That guess was wrong: a session
  * can open with `recent`, `read` or `append` just as easily as with `search`, and a pointer the
- * model never loads is no pointer. Nine copies is the price of the only channel that survives,
+ * model never loads is no pointer. Eight copies is the price of the only channel that survives,
  * which is exactly why it is this short: the supersession clause was traded for brevity
  * (owner, 2026-08-31) — "first" carries the priority, and a vault with no `AGENTS.md` pays one
  * cheap filesystem-shaped "no note" answer for it.
@@ -107,7 +107,7 @@ const AGENT_NOTE_POINTER =
  * Ordered by how often a tool is reached for, and every contract inside 80 characters.
  *
  * **The order** is orientation first (`search`, `recent`, `read`, `list`), then mutation by
- * blast radius (`append`, `edit`, `write`, `move`, `delete`). Frequency is not the criterion —
+ * blast radius (`append`, `edit`, `move`, `delete`). Frequency is not the criterion —
  * first-glance value is: `recent` answers "what has this person been working on", which is the
  * question that comes *before* knowing what to search for, while `delete`/`move`/`append` are
  * reached for only once the model already knows what it is doing.
@@ -223,13 +223,15 @@ export const TOOLS: ToolDescriptor[] = [
   {
     name: "append",
     title: "Append to a note",
+    // The create path as well as the add path (owner, 2026-11-03: "no write. Use append as
+    // write"). Replacing a note is `delete` then `append`; nothing here overwrites in one call.
     description:
-      "Creating if missing." +
+      "Add to a note, creating it if missing." +
       AGENT_NOTE_POINTER,
     inputSchema: {
       type: "object",
       properties: {
-        path: str("Exact vault path. Created if missing — a typo makes a new note rather than failing."),
+        path: str("Exact vault path. A new path creates the note — a typo makes a new note rather than failing."),
         text: str("Text to append. A newline is inserted first if the note does not end with one."),
       },
       required: ["path", "text"],
@@ -256,23 +258,6 @@ export const TOOLS: ToolDescriptor[] = [
         new_text: str("Replacement text."),
       },
       required: ["path", "old_text", "new_text"],
-      additionalProperties: false,
-    },
-    annotations: WRITES(true),
-  },
-  {
-    name: "write",
-    title: "Create or replace a note",
-    description:
-      "Create a note, or overwrite if exists." +
-      AGENT_NOTE_POINTER,
-    inputSchema: {
-      type: "object",
-      properties: {
-        path: str("Exact vault path."),
-        content: str("The note's full new content."),
-      },
-      required: ["path", "content"],
       additionalProperties: false,
     },
     annotations: WRITES(true),
@@ -362,8 +347,6 @@ function writeOp(name: string, args: Record<string, unknown>): WriteOp {
         newText: asString(args, "new_text"),
         replaceAll: asBool(args, "replace_all"),
       };
-    case "write":
-      return { kind: "write", path: asString(args, "path"), content: asString(args, "content") };
     case "delete":
       return { kind: "delete", path: asString(args, "path") };
     default:
@@ -632,7 +615,6 @@ async function runTool(
 
     case "append":
     case "edit":
-    case "write":
     case "delete":
     case "move": {
       if (!ctx.writable) {

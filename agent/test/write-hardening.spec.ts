@@ -37,7 +37,7 @@ describe("a refusal must not name what the agent cannot see", () => {
       { excludes: "Credentials/**" }
     );
     // `Credentials/**` does not match the bare folder, so this passes the scope gate.
-    const err = await callTool("write", { path: "Credentials", content: "x\n" }, ctx).then(
+    const err = await callTool("append", { path: "Credentials", text: "x\n" }, ctx).then(
       () => null,
       (e: unknown) => String(e)
     );
@@ -60,7 +60,7 @@ describe("a refusal must not name what the agent cannot see", () => {
       await build(notes, undefined, "Secret.md"),
     ]) {
       // The caller's own spelling, so the real-case name can only appear if it leaked.
-      const err = await refusal(ctx, { tool: "write", args: { path: "secret.md/child.md", content: "x\n" } });
+      const err = await refusal(ctx, { tool: "append", args: { path: "secret.md/child.md", text: "x\n" } });
       expect(err).not.toBeNull();
       expect(err).toContain('"secret.md/child.md"');
       expect(err).not.toContain("Secret.md");
@@ -73,8 +73,8 @@ describe("a refusal must not name what the agent cannot see", () => {
       { "Welcome.md": "hi\n", "Hidden.md": "n\n", "Vaulted/keys.md": "k\n" },
       { excludes: "Hidden.md\nVaulted/**" }
     );
-    const asNote = await refusal(ctx, { tool: "write", args: { path: "Hidden.md/x.md", content: "x\n" } });
-    const asFolder = await refusal(ctx, { tool: "write", args: { path: "Vaulted", content: "x\n" } });
+    const asNote = await refusal(ctx, { tool: "append", args: { path: "Hidden.md/x.md", text: "x\n" } });
+    const asFolder = await refusal(ctx, { tool: "append", args: { path: "Vaulted", text: "x\n" } });
     expect(asNote?.replace('"Hidden.md/x.md"', "<path>")).toBe(asFolder?.replace('"Vaulted"', "<path>"));
   });
 
@@ -86,7 +86,7 @@ describe("a refusal must not name what the agent cannot see", () => {
     const ancestor = await refusal(ctx, { tool: "append", args: { path: "Welcome.md/child.md", text: "x\n" } });
     expect(ancestor).toMatch(/"Welcome.md" is a note, so "Welcome.md\/child.md" cannot live inside it/);
     // A folder with a visible child names that one, and never the hidden sibling.
-    const folder = await refusal(ctx, { tool: "write", args: { path: "Mixed", content: "x\n" } });
+    const folder = await refusal(ctx, { tool: "append", args: { path: "Mixed", text: "x\n" } });
     expect(folder).toMatch(/"Mixed" is a folder in this vault \(it holds "Mixed\/open.md"\)/);
     expect(folder).not.toContain("secret.md");
   });
@@ -180,7 +180,7 @@ describe("case-only note/folder clash", () => {
     const writer = new VaultWriter({ view, device: "agent" });
 
     await expect(
-      writer.apply([{ kind: "write", path: "projects/Roadmap.md", content: "x\n" }])
+      writer.apply([{ kind: "append", path: "projects/Roadmap.md", text: "x\n" }])
     ).rejects.toThrow();
   });
 });
@@ -196,7 +196,7 @@ describe("write gates ignore case; reads do not", () => {
     "privateer/log.md": "ahoy\n",
   };
   const mutations = (dir: string): { tool: string; args: Record<string, unknown> }[] => [
-    { tool: "write", args: { path: `${dir}/new.md`, content: "x\n" } },
+    { tool: "append", args: { path: `${dir}/new.md`, text: "x\n" } },
     { tool: "append", args: { path: `${dir}/old.md`, text: "x\n" } },
     { tool: "edit", args: { path: `${dir}/old.md`, old_text: "legacy", new_text: "changed" } },
     { tool: "delete", args: { path: `${dir}/old.md` } },
@@ -215,7 +215,7 @@ describe("write gates ignore case; reads do not", () => {
         await expect(callTool(op.tool, op.args, ctx), `${op.tool} ${JSON.stringify(op.args)}`).rejects.toThrow(refusal);
       }
       await expect(
-        callTool("write", { path: "private/x.md", content: "x\n" }, ctx)
+        callTool("append", { path: "private/x.md", text: "x\n" }, ctx)
       ).rejects.toThrow(refusal);
       const after = await view.snapshot({ fresh: true });
       expect(after.all).toEqual(before.all);
@@ -225,7 +225,7 @@ describe("write gates ignore case; reads do not", () => {
       await expect(callTool("read", { path: "Credentials/keys.md" }, ctx)).rejects.toThrow(/no note at/);
 
       // Segment boundaries hold: `Private/**` does not reach `privateer/`.
-      await callTool("write", { path: "privateer/new.md", content: "fine\n" }, ctx);
+      await callTool("append", { path: "privateer/new.md", text: "fine\n" }, ctx);
       await callTool("append", { path: "privateer/log.md", text: "more\n" }, ctx);
       const done = await view.snapshot({ fresh: true });
       expect(Object.keys(done.files)).toContain("privateer/new.md");
