@@ -196,6 +196,70 @@ describe("search index", () => {
     });
   });
 
+  /** Serves `contents`, but holds the fetch of `held` open until `release()` is called. */
+  function heldReader(contents: Record<string, string>, held: string) {
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const reached = new Promise<void>((resolve) => (started = resolve));
+    const reader: BlobReader = {
+      read: async (e: FileEntry) => {
+        if (e.h === held) {
+          started();
+          await gate;
+        }
+        return new TextEncoder().encode(contents[e.h] ?? "");
+      },
+    };
+    return { reader, release, reached };
+  }
+
+  // The interleaving: one head, the policy narrows while a build under the wider one is
+  // waiting on a blob, and a newer build under the narrow one finishes first.
+  it("never lets a build superseded mid-fetch insert an excluded row or stamp the head", async () => {
+    await withIndex(async (index) => {
+      // The excluded note is the newest, so the old build fetches it first and is held there.
+      const wide = {
+        "Secret.md": entry("hs", { mtime: 2_000_000_000_000 }),
+        "Welcome.md": entry("hw"),
+      };
+      const narrow = { "Welcome.md": entry("hw") };
+      const contents = { hs: "meet the informant\n", hw: "welcome\n" };
+      const old = heldReader(contents, "hs");
+
+      const superseded = index.catchUp(old.reader, k("H", "P1"), wide);
+      await old.reached;
+      expect(await index.catchUp(reader(contents), k("H", "P2"), narrow)).toBe(true);
+      old.release();
+
+      const finished = await superseded;
+      expect(index.query("informant", { maxResults: 10 }).hits).toEqual([]);
+      expect(finished).toBe(false);
+      expect(index.status().rows).toBe(1);
+      expect(index.isCurrent(k("H", "P2"))).toBe(true);
+      expect(index.isCurrent(k("H", "P1"))).toBe(false);
+      // The sweep that runs after every tool keeps the P2 rows, and still nothing excluded.
+      index.retainPolicy("P2");
+      expect(index.query("informant", { maxResults: 10 }).hits).toEqual([]);
+    });
+  });
+
+  it("never lets a build in flight across a drop write anything afterwards", async () => {
+    await withIndex(async (index) => {
+      const files = { "Secret.md": entry("hs", { mtime: 2_000_000_000_000 }), "Welcome.md": entry("hw") };
+      const held = heldReader({ hs: "meet the informant\n", hw: "welcome\n" }, "hs");
+      const inFlight = index.catchUp(held.reader, k("H", "P1"), files);
+      await held.reached;
+      // Another tool saw the policy move to P2; no build of its own, just the sweep.
+      index.retainPolicy("P2");
+      held.release();
+
+      const finished = await inFlight;
+      expect(index.status()).toEqual({ head: null, rows: 0, pending: 0 });
+      expect(finished).toBe(false);
+    });
+  });
+
   it("reports how many notes it still owes the current snapshot", async () => {
     await withIndex(async (index) => {
       const files = { "a.md": entry("h1"), "b.md": entry("h2") };

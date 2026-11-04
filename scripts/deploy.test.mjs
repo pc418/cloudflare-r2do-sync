@@ -586,6 +586,31 @@ test("agent deployment and script names are validated at the option boundary", a
   assert.throws(() => agentTarget(parseArgs(["--vault", LIVE]), base), /pass --live/);
 });
 
+test("no spelling of live reaches production without --live", async () => {
+  const { agentTarget, parseArgs } = await import("./deploy-agent.mjs");
+  const base = { scriptName: "obsidian-r2do-sync", bucket: "obsidian-r2do-sync" };
+  for (const spelling of [" live ", "live\n", "\tlive", "LIVE", " Live "]) {
+    const refused = (fn) => {
+      let result;
+      try {
+        result = fn();
+      } catch (error) {
+        return String(error);
+      }
+      return `accepted as ${JSON.stringify(result)}`;
+    };
+    // Refused by the live guard (normalised) or by the name rule (case) — never accepted.
+    const asVault = refused(() => agentTarget(parseArgs(["--vault", spelling]), base));
+    assert.match(asVault, /pass --live|invalid deployment name/, `--vault ${JSON.stringify(spelling)}: ${asVault}`);
+    const asName = refused(() => agentTarget({ vault: "obsidian-agent-dummy", name: spelling }, base));
+    assert.match(asName, /pass --live|invalid deployment name/, `--name ${JSON.stringify(spelling)}: ${asName}`);
+  }
+  // The trimmed spellings specifically meet the live guard, not an incidental shape refusal.
+  assert.throws(() => agentTarget({ vault: " live " }, base), /names the production deployment/);
+  assert.throws(() => agentTarget({ vault: "live\n" }, base), /names the production deployment/);
+  assert.throws(() => agentTarget({ vault: "obsidian-agent-dummy", name: " live " }, base), /names the production deployment/);
+});
+
 test("a rejected agent name touches nothing: no file, no lock, no request", async () => {
   const { deployAgent } = await import("./deploy-agent.mjs");
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");

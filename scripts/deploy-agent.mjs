@@ -359,12 +359,23 @@ export function agentTarget({ vault, live = false, name = null }, base = loadWor
   if (live === true) {
     if (vault !== LIVE) throw new Error("--live and --vault name different deployments; pass one");
     target = LIVE;
-  } else if (vault === LIVE) {
-    throw new Error(`"${LIVE}" names the production deployment; pass --live to mean it`);
   } else {
-    target = parseDeploymentName(vault, base);
+    target = notLive(parseDeploymentName(vault, base), "--vault");
   }
-  return { vault: target, name: name === null || name === undefined ? null : parseDeploymentName(name, base) };
+  const script = name === null || name === undefined ? null : notLive(parseDeploymentName(name, base), "--name");
+  return { vault: target, name: script };
+}
+
+/**
+ * Judged on the value `parseDeploymentName` returned — trimmed, so `" live "` or `"live\n"`
+ * arrives here as `live` — and case-folded in case that rule ever loosens. Only `--live` may
+ * name production; anywhere else the word would quietly select production's `.env`.
+ */
+function notLive(normalised, option) {
+  if (normalised.toLowerCase() === LIVE) {
+    throw new Error(`${option} "${normalised}" names the production deployment; pass --live to mean it`);
+  }
+  return normalised;
 }
 
 export async function deployAgent(opts) {

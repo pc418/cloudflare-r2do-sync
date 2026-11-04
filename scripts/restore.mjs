@@ -335,6 +335,20 @@ export function legacyV2Requested(argv = process.argv) {
 const HASH_RE = /^[0-9a-f]{64}$/;
 
 /**
+ * The snapshot served must be the one asked for, whatever its format. Checked before the mode
+ * is decided, so it holds for v1 as much as v2/v3: a plaintext restore has nothing else binding
+ * the manifest to the id the operator named with `--head`, and restoring snapshot B as A is a
+ * silent substitution even when every byte of B is genuine.
+ */
+export function assertServedSnapshot(manifest, requested) {
+  const served = typeof manifest === "object" && manifest !== null ? manifest.id : undefined;
+  if (typeof served !== "string" || served !== requested) {
+    throw new Error(`invalid snapshot from server: asked for snapshot ${requested}, got ${JSON.stringify(served)}`);
+  }
+  return manifest;
+}
+
+/**
  * Checks an encrypted snapshot's envelope and opens its path map, before anything is written.
  *
  * The key must be the one the snapshot names (a wrong key is refused here, whatever flags were
@@ -437,7 +451,7 @@ async function main() {
     console.error("remote vault has no head — nothing to restore");
     process.exit(1);
   }
-  const manifest = await api(`/api/manifests/${head}`);
+  const manifest = assertServedSnapshot(await api(`/api/manifests/${head}`), head);
   console.log(`restoring snapshot ${head} (v${manifest.v}, ${manifest.device}, ${manifest.createdAt})`);
 
   let files;

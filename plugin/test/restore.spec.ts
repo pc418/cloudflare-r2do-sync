@@ -490,6 +490,41 @@ describe("restore.mjs encrypted head integrity", () => {
   });
 });
 
+describe("restore.mjs restores the snapshot it asked for, in every mode", () => {
+  it("refuses a plaintext (v1) manifest served under another id, by --head or by the head pointer", async () => {
+    const content = bytes("genuine but different\n");
+    const h = await sha256Hex(content);
+    const A = "01JAAAAAAAAAAAAAAAAAAAAAAA";
+    const B = "01JBBBBBBBBBBBBBBBBBBBBBBB";
+    const v1 = (id: string) =>
+      JSON.stringify({
+        v: 1, id, parent: null, device: "laptop", createdAt: "2026-11-01T00:00:00.000Z",
+        files: { "note.md": { h, size: content.length, mtime: 1 } },
+      });
+    const routes: Served = {
+      "/api/head": JSON.stringify({ head: A }),
+      [`/api/manifests/${A}`]: v1(B),
+      [`/api/blobs/${h}`]: content,
+    };
+    await withRestoreServer(routes, async (run, out) => {
+      for (const extra of [["--plaintext", "--head", A], ["--plaintext"]]) {
+        const result = await run({}, extra);
+        expect(result.code, extra.join(" ")).not.toBe(0);
+        expect(result.stderr).toMatch(new RegExp(`asked for snapshot ${A}, got "${B}"`));
+        await expect(readFile(path.join(out, "note.md"))).rejects.toThrow();
+      }
+    });
+
+    // Control: the same snapshot served under its own id restores.
+    await withRestoreServer({ ...routes, [`/api/manifests/${A}`]: v1(A) }, async (run, out) => {
+      const result = await run({}, ["--plaintext", "--head", A]);
+      expect(result.stderr).toBe("");
+      expect(result.code).toBe(0);
+      expect(text(await readFile(path.join(out, "note.md")))).toBe(text(content));
+    });
+  });
+});
+
 describe("restore.mjs path safety", () => {
   it("accepts ordinary vault paths", () => {
     expect(restore.assertSafePath("daily/2026-08-03.md")).toBe("daily/2026-08-03.md");

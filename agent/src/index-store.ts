@@ -87,7 +87,30 @@ export class SearchIndex {
   /** Forgets everything. The next search rebuilds; nothing is lost because nothing is only here. */
   drop(): void {
     this.#sql.exec("DELETE FROM notes");
-    this.#sql.exec("DELETE FROM index_meta");
+    // Everything but the build generation, which keeps counting up across a drop — and moves on
+    // here too, so a build in flight when the index was dropped (by a policy change seen from
+    // any tool) cannot write its now-excluded rows back afterwards.
+    this.#sql.exec("DELETE FROM index_meta WHERE k <> 'generation'");
+    this.#claimGeneration();
+  }
+
+  /**
+   * Claims the index for one build, superseding every build still in flight.
+   *
+   * A catch-up awaits blob fetches, and a Durable Object's input gate opens across them, so a
+   * second search can run its own catch-up meanwhile — under a policy that has since narrowed.
+   * Each build takes a new generation and writes only while it still holds the latest one, so
+   * an older build resuming after the newer one recorded its policy can neither insert a row the
+   * new policy excludes nor stamp the head.
+   */
+  #claimGeneration(): string {
+    const next = String(Number(this.#meta("generation") ?? "0") + 1);
+    this.#setMeta("generation", next);
+    return next;
+  }
+
+  #holds(generation: string): boolean {
+    return this.#meta("generation") === generation;
   }
 
   /**
@@ -143,6 +166,7 @@ export class SearchIndex {
     // policy is recorded before the first row so no row ever exists without one.
     this.retainPolicy(key.policy);
     this.#setMeta("policy", key.policy);
+    const generation = this.#claimGeneration();
     const budget = Math.max(0, Math.min(opts.budget ?? INDEX_CHUNK, INDEX_CHUNK));
     // Paths that left the vault, or stopped being indexable, go first: it is cheap and keeps a
     // deleted note from answering a later search.
@@ -153,23 +177,23 @@ export class SearchIndex {
 
     const outstanding = this.#outstanding(files);
     for (const path of outstanding.slice(0, budget)) {
+      let text: string;
       try {
-        const text = new TextDecoder().decode(await view.read(files[path]));
-        this.#sql.exec(
-          "INSERT OR REPLACE INTO notes (path, hash, content) VALUES (?, ?, ?)",
-          path,
-          files[path].h,
-          text
-        );
+        text = new TextDecoder().decode(await view.read(files[path]));
       } catch {
         // One unreadable blob must not stall the whole build forever. Record the hash with
         // empty content so the path stops being outstanding; a later edit re-reads it.
-        this.#sql.exec(
-          "INSERT OR REPLACE INTO notes (path, hash, content) VALUES (?, ?, '')",
-          path,
-          files[path].h
-        );
+        text = "";
       }
+      // The only await is above: from here to the next one nothing can interleave, so this
+      // check covers the insert, and the last one covers the head stamp below.
+      if (!this.#holds(generation)) return false;
+      this.#sql.exec(
+        "INSERT OR REPLACE INTO notes (path, hash, content) VALUES (?, ?, ?)",
+        path,
+        files[path].h,
+        text
+      );
     }
 
     const complete = outstanding.length <= budget;
