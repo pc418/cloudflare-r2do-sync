@@ -44,6 +44,57 @@ export class VaultError extends Error {}
 const nfc = (text: string): string => text.normalize("NFC");
 
 /**
+ * Case-folded, for the **write** gates only. The default filesystems on macOS, iOS and Windows
+ * are case-insensitive, so a note written as `credentials/new.md` lands inside a denied or
+ * excluded `Credentials/` folder there. Folding both the glob and the path keeps segment
+ * boundaries (`private/**` still cannot match `privateer/x`), and the folded check is only ever
+ * added to the exact one, so it can refuse more and never permit more.
+ */
+const fold = (text: string): string => nfc(text).toLowerCase();
+
+/** `makeExcluder` over folded globs and a folded path. */
+function foldedExcluder(globs: string[]): (path: string) => boolean {
+  const match = makeExcluder(globs.map(fold));
+  return (path) => match(fold(path));
+}
+
+/**
+ * What this agent has durably learned about its vault, kept in the Durable Object's storage so
+ * it survives an isolate restart and a redeploy.
+ *
+ * One fact today: an authenticated (v3) shared policy has been read for this vault. After that,
+ * a missing settings document or an unauthenticated v2 one is not "no policy" — only a server or
+ * R2 operator can make a published document disappear, and falling back would drop every exclude.
+ */
+export interface VaultMarks {
+  /** Read from storage at the moment of each decision, never cached in memory. */
+  authenticatedPolicySeen(): boolean;
+  /** Persisted before the policy it records is used. */
+  markAuthenticatedPolicy(): void;
+}
+
+/** `VaultMarks` over a Durable Object's SQLite, scoped to one vault. */
+export class StoredVaultMarks implements VaultMarks {
+  readonly #sql: SqlStorage;
+  readonly #key: string;
+
+  /** `scope` names the vault (its server and key id), so re-pointing a deployment starts clean. */
+  constructor(sql: SqlStorage, scope: string) {
+    this.#sql = sql;
+    this.#key = `authenticated-policy ${scope}`;
+    this.#sql.exec("CREATE TABLE IF NOT EXISTS vault_marks (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
+  }
+
+  authenticatedPolicySeen(): boolean {
+    return this.#sql.exec("SELECT 1 FROM vault_marks WHERE k = ?", this.#key).toArray().length > 0;
+  }
+
+  markAuthenticatedPolicy(): void {
+    this.#sql.exec("INSERT OR IGNORE INTO vault_marks (k, v) VALUES (?, '1')", this.#key);
+  }
+}
+
+/**
  * The largest note this connector will materialise, in bytes.
  *
  * Not a product limit — a memory one. A note is buffered as ciphertext, decrypted, decoded to
@@ -97,6 +148,15 @@ function globList(value: unknown, field: string): string[] {
   return parseGlobs(value);
 }
 
+/** One read of the shared policy. */
+interface Policy {
+  rev: number;
+  fingerprint: string;
+  scope: (path: string) => boolean;
+  /** The policy's excludes, case-folded, for the write gate. */
+  excludedIgnoringCase: (path: string) => boolean;
+}
+
 export interface Snapshot {
   head: string;
   /**
@@ -114,6 +174,11 @@ export interface Snapshot {
    * not exist" and replaces carried content with nothing. One policy per attempt, or none.
    */
   inScope: (path: string) => boolean;
+  /**
+   * Whether the vault's excludes cover this path *ignoring case*. The write gate adds this to
+   * `inScope`; reads do not use it. From the same policy as `inScope`.
+   */
+  excludedIgnoringCase: (path: string) => boolean;
   /** In-scope paths: what the tools may see. */
   files: Record<string, FileEntry>;
   /**
@@ -162,8 +227,11 @@ export class VaultView {
    * excluding a folder from sync, which would stop it reaching the owner's own devices.
    */
   readonly #denied: (path: string) => boolean;
+  /** The same list, case-folded; consulted by the write gate only. */
+  readonly #deniedIgnoringCase: (path: string) => boolean;
   /** Part of the policy fingerprint, so narrowing the list invalidates caches built under it. */
   readonly #denyMark: string;
+  readonly #marks: VaultMarks | null;
   #cached: Snapshot | null = null;
 
   /**
@@ -174,7 +242,7 @@ export class VaultView {
    * moved would keep exposing a folder the owner had just excluded — indefinitely, since the
    * Durable Object outlives the request.
    */
-  #policy: { rev: number; fingerprint: string; scope: (path: string) => boolean } | null = null;
+  #policy: Policy | null = null;
 
   constructor(opts: {
     api: SyncApi;
@@ -183,6 +251,8 @@ export class VaultView {
     configDir?: string;
     /** Glob list, same syntax as the policy's `excludes`. Absent means no rule. */
     deny?: string;
+    /** Durable facts about this vault. Absent (tests, tools) means nothing is remembered. */
+    marks?: VaultMarks | null;
   }) {
     this.#api = opts.api;
     this.#writeApi = opts.writeApi ?? null;
@@ -195,12 +265,27 @@ export class VaultView {
     const globs = denyGlobs(opts.deny).map(nfc);
     const match = makeExcluder(globs);
     this.#denied = (path) => match(nfc(path));
+    this.#deniedIgnoringCase = foldedExcluder(globs);
     this.#denyMark = globs.join("\u0000");
+    this.#marks = opts.marks ?? null;
   }
 
   /** Whether the agent's own deny list covers this path, regardless of the vault's policy. */
   denied(path: string): boolean {
     return this.#denied(path);
+  }
+
+  /** The write gate's question: denied exactly, or denied in any case. Reads use `denied`. */
+  deniedForWrite(path: string): boolean {
+    return this.#denied(path) || this.#deniedIgnoringCase(path);
+  }
+
+  /**
+   * The fingerprint of the policy this view last read, or `null` before any. The search index
+   * compares it with the policy its rows were built under and drops them when it moved.
+   */
+  get policyFingerprint(): string | null {
+    return this.#policy?.fingerprint ?? null;
   }
 
   get configDir(): string {
@@ -253,7 +338,7 @@ export class VaultView {
    * a 401 or a 5xx as "no excludes" would open the vault wide exactly when something is wrong —
    * so it propagates.
    */
-  async #policyNow(): Promise<{ rev: number; fingerprint: string; scope: (path: string) => boolean }> {
+  async #policyNow(): Promise<Policy> {
     let raw: unknown;
     try {
       raw = await this.#api.getSettingsDoc();
@@ -263,6 +348,13 @@ export class VaultView {
     }
 
     if (raw === null || raw === undefined) {
+      // A vault that never published a policy has none; one whose authenticated policy this
+      // agent has already read did not lose it — only the server or R2 can make it vanish.
+      if (this.#marks?.authenticatedPolicySeen() === true) {
+        throw new VaultError(
+          "the shared settings document is missing, but an authenticated policy for this vault was read before; refusing to fall back to no restrictions"
+        );
+      }
       const fingerprint = `none:${this.#configDir}:${this.#denyMark}`;
       if (this.#policy?.fingerprint !== fingerprint) {
         this.#policy = {
@@ -276,6 +368,7 @@ export class VaultView {
               configDir: this.#configDir,
             })
           ),
+          excludedIgnoringCase: () => false,
         };
       }
       return this.#policy;
@@ -291,6 +384,14 @@ export class VaultView {
     if (raw.v === 1) {
       throw new VaultError(
         "the shared settings document is unencrypted, but this vault is encrypted; refusing to take its scope rules from it"
+      );
+    }
+    // Also before the cache. v2 encrypts but does not bind its header, so once a v3 policy has
+    // been read for this vault a v2 document is a replay or a downgrade, not an edit: every
+    // device that writes v3 settings keeps writing v3. A vault that never had v3 is unaffected.
+    if (raw.v === 2 && this.#marks?.authenticatedPolicySeen() === true) {
+      throw new VaultError(
+        "the shared settings document uses the legacy v2 format, but an authenticated policy for this vault was read before; refusing to take its scope rules from it"
       );
     }
     const rev = raw.rev ?? 0;
@@ -311,15 +412,19 @@ export class VaultView {
         : undefined
     );
 
+    const excludes = globList(plain.excludes, "excludes");
     const scope = this.#withDeny(
       makeScopeFilter({
-        excludes: globList(plain.excludes, "excludes"),
+        excludes,
         onlyPaths: globList(plain.onlyPaths, "onlyPaths"),
         syncConfigDir: false,
         configDir: this.#configDir,
       })
     );
-    this.#policy = { rev, fingerprint, scope };
+    // Only now — authenticated *and* understood — and before the policy is used, so a refusal
+    // after a restart never depends on this isolate having been the one that read it.
+    if (raw.v === 3) this.#marks?.markAuthenticatedPolicy();
+    this.#policy = { rev, fingerprint, scope, excludedIgnoringCase: foldedExcluder(excludes) };
     return this.#policy;
   }
 
@@ -346,6 +451,7 @@ export class VaultView {
     const manifest = await this.#api.getManifest(head);
     const all = await this.#decryptPathMap(manifest);
     const inScope = policy.scope;
+    const excludedIgnoringCase = policy.excludedIgnoringCase;
 
     // The reading side of the sync policy. `all` keeps everything, because a commit must carry
     // it; `files` is what the tools may look at.
@@ -356,7 +462,7 @@ export class VaultView {
       else hidden++;
     }
 
-    this.#cached = { head, policy: policy.fingerprint, inScope, files, all, hidden };
+    this.#cached = { head, policy: policy.fingerprint, inScope, excludedIgnoringCase, files, all, hidden };
     return this.#cached;
   }
 

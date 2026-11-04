@@ -502,10 +502,19 @@ node scripts/restore.mjs --out ./restored              # current head
 node scripts/restore.mjs --out ./restored --head <manifest-id>
 node scripts/restore.mjs --out ./restored --passphrase --salt <public-vault-salt>
 node scripts/restore.mjs --out ./restored --plaintext    # an unencrypted vault only
+node scripts/restore.mjs --out ./restored --legacy-v2    # accept an unauthenticated v2 head
 ```
 
 An unencrypted vault needs `--plaintext`, and a snapshot that is unencrypted while you supplied
 a key is refused: an encrypted vault's devices never write one, so it is not yours to trust.
+
+An encrypted snapshot must name your key, be the snapshot asked for, and — for the current (v3)
+format — authenticate its header, so an altered id, parent, device, time or blob set is refused
+before anything is written. An older v2 snapshot has no authenticated header and is refused
+unless you pass `--legacy-v2`; that flag never relaxes a wrong key or a failed v3 check. Restore
+keeps no history of its own, so it cannot tell an old snapshot from the current one: a server
+can still hand you an authentic earlier snapshot as the head. Pass `--head` with an id you know
+when that matters.
 
 It prompts for the access token and master key (or reads `ACCESS_TOKEN` / `MASTER_KEY`), so
 neither lands in shell history. It re-implements the crypto independently on purpose, and a

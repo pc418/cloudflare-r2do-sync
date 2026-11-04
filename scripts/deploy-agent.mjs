@@ -18,6 +18,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  cloudflareFailure,
   fingerprint,
   handoffPath,
   loadEnvFile,
@@ -27,6 +28,7 @@ import {
   withDeployLock,
   writeHandoff,
 } from "./setup-lib.mjs";
+import { loadWorkerDeployConfig, parseDeploymentName } from "./worker-config.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const AGENT_DIR = path.join(ROOT, "agent");
@@ -100,7 +102,7 @@ const USAGE = `usage: node scripts/deploy-agent.mjs --vault <name> [--writable] 
 The agent is a SEPARATE Worker holding the vault master key. Deploying it against a vault
 whose own credentials are not in .env.<vault> is refused.`;
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const opts = { vault: null, live: false, writable: false, rotateBearer: false, rotateTokens: false, name: null, deny: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -341,8 +343,34 @@ export function retirementPlan(agentEnv, minted, opts = {}) {
   return [...new Set(ids)].filter((id) => !active.has(id));
 }
 
+/**
+ * Validates the deployment and script names at the option boundary, before either names a file
+ * (`.env.agent.<vault>`, `.env.<vault>`, the master-key file, the handover file and its lock) or
+ * a REST path, and before anything is minted or revoked.
+ *
+ * Both go through `parseDeploymentName`, so they get the same shape rule and the same refusals
+ * a vault deploy does (the default deployment's own names, the unrelated bucket, the sandbox
+ * marker). `live` is the one name that rule does not cover: it is the production sentinel, and
+ * it is accepted only from `--live`. A `--vault live` — or a named vault called "live" arriving
+ * from `deploy.mjs --agent` — would otherwise be read as production.
+ */
+export function agentTarget({ vault, live = false, name = null }, base = loadWorkerDeployConfig()) {
+  let target;
+  if (live === true) {
+    if (vault !== LIVE) throw new Error("--live and --vault name different deployments; pass one");
+    target = LIVE;
+  } else if (vault === LIVE) {
+    throw new Error(`"${LIVE}" names the production deployment; pass --live to mean it`);
+  } else {
+    target = parseDeploymentName(vault, base);
+  }
+  return { vault: target, name: name === null || name === undefined ? null : parseDeploymentName(name, base) };
+}
+
 export async function deployAgent(opts) {
-  return withDeployLock(ROOT, opts.vault, () => deployAgentLocked(opts));
+  const target = agentTarget(opts);
+  const checked = { ...opts, vault: target.vault, name: target.name };
+  return withDeployLock(ROOT, checked.vault, () => deployAgentLocked(checked));
 }
 
 async function deployAgentLocked(opts) {
@@ -432,7 +460,9 @@ async function deployAgentLocked(opts) {
     );
   }
 
-  const API = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}`;
+  const API = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(ACCOUNT_ID)}`;
+  // Every REST path component that came from a file or an option, encoded on its own.
+  const SCRIPT = encodeURIComponent(scriptName);
   const cf = async (pathname, init = {}) => {
     const res = await fetch(`${API}${pathname}`, {
       ...init,
@@ -449,8 +479,9 @@ async function deployAgentLocked(opts) {
     }
     return { status: res.status, body };
   };
+  // Status and `errors[]` only — never the raw response: see `cloudflareFailure`.
   const fail = (step, detail) => {
-    throw new Error(`FAIL [${step}]: ${JSON.stringify(detail, null, 2)}`);
+    throw cloudflareFailure(step, detail);
   };
 
   log(`agent "${scriptName}" for vault "${vault}" (${SYNC_URL})`);
@@ -465,7 +496,7 @@ async function deployAgentLocked(opts) {
   // The upload is a PUT: against a name somebody else owns it would replace that Worker's
   // code and bindings. A recorded URL from a previous deploy is proof this name is ours.
   if (!agentEnv.AGENT_URL) {
-    const existing = await cf(`/workers/scripts/${scriptName}/settings`);
+    const existing = await cf(`/workers/scripts/${SCRIPT}/settings`);
     if (existing.status === 200) {
       throw new Error(
         `a Worker named "${scriptName}" already exists on this account, and ${agentEnvName} has no\n` +
@@ -489,7 +520,7 @@ async function deployAgentLocked(opts) {
   const tokenIdOf = (token) => token.tokenId ?? token.id ?? "";
 
   const revoke = async (id) => {
-    const res = await fetch(`${SYNC_URL.replace(/\/$/, "")}/api/tokens/${id}`, {
+    const res = await fetch(`${SYNC_URL.replace(/\/$/, "")}/api/tokens/${encodeURIComponent(id)}`, {
       method: "DELETE",
       headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
     });
@@ -531,7 +562,7 @@ async function deployAgentLocked(opts) {
     // over an agent that cannot write. Asking the platform also covers the day the
     // never-deletes-a-secret behaviour stops being true: the binding is simply absent, and this
     // mints rather than deploying a tokenless agent.
-    const live = await cf(`/workers/scripts/${scriptName}/secrets`);
+    const live = await cf(`/workers/scripts/${SCRIPT}/secrets`);
     const present = new Set(
       live.status === 200 ? (live.body?.result ?? []).map((secret) => secret.name) : []
     );
@@ -640,7 +671,7 @@ async function deployAgentLocked(opts) {
       const form = new FormData();
       form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
       form.append("worker.js", new Blob([bundled], { type: "application/javascript+module" }), "worker.js");
-      return cf(`/workers/scripts/${scriptName}`, { method: "PUT", body: form });
+      return cf(`/workers/scripts/${SCRIPT}`, { method: "PUT", body: form });
     };
 
     log("uploading script...");
@@ -657,7 +688,7 @@ async function deployAgentLocked(opts) {
     // the downgrade has to be performed, not merely not-declared. Loud on failure: the wrong
     // outcome here is an agent that can still write when the operator asked that it could not.
     if (!opts.writable) {
-      const dropped = await cf(`/workers/scripts/${scriptName}/secrets/SYNC_WRITE_TOKEN`, {
+      const dropped = await cf(`/workers/scripts/${SCRIPT}/secrets/SYNC_WRITE_TOKEN`, {
         method: "DELETE",
       });
       if (dropped.status !== 200 && dropped.status !== 204 && dropped.status !== 404) {
@@ -670,7 +701,7 @@ async function deployAgentLocked(opts) {
     const subdomain = sub.body?.result?.subdomain;
     if (!subdomain) fail("subdomain", sub);
 
-    const enable = await cf(`/workers/scripts/${scriptName}/subdomain`, {
+    const enable = await cf(`/workers/scripts/${SCRIPT}/subdomain`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ enabled: true, previews_enabled: false }),

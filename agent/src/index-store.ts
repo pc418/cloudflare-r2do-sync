@@ -41,6 +41,16 @@ export type BlobReader = { read(entry: FileEntry): Promise<Uint8Array> };
  */
 export const INDEX_CHUNK = 25;
 
+/**
+ * What an index describes: one snapshot (`head`) seen under one policy (`policy`, the view's
+ * fingerprint). Kept as two fields, never one joined string, so "same policy" is a comparison of
+ * the policy itself and cannot be confused by a separator inside a glob.
+ */
+export interface IndexKey {
+  head: string;
+  policy: string;
+}
+
 export interface IndexStatus {
   /** The head the index fully describes, or null while it is still catching up. */
   head: string | null;
@@ -80,8 +90,27 @@ export class SearchIndex {
     this.#sql.exec("DELETE FROM index_meta");
   }
 
+  /**
+   * Drops every row unless it was built under exactly this policy.
+   *
+   * Rows from another policy are never *served* — `isCurrent` checks the policy too — but they
+   * are plaintext of notes the owner may just have excluded (or a redeploy denied), and they
+   * would otherwise sit here until a search happened to catch up past them. An index with rows
+   * and no recorded policy predates this record, so its policy is unknown and it goes too.
+   */
+  retainPolicy(policy: string): void {
+    const stored = this.#meta("policy");
+    if (stored === policy) return;
+    if (stored === null && this.#rowCount() === 0) return;
+    this.drop();
+  }
+
+  #rowCount(): number {
+    return this.#sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM notes").toArray()[0]?.n ?? 0;
+  }
+
   status(files?: Record<string, FileEntry>): IndexStatus {
-    const rows = this.#sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM notes").toArray()[0]?.n ?? 0;
+    const rows = this.#rowCount();
     const pending = files === undefined ? 0 : this.#outstanding(files).length;
     return { head: this.#meta("head"), rows, pending };
   }
@@ -106,10 +135,14 @@ export class SearchIndex {
    */
   async catchUp(
     view: BlobReader,
-    key: string,
+    key: IndexKey,
     files: Record<string, FileEntry>,
     opts: { budget?: number } = {}
   ): Promise<boolean> {
+    // Before anything is read or written: rows from another policy are not reused, and the
+    // policy is recorded before the first row so no row ever exists without one.
+    this.retainPolicy(key.policy);
+    this.#setMeta("policy", key.policy);
     const budget = Math.max(0, Math.min(opts.budget ?? INDEX_CHUNK, INDEX_CHUNK));
     // Paths that left the vault, or stopped being indexable, go first: it is cheap and keeps a
     // deleted note from answering a later search.
@@ -140,7 +173,7 @@ export class SearchIndex {
     }
 
     const complete = outstanding.length <= budget;
-    this.#setMeta("head", complete ? key : null);
+    this.#setMeta("head", complete ? key.head : null);
     return complete;
   }
 
@@ -151,8 +184,8 @@ export class SearchIndex {
    * changes which notes may be searched without moving the head, and an index keyed on the
    * head would go on answering with rows the owner has just put out of scope.
    */
-  isCurrent(key: string): boolean {
-    return this.#meta("head") === key;
+  isCurrent(key: IndexKey): boolean {
+    return this.#meta("policy") === key.policy && this.#meta("head") === key.head;
   }
 
   /**
@@ -199,7 +232,7 @@ export class SearchIndex {
       }
     }
 
-    const total = this.#sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM notes").toArray()[0]?.n ?? 0;
+    const total = this.#rowCount();
     return { hits, scanned: total, spent: 0, candidates: matchedFiles, more, source: "index" };
   }
 }

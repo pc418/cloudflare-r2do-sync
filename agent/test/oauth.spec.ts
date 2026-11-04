@@ -380,6 +380,123 @@ describe("token", () => {
   });
 });
 
+describe("where the code goes (consent page) and who sent it (RFC 9207)", () => {
+  const metadataIssuer = async (): Promise<string> => {
+    const res = await SELF.fetch(`${ORIGIN}/.well-known/oauth-authorization-server`);
+    const body = await res.json<{ issuer: string; authorization_response_iss_parameter_supported?: boolean }>();
+    expect(body.authorization_response_iss_parameter_supported).toBe(true);
+    return body.issuer;
+  };
+
+  const register = async (client_name: unknown, redirect = REDIRECT): Promise<string> => {
+    const res = await SELF.fetch(`${ORIGIN}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name, redirect_uris: [redirect] }),
+    });
+    expect(res.status).toBe(201);
+    return (await res.json<{ client_id: string }>()).client_id;
+  };
+
+  const shown = (html: string, cls: string): string | null =>
+    new RegExp(`<strong class="${cls}">([^<]*)</strong>`).exec(html)?.[1] ?? null;
+
+  it("advertises the iss parameter, and a granted code carries exactly the metadata issuer", async () => {
+    const issuer = await metadataIssuer();
+    const challenge = await challengeFor(VERIFIER);
+    const granted = await form("/oauth/authorize", {
+      redirect_uri: REDIRECT,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "opaque-state",
+      token: BEARER,
+    });
+    expect(granted.status).toBe(302);
+    const back = new URL(granted.headers.get("location") ?? "");
+    expect(back.searchParams.get("iss")).toBe(issuer);
+    expect(back.searchParams.get("state")).toBe("opaque-state");
+    expect(back.searchParams.get("code")).not.toBeNull();
+  });
+
+  it("a denial goes back to the validated redirect with access_denied, state and iss, and no code", async () => {
+    const issuer = await metadataIssuer();
+    const challenge = await challengeFor(VERIFIER);
+    const denied = await form("/oauth/authorize", {
+      redirect_uri: REDIRECT,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "opaque-state",
+      decision: "deny",
+    });
+    expect(denied.status).toBe(302);
+    const back = new URL(denied.headers.get("location") ?? "");
+    expect(`${back.origin}${back.pathname}`).toBe(REDIRECT);
+    expect(back.searchParams.get("error")).toBe("access_denied");
+    expect(back.searchParams.get("state")).toBe("opaque-state");
+    expect(back.searchParams.get("iss")).toBe(issuer);
+    expect(back.searchParams.get("code")).toBeNull();
+
+    // A redirect that never validated gets no redirect at all, denial or not.
+    const foreign = await form("/oauth/authorize", {
+      redirect_uri: "https://evil.example/cb",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      decision: "deny",
+    });
+    expect(foreign.status).toBe(400);
+    expect(foreign.headers.get("location")).toBeNull();
+  });
+
+  it("shows the host (and non-default port) the code is actually sent to", async () => {
+    const challenge = await challengeFor(VERIFIER);
+    for (const redirect of [REDIRECT, "http://127.0.0.1:6274/oauth/callback", "http://localhost/cb"]) {
+      const page = await SELF.fetch(authorizeUrl(challenge, { redirect_uri: redirect }));
+      expect(page.status).toBe(200);
+      const host = shown(await page.text(), "destination");
+
+      const granted = await form("/oauth/authorize", {
+        redirect_uri: redirect,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        token: BEARER,
+      });
+      expect(granted.status).toBe(302);
+      expect(host, redirect).toBe(new URL(granted.headers.get("location") ?? "").host);
+    }
+    const loopback = await SELF.fetch(authorizeUrl(challenge, { redirect_uri: "http://127.0.0.1:6274/cb" }));
+    expect(shown(await loopback.text(), "destination")).toBe("127.0.0.1:6274");
+  });
+
+  it("shows a registered client name, escaped, so a hostile one renders inert", async () => {
+    const hostile = `<script>alert(1)</script><img src=x onerror="alert(2)">'\u202Eevil`;
+    const clientId = await register(hostile);
+    const page = await SELF.fetch(authorizeUrl(await challengeFor(VERIFIER), { client_id: clientId }));
+    const html = await page.text();
+    expect(html).not.toContain("<script>");
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("\u202E");
+    expect(shown(html, "client")).toBe(
+      "&lt;script&gt;alert(1)&lt;/script&gt;&lt;img src=x onerror=&quot;alert(2)&quot;&gt;&#39;evil"
+    );
+    // The CSP stays as strict as before: no script source at all.
+    expect(page.headers.get("content-security-policy")).toContain("default-src 'none'");
+
+    const named = await register("Claude");
+    const plain = await (await SELF.fetch(authorizeUrl(await challengeFor(VERIFIER), { client_id: named }))).text();
+    expect(shown(plain, "client")).toBe("Claude");
+  });
+
+  it("shows no name for a client id this server did not sign, or a registration without one", async () => {
+    const challenge = await challengeFor(VERIFIER);
+    const forged = `mcp-${btoa(JSON.stringify({ r: "x", n: "ChatGPT" })).replace(/=+$/, "")}.AAAA`;
+    for (const clientId of ["mcp-test", forged, await register(undefined)]) {
+      const html = await (await SELF.fetch(authorizeUrl(challenge, { client_id: clientId }))).text();
+      expect(shown(html, "client"), clientId).toBeNull();
+      expect(html).not.toContain("ChatGPT");
+    }
+  });
+});
+
 describe("routing", () => {
   it("404s an unknown OAuth path instead of falling through to the MCP handler", async () => {
     const res = await SELF.fetch(`${ORIGIN}/oauth/userinfo`);

@@ -1,4 +1,4 @@
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { SELF, createExecutionContext, env, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import {
   ADMIN,
@@ -346,5 +346,58 @@ describe("read-only scope", () => {
     expect((await SELF.fetch(`${BASE}/api/head`, authed(minted.token))).status).toBe(200);
     const hash = await putBlob(minted.token, "legacy write");
     expect((await commit(minted.token, makeManifest({ files: { "a.md": { h: hash } } }), null)).status).toBe(200);
+  });
+});
+
+describe("admin routes with no admin credential configured", () => {
+  const ADMIN_ROUTES: [string, string][] = [
+    ["GET", "/api/tokens"],
+    ["POST", "/api/tokens"],
+    ["DELETE", "/api/tokens/01HZZZZZZZZZZZZZZZZZZZZZZZ"],
+    ["POST", "/api/gc"],
+    ["POST", "/api/gc/index?manifests=1"],
+    ["POST", "/api/history/index?manifests=1"],
+  ];
+
+  /** The real Worker entry point, under an env whose ADMIN_TOKEN is replaced or removed. */
+  async function call(adminToken: string | undefined, method: string, path: string, bearer?: string) {
+    const { default: worker } = await import("../src/index");
+    const patched = { ...env };
+    // Removed outright, not set to undefined: an unset secret is an absent binding.
+    if (adminToken === undefined) Reflect.deleteProperty(patched, "ADMIN_TOKEN");
+    else patched.ADMIN_TOKEN = adminToken;
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (bearer !== undefined) headers.authorization = `Bearer ${bearer}`;
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      new Request(`${BASE}${path}`, { method, headers, body: method === "POST" ? "{}" : undefined }),
+      patched,
+      ctx
+    );
+    await waitOnExecutionContext(ctx);
+    return res;
+  }
+
+  it("refuses every admin route, whatever is presented, before any comparison", async () => {
+    // A real access token: with a credential configured it would earn a 403 from the role
+    // check, which runs only after the comparison. Here nothing gets that far.
+    const { token: access } = await mintToken("probe");
+    for (const configured of [undefined, ""]) {
+      for (const [method, path] of ADMIN_ROUTES) {
+        for (const presented of [undefined, "", " ", ADMIN, access]) {
+          const res = await call(configured, method, path, presented);
+          expect(res.status, `${String(configured)} ${method} ${path} ${String(presented)}`).toBe(401);
+          const body = await res.json<{ error: { code: string; message: string } }>();
+          expect(body.error.message).toMatch(/not configured/);
+        }
+      }
+    }
+  });
+
+  it("still accepts the configured token and refuses a wrong one", async () => {
+    expect((await call(ADMIN, "GET", "/api/tokens", ADMIN)).status).toBe(200);
+    expect((await call(ADMIN, "GET", "/api/tokens", "wrong-admin-token")).status).toBe(401);
+    // No trimming for equality: whitespace around the real token is a different token.
+    expect((await call(ADMIN, "GET", "/api/tokens", `${ADMIN} x`)).status).toBe(401);
   });
 });

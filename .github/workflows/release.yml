@@ -4,16 +4,20 @@ on:
   push:
     tags: ["*"]
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
+# Nothing by default. The job that runs dependency install scripts and both test suites holds a
+# read-only token and keeps no credential in the checkout; only the job that publishes holds
+# write, and it runs no repository code at all.
+permissions: {}
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
@@ -39,21 +43,69 @@ jobs:
         run: |
           npm run build --prefix plugin
           node scripts/release-validate.mjs "$GITHUB_REF_NAME"
+      - name: Hand the three release assets to the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: |
+            plugin/dist/main.js
+            plugin/dist/manifest.json
+            plugin/dist/styles.css
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # From this run only (the action's default run-id), so what is attested and published is
+      # exactly what `build` tested, built and validated.
+      - name: Download the validated assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: dist
+      - name: Check the assets name the tagged version
+        run: |
+          for f in main.js manifest.json styles.css; do
+            test -s "dist/$f" || { echo "::error::missing release asset $f"; exit 1; }
+          done
+          version="$(jq -r .version dist/manifest.json)"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::dist/manifest.json is version $version, but the tag is $GITHUB_REF_NAME"
+            exit 1
+          fi
       - name: Attest release assets
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: |
-            plugin/dist/main.js
-            plugin/dist/manifest.json
-            plugin/dist/styles.css
-      - name: Publish GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
+            dist/main.js
+            dist/manifest.json
+            dist/styles.css
+      # A draft first, so the release is never visible without all three assets attached.
+      - name: Create the release as a draft, with its assets
         run: >-
           gh release create "$GITHUB_REF_NAME"
-          plugin/dist/main.js
-          plugin/dist/manifest.json
-          plugin/dist/styles.css
+          dist/main.js
+          dist/manifest.json
+          dist/styles.css
+          --repo "$GH_REPO"
           --verify-tag
           --generate-notes
           --title "$GITHUB_REF_NAME"
+          --draft
+      - name: Publish the draft once its assets are attached
+        run: |
+          assets="$(gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" --json assets --jq '[.assets[].name] | sort | join(",")')"
+          if [ "$assets" != "main.js,manifest.json,styles.css" ]; then
+            echo "::error::draft release has assets [$assets]; leaving it unpublished"
+            exit 1
+          fi
+          gh release edit "$GITHUB_REF_NAME" --repo "$GH_REPO" --draft=false

@@ -109,9 +109,17 @@ app.get("/health", (c) => c.json({ ok: true }));
 // --- admin routes -----------------------------------------------------------
 
 const adminAuth = async (c: Context<AppEnv>, next: () => Promise<void>) => {
+  // Before any comparison. An unset binding encodes as an empty buffer, so the only thing
+  // standing between it and an empty bearer would be header whitespace normalisation. No
+  // credential configured means no admin access at all. A 401, not a 5xx, so a deploy's
+  // stored-token check reads it as "not accepted" and rotates the secret in.
+  const expected: unknown = c.env.ADMIN_TOKEN;
+  if (typeof expected !== "string" || expected === "") {
+    return c.json(errJson("unauthorized", "admin access is not configured on this deployment"), 401);
+  }
   const token = bearer(c);
   if (token === null) return c.json(errJson("unauthorized", "missing bearer token"), 401);
-  if (!timingSafeEqualStr(token, c.env.ADMIN_TOKEN)) {
+  if (!timingSafeEqualStr(token, expected)) {
     // A valid *access* token on an admin route is a role violation, not a bad login.
     const verified = await vault(c.env).verifyToken(token);
     if (verified !== null) return c.json(errJson("forbidden", "access tokens cannot administer tokens"), 403);

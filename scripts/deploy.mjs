@@ -21,6 +21,7 @@ import {
   parseDeploymentName,
 } from "./worker-config.mjs";
 import {
+  cloudflareFailure,
   fingerprint,
   handoffPath,
   handoffPending,
@@ -144,8 +145,9 @@ async function deployViaRestLocked({
     return { status: res.status, body };
   }
 
+  // Status and `errors[]` only — never the raw response: see `cloudflareFailure`.
   const fail = (step, detail) => {
-    throw new Error(`FAIL [${step}]: ${JSON.stringify(detail, null, 2)}`);
+    throw cloudflareFailure(step, detail);
   };
 
   // 1. Bundle -----------------------------------------------------------------

@@ -99,27 +99,42 @@ function assertMaterializable(
     // An ancestor of this path that is itself a note: `Notes` exists, and we wrote `Notes/a.md`.
     for (let i = folded.indexOf("/"); i !== -1; i = folded.indexOf("/", i + 1)) {
       const ancestor = byFolded.get(folded.slice(0, i));
-      if (ancestor !== undefined) {
-        throw new VaultError(
-          `"${ancestor}" is a note, so "${path}" cannot live inside it. Pick another path.`
-        );
-      }
-    }
-
-    // Or this path is itself a folder someone still has files in.
-    for (const [otherFolded, other] of byFolded) {
-      if (!otherFolded.startsWith(`${folded}/`)) continue;
-      // Naming the child is the helpful message, but `files` carries excluded entries the
-      // agent may not read — and an exclude glob like `Credentials/**` does not match the bare
-      // folder, so this refusal is reachable with a hidden child behind it. An error is a read
-      // channel: name the child only when the agent could have listed it anyway.
+      if (ancestor === undefined) continue;
+      // `files` carries excluded and denied entries the agent may not read, and an error is a
+      // read channel: naming a hidden ancestor (in its real case) confirms a note the agent
+      // could never have listed. Only a visible one is named.
+      if (!Object.hasOwn(visible, ancestor)) throw new VaultError(hiddenClash(path));
       throw new VaultError(
-        Object.hasOwn(visible, other)
-          ? `"${path}" is a folder in this vault (it holds "${other}"), so it cannot also be a note. Pick another path.`
-          : `"${path}" is a folder in this vault, so it cannot also be a note. Pick another path.`
+        `"${ancestor}" is a note, so "${path}" cannot live inside it. Pick another path.`
       );
     }
+
+    // Or this path is itself a folder someone still has files in. Name a child the agent can
+    // see; when every child is hidden, even "is a folder" would confirm a folder it cannot list
+    // (an exclude glob like `Credentials/**` does not match the bare folder, so this refusal is
+    // reachable with only hidden children behind it).
+    let hiddenChild = false;
+    for (const [otherFolded, other] of byFolded) {
+      if (!otherFolded.startsWith(`${folded}/`)) continue;
+      if (!Object.hasOwn(visible, other)) {
+        hiddenChild = true;
+        continue;
+      }
+      throw new VaultError(
+        `"${path}" is a folder in this vault (it holds "${other}"), so it cannot also be a note. Pick another path.`
+      );
+    }
+    if (hiddenChild) throw new VaultError(hiddenClash(path));
   }
+}
+
+/**
+ * The refusal for a clash with something the agent cannot see. It names only the caller's own
+ * path and is the same words for a hidden note and a hidden folder, so it says no more than
+ * that the path is unavailable. The refusal itself still tells the caller *something* is there.
+ */
+function hiddenClash(path: string): string {
+  return `"${path}" cannot be used: it clashes with another path in this vault. Pick another path.`;
 }
 
 /**
@@ -182,10 +197,13 @@ export class VaultWriter {
         // owner can change from any device; "this connector has no permission" is set where
         // the agent was deployed and cannot be changed from inside the vault at all. Sending
         // both to the same message would send the reader to the wrong place.
-        if (this.#view.denied(path)) {
+        //
+        // Both ignore case here, and only here: on a case-insensitive device `credentials/x.md`
+        // lands inside a denied `Credentials/` folder. Reads keep exact matching.
+        if (this.#view.deniedForWrite(path)) {
           throw new VaultError(`"${path}" is a path this connector has no permission on`);
         }
-        if (!inScope(path)) {
+        if (!inScope(path) || snapshot.excludedIgnoringCase(path)) {
           throw new VaultError(
             `"${path}" is outside what this vault syncs (its exclude or only-paths policy), so writing it would publish a note no device would download`
           );

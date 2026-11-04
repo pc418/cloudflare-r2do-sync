@@ -4,7 +4,7 @@
 // decide *what* setup does (which credentials, which words the user is told) are unit
 // tested without touching a Cloudflare account.
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fchmodSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEPLOYMENT_NAME_RE } from "./worker-config.mjs";
@@ -93,6 +93,54 @@ export function loadEnvFile(root = ROOT, fileName = ".env") {
 }
 
 /**
+ * The error a failed Cloudflare API step raises: the step, the HTTP status, and each entry of
+ * the response's `errors[]` as `code: message` — nothing else from the response.
+ *
+ * Those requests carry the master key, tokens and the admin credential, and the full body
+ * (`result`, `messages`, anything an endpoint chooses to echo) is not ours to vouch for, so it
+ * is never printed. A body that is not the Cloudflare envelope yields the status alone. A plain
+ * string detail is this script's own message and is passed through.
+ */
+export function cloudflareFailure(step, detail) {
+  if (typeof detail === "string") return new Error(`FAIL [${step}]: ${detail}`);
+  const status = typeof detail?.status === "number" ? `HTTP ${detail.status}` : "no HTTP status";
+  const errors = Array.isArray(detail?.body?.errors) ? detail.body.errors : [];
+  const lines = errors.map((entry) => {
+    const code = typeof entry?.code === "number" || typeof entry?.code === "string" ? String(entry.code) : "?";
+    const message = typeof entry?.message === "string" ? entry.message : "";
+    return `  ${code}: ${message}`;
+  });
+  return new Error([`FAIL [${step}]: ${status}`, ...lines].join("\n"));
+}
+
+/**
+ * Writes a file holding secrets: opened, tightened to 0600 through its descriptor, and only
+ * then written — so not one secret byte ever sits in a file at the mode it was found with.
+ *
+ * `mode:` on a write applies only when the file is CREATED. An .env that already existed keeps
+ * whatever it had (commonly 0644 from an editor or a `cp .env.example`), and the old shape —
+ * write, then `chmod` — left a fresh admin token world-readable in between. The descriptor is
+ * closed whether or not the write succeeds.
+ *
+ * `fresh` replaces whatever is at the path with a new file (`wx` after removing it), for the
+ * handover's temp sibling: a stale `.tmp` left by a crash is never reused, so no descriptor a
+ * reader opened on it earlier, and no symbolic link planted there, receives the new bytes. An
+ * in-place file cannot do that without changing its identity, so a reader that opened it while
+ * it was still 0644 can keep reading through that descriptor — fchmod checks new opens only.
+ */
+export function writeSecretFile(file, text, { fresh = false } = {}) {
+  if (fresh) rmSync(file, { force: true });
+  const fd = openSync(file, fresh ? "wx" : "w", 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    writeFileSync(fd, text);
+  } finally {
+    closeSync(fd);
+  }
+  return file;
+}
+
+/**
  * Writes `values` into `root`/.env, replacing existing assignments in place and appending
  * the rest. Every other line — comments, unrelated keys — is preserved verbatim: this file
  * also carries the user's Cloudflare credentials, which setup must never touch.
@@ -115,12 +163,9 @@ export function upsertEnvFile(root, values, fileName = ".env") {
   });
   for (const [key, value] of pending) updated.push(`${key}=${quoteEnvValue(value)}`);
 
-  writeFileSync(file, `${updated.join("\n")}\n`, { mode: 0o600 });
-  // `mode:` only applies when the file is CREATED. An .env that already existed keeps
-  // whatever permissions it had — commonly 0644 from an editor or a `cp .env.example` — and
-  // this function has just written an admin token and a vault-wide access token into it.
-  chmodSync(file, 0o600);
-  return file;
+  // Tightened before the write, not after: this is about to hold an admin token and a
+  // vault-wide access token, and an existing file keeps the mode it was found with.
+  return writeSecretFile(file, `${updated.join("\n")}\n`);
 }
 
 // --- deployment identity ------------------------------------------------------
@@ -649,9 +694,7 @@ export function tokenOutputPlan({ isTty, out = null, printToken = false }) {
 
 /** Writes the handoff a non-interactive caller asked for, readable only by its owner. */
 export function writeTokenHandoff(file, payload) {
-  writeFileSync(file, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
-  chmodSync(file, 0o600); // `mode:` only applies on creation; the file may already exist
-  return file;
+  return writeSecretFile(file, `${JSON.stringify(payload, null, 2)}\n`);
 }
 
 // --- final output ------------------------------------------------------------
@@ -834,8 +877,7 @@ export function writeHandoff(root, deploymentName, sections) {
   // until the chmod caught up. Rename is atomic, so the file is either the old one or the new
   // one — never a half-written document whose mere presence suppresses the next rotation.
   const temp = `${file}.tmp`;
-  writeFileSync(temp, `${body}\n`, { mode: 0o600 });
-  chmodSync(temp, 0o600); // `mode:` only applies on creation; the temp may already exist
+  writeSecretFile(temp, `${body}\n`, { fresh: true });
   renameSync(temp, file);
   return file;
 }

@@ -468,6 +468,22 @@ export async function callTool(
   args: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<string> {
+  try {
+    return await runTool(name, args, ctx);
+  } finally {
+    // Every tool reads the current policy on its way through. The search index's rows are
+    // plaintext, so once the policy has moved they are dropped now — not whenever a search
+    // next happens to catch up past them.
+    const policy = ctx.view.policyFingerprint;
+    if (ctx.index !== undefined && policy !== null) ctx.index.retainPolicy(policy);
+  }
+}
+
+async function runTool(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<string> {
   switch (name) {
     case "search": {
       const { files, head, policy } = await ctx.view.snapshot();
@@ -487,7 +503,7 @@ export async function callTool(
       // worth. Prefer the index, but only while it describes exactly this head — a stale one
       // would answer confidently about notes that have since changed.
       // Head AND policy: `files` is a function of both, so the index must be keyed on both.
-      const key = `${head}|${policy}`;
+      const key = { head, policy };
       let result;
       if (!regex && ctx.index !== undefined && ctx.index.isCurrent(key)) {
         result = ctx.index.query(query, {

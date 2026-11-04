@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { VaultCrypto, deriveMasterKeyFromPassphrase, generateMasterKey, manifestAad, parseMasterKey, toBase64 } from "../src/crypto";
 import { sha256Hex } from "../src/hash";
+import { buildManifest } from "../src/types";
 
 // Resolve Node-only test helpers without adding Node globals to the browser plugin build.
 const fs = await import(/* @vite-ignore */ "node:fs/promises" as string);
@@ -28,7 +29,13 @@ interface RestoreModule {
   }): Promise<Uint8Array>;
   passphraseModeRequested(argv?: string[]): boolean;
   plaintextModeRequested(argv?: string[]): boolean;
-  restoreMode(input: { version: unknown; keyInput: boolean; plaintext: boolean }): "encrypted" | "plaintext";
+  legacyV2Requested(argv?: string[]): boolean;
+  restoreMode(input: {
+    version: unknown;
+    keyInput: boolean;
+    plaintext: boolean;
+    legacyV2?: boolean;
+  }): "encrypted" | "plaintext";
   keyIdOf(master: Uint8Array): Promise<string>;
   decryptBlob(master: Uint8Array, plainHash: string, cipher: Uint8Array): Promise<Uint8Array>;
   decryptManifestMap(master: Uint8Array, enc: unknown, aad?: string): Promise<unknown>;
@@ -229,7 +236,9 @@ describe("restore.mjs encrypted credential selection", () => {
 describe("restore.mjs snapshot mode", () => {
   it("decides the mode from what the operator supplied, never from the manifest alone", () => {
     expect(restore.restoreMode({ version: 3, keyInput: true, plaintext: false })).toBe("encrypted");
-    expect(restore.restoreMode({ version: 2, keyInput: false, plaintext: false })).toBe("encrypted");
+    expect(
+      restore.restoreMode({ version: 2, keyInput: false, plaintext: false, legacyV2: true })
+    ).toBe("encrypted");
     expect(restore.restoreMode({ version: 1, keyInput: false, plaintext: true })).toBe("plaintext");
   });
 
@@ -314,6 +323,170 @@ describe("restore.mjs snapshot mode", () => {
       server.close();
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+type Served = Record<string, string | Uint8Array>;
+
+/** Serves fixed routes on loopback and runs the real CLI against them, as an operator would. */
+async function withRestoreServer(
+  routes: Served,
+  body: (run: (env: Record<string, string>, extra?: string[]) => Promise<{ code: number; stderr: string }>, out: string) => Promise<void>
+): Promise<void> {
+  const http = await import(/* @vite-ignore */ "node:http" as string);
+  const { spawn } = await import(/* @vite-ignore */ "node:child_process" as string);
+  const server = http.createServer((req: { url: string }, res: {
+    writeHead(s: number, h?: Record<string, string>): void; end(b?: string | Uint8Array): void;
+  }) => {
+    const hit = routes[req.url];
+    if (hit === undefined) { res.writeHead(404); res.end(); return; }
+    res.writeHead(200, typeof hit === "string" ? { "content-type": "application/json" } : {});
+    res.end(hit);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+  const dir = await mkdtemp(path.join(tmpdir(), "restore-integrity-"));
+  const out = path.join(dir, "out");
+  const run = (env: Record<string, string>, extra: string[] = []) =>
+    new Promise<{ code: number; stderr: string }>((resolve) => {
+      const child = spawn(
+        proc.execPath,
+        [new URL("../../scripts/restore.mjs", import.meta.url).pathname, "--out", out, "--url", `http://127.0.0.1:${port}`, ...extra],
+        { env: { PATH: proc.env.PATH ?? "", ACCESS_TOKEN: "dummy", ...env }, stdio: ["ignore", "pipe", "pipe"] }
+      );
+      let stderr = "";
+      child.stderr.on("data", (d: Uint8Array) => (stderr += text(d)));
+      child.on("close", (code: number) => resolve({ code, stderr }));
+    });
+  try {
+    await body(run, out);
+  } finally {
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+describe("restore.mjs encrypted head integrity", () => {
+  const ID = "01J00000000000000000000000";
+  const PARENT = "01HZZZZZZZZZZZZZZZZZZZZZZZ";
+  const content = bytes("# genuine note\n");
+
+  /** A snapshot the plugin itself produced: real `buildManifest`, real blob encryption. */
+  async function pluginSnapshot(key: Uint8Array = KEY) {
+    const plugin = await VaultCrypto.create(key);
+    const h = await sha256Hex(content);
+    const cipher = await plugin.encryptBlob(h, content);
+    const c = await sha256Hex(cipher);
+    const files = { "note.md": { h, size: content.length, mtime: 1, c } };
+    const manifest = (await buildManifest({
+      crypto: plugin, parent: PARENT, files, blobs: [c], id: ID, device: "laptop",
+      createdAt: "2026-11-01T00:00:00.000Z",
+    })) as unknown as Record<string, unknown>;
+    return { plugin, manifest, files, cipher, c };
+  }
+
+  const routesFor = (manifest: Record<string, unknown>, c: string, cipher: Uint8Array): Served => ({
+    "/api/head": JSON.stringify({ head: manifest.id }),
+    [`/api/manifests/${String(manifest.id)}`]: JSON.stringify(manifest),
+    [`/api/blobs/${c}`]: cipher,
+  });
+
+  it("restores a v3 snapshot the plugin produced", async () => {
+    const { manifest, c, cipher } = await pluginSnapshot();
+    expect(manifest.v).toBe(3);
+    await withRestoreServer(routesFor(manifest, c, cipher), async (run, out) => {
+      const result = await run({ MASTER_KEY: toBase64(KEY) });
+      expect(result.stderr).toBe("");
+      expect(result.code).toBe(0);
+      expect(text(await readFile(path.join(out, "note.md")))).toBe(text(content));
+    });
+  });
+
+  it("refuses a v3 snapshot whose authenticated header was changed, writing nothing", async () => {
+    const { manifest, c, cipher } = await pluginSnapshot();
+    const altered: Record<string, unknown>[] = [
+      { ...manifest, id: "01J11111111111111111111111" },
+      { ...manifest, parent: null },
+      { ...manifest, device: "impostor" },
+      { ...manifest, createdAt: "2030-01-01T00:00:00.000Z" },
+      { ...manifest, blobs: [c, "0".repeat(64)] },
+    ];
+    for (const forged of altered) {
+      await withRestoreServer(routesFor(forged, c, cipher), async (run, out) => {
+        // --legacy-v2 relaxes the v2 refusal only; it must not relax v3 authentication.
+        for (const extra of [[], ["--legacy-v2"]]) {
+          const result = await run({ MASTER_KEY: toBase64(KEY) }, extra);
+          expect(result.code).not.toBe(0);
+          expect(result.stderr).toMatch(/failed authentication/);
+          await expect(readFile(path.join(out, "note.md"))).rejects.toThrow();
+        }
+      });
+    }
+  });
+
+  it("refuses a head served under a different id than the one asked for", async () => {
+    const { manifest, c, cipher } = await pluginSnapshot();
+    const routes = routesFor(manifest, c, cipher);
+    routes["/api/head"] = JSON.stringify({ head: "01J22222222222222222222222" });
+    routes["/api/manifests/01J22222222222222222222222"] = JSON.stringify(manifest);
+    await withRestoreServer(routes, async (run, out) => {
+      const result = await run({ MASTER_KEY: toBase64(KEY) });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toMatch(/asked for snapshot 01J22222222222222222222222/);
+      await expect(readFile(path.join(out, "note.md"))).rejects.toThrow();
+    });
+  });
+
+  it("refuses a v2 snapshot by default and restores it with --legacy-v2", async () => {
+    const { plugin, files, c, cipher } = await pluginSnapshot();
+    const v2 = {
+      v: 2, id: ID, parent: PARENT, device: "laptop", createdAt: "2026-11-01T00:00:00.000Z",
+      keyId: plugin.keyId, blobs: [c], enc: await plugin.encryptJson(files),
+    };
+    await withRestoreServer(routesFor(v2, c, cipher), async (run, out) => {
+      const refused = await run({ MASTER_KEY: toBase64(KEY) });
+      expect(refused.code).not.toBe(0);
+      expect(refused.stderr).toMatch(/v2.*--legacy-v2/);
+      await expect(readFile(path.join(out, "note.md"))).rejects.toThrow();
+
+      const accepted = await run({ MASTER_KEY: toBase64(KEY) }, ["--legacy-v2"]);
+      expect(accepted.stderr).toBe("");
+      expect(accepted.code).toBe(0);
+      expect(text(await readFile(path.join(out, "note.md")))).toBe(text(content));
+    });
+    expect(() => restore.restoreMode({ version: 2, keyInput: true, plaintext: false })).toThrow(
+      /--legacy-v2/
+    );
+    expect(() =>
+      restore.restoreMode({ version: 2, keyInput: false, plaintext: true, legacyV2: true })
+    ).toThrow(/--plaintext/);
+    expect(restore.legacyV2Requested(["node", "restore.mjs", "--legacy-v2"])).toBe(true);
+    expect(() =>
+      restore.legacyV2Requested(["node", "restore.mjs", "--legacy-v2", "--legacy-v2"])
+    ).toThrow(/only be supplied once/);
+  });
+
+  it("refuses a key the snapshot does not name, whatever flags are given", async () => {
+    const { plugin, manifest, files, c, cipher } = await pluginSnapshot();
+    const v2 = {
+      ...manifest, v: 2, enc: await plugin.encryptJson(files),
+    };
+    const otherKeyId = await restore.keyIdOf(OTHER_KEY);
+    for (const served of [manifest, v2]) {
+      await withRestoreServer(routesFor(served, c, cipher), async (run, out) => {
+        const result = await run({ MASTER_KEY: toBase64(OTHER_KEY) }, ["--legacy-v2"]);
+        expect(result.code).not.toBe(0);
+        expect(result.stderr).toMatch(/wrong master key/);
+        await expect(readFile(path.join(out, "note.md"))).rejects.toThrow();
+      });
+    }
+    // Relabelling the header to the operator's key does not help: the keyId is authenticated.
+    await withRestoreServer(routesFor({ ...manifest, keyId: otherKeyId }, c, cipher), async (run, out) => {
+      const result = await run({ MASTER_KEY: toBase64(OTHER_KEY) }, ["--legacy-v2"]);
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toMatch(/failed authentication/);
+      await expect(readFile(path.join(out, "note.md"))).rejects.toThrow();
+    });
   });
 });
 

@@ -804,3 +804,120 @@ test("env values survive the shell, and round-trip through the loader", async ()
   assert.equal(loadEnvFile(dir, ".env.t").AGENT_DENY, deny);
   rmSync(dir, { recursive: true });
 });
+
+// --- secret files are 0600 before the first secret byte lands -------------------
+
+/**
+ * Watches every `writeFileSync` the library makes and records the target's mode at that
+ * moment. The library imports `writeFileSync` by name, so the builtin's live binding is
+ * re-synced after mocking (and again after restoring).
+ */
+async function modesAtWrite(body, { failWrites = false } = {}) {
+  const fs = (await import("node:fs")).default;
+  const { syncBuiltinESMExports } = await import("node:module");
+  const { mock } = await import("node:test");
+  const seen = [];
+  const closed = [];
+  const realWrite = fs.writeFileSync;
+  const realClose = fs.closeSync;
+  mock.method(fs, "writeFileSync", (target, data, ...rest) => {
+    const mode =
+      typeof target === "number"
+        ? fs.fstatSync(target).mode & 0o777
+        : fs.existsSync(target)
+          ? fs.statSync(target).mode & 0o777
+          : null;
+    seen.push({ fd: typeof target === "number" ? target : null, mode, data: String(data) });
+    if (failWrites) throw new Error("disk full");
+    return realWrite(target, data, ...rest);
+  });
+  mock.method(fs, "closeSync", (fd) => {
+    closed.push(fd);
+    return realClose(fd);
+  });
+  syncBuiltinESMExports();
+  try {
+    await body();
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+  return { seen, closed };
+}
+
+test("an existing 0644 .env is already 0600 when the secret is written into it", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "secret-env-"));
+  try {
+    const file = path.join(root, ".env");
+    writeFileSync(file, "CLOUDFLARE_TOKEN=cf-secret\n");
+    chmodSync(file, 0o644);
+    const { seen } = await modesAtWrite(() => upsertEnvFile(root, { ADMIN_TOKEN: "SENTINEL-admin" }));
+    const secret = seen.filter((w) => w.data.includes("SENTINEL-admin"));
+    assert.equal(secret.length, 1);
+    assert.equal(secret[0].mode, 0o600);
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.match(readFileSync(file, "utf8"), /CLOUDFLARE_TOKEN=cf-secret/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the handover temp sibling is a fresh 0600 file, never a stale 0644 one or a planted link", async () => {
+  const { symlinkSync } = await import("node:fs");
+  const { writeHandoff, handoffPath } = await import("./setup-lib.mjs");
+  const root = mkdtempSync(path.join(tmpdir(), "secret-handoff-"));
+  try {
+    const file = handoffPath(root, "notes-2");
+    writeFileSync(file, "old\n");
+    chmodSync(file, 0o644);
+    // A crash left a world-readable temp behind.
+    writeFileSync(`${file}.tmp`, "stale\n");
+    chmodSync(`${file}.tmp`, 0o644);
+    const { seen } = await modesAtWrite(() => writeHandoff(root, "notes-2", { vault: "ADMIN_TOKEN SENTINEL-handoff" }));
+    const secret = seen.filter((w) => w.data.includes("SENTINEL-handoff"));
+    assert.equal(secret.length, 1);
+    assert.equal(secret[0].mode, 0o600);
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+
+    // A symbolic link planted at the temp path is replaced, not written through.
+    const decoy = path.join(root, "decoy.txt");
+    writeFileSync(decoy, "decoy\n");
+    symlinkSync(decoy, `${file}.tmp`);
+    writeHandoff(root, "notes-2", { vault: "ADMIN_TOKEN SENTINEL-2" });
+    assert.equal(readFileSync(decoy, "utf8"), "decoy\n");
+    assert.match(readFileSync(file, "utf8"), /SENTINEL-2/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a token handoff file is 0600 before the token is written, and closed if the write fails", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "secret-token-"));
+  try {
+    const file = path.join(root, "tok.json");
+    writeFileSync(file, "{}\n");
+    chmodSync(file, 0o644);
+    const { seen } = await modesAtWrite(() => writeTokenHandoff(file, { token: "SENTINEL-token" }));
+    const secret = seen.filter((w) => w.data.includes("SENTINEL-token"));
+    assert.equal(secret.length, 1);
+    assert.equal(secret[0].mode, 0o600);
+
+    let failed;
+    const { seen: attempted, closed } = await modesAtWrite(
+      () => {
+        try {
+          writeTokenHandoff(file, { token: "SENTINEL-again" });
+        } catch (error) {
+          failed = error;
+        }
+      },
+      { failWrites: true }
+    );
+    assert.match(String(failed), /disk full/);
+    assert.equal(attempted.length, 1);
+    assert.notEqual(attempted[0].fd, null, "written through the descriptor that was tightened");
+    assert.ok(closed.includes(attempted[0].fd), "the descriptor is closed when the write fails");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

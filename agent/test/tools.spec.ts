@@ -910,6 +910,57 @@ describe("budgets and configuration", () => {
     expect(wide).toContain("# Tea");
   });
 
+  // Rows built under a wider policy are never served (the key carries the policy), but they are
+  // plaintext of notes the owner just excluded, so they must not wait for the next search.
+  it("drops index rows when the policy narrows under an unchanged head, and reuses them otherwise", async () => {
+    const vault = fakeVault();
+    const crypto = await testCrypto();
+    await seed(vault, crypto, { "Welcome.md": "tea time\n", "Secret.md": "tea with the informant\n" });
+    vault.settings = await policyDoc(crypto, 1, { excludes: "" });
+    const head = vault.head;
+
+    const seen = await runInDurableObject(
+      env.AGENT.getByName(`p-${Math.random().toString(36).slice(2)}`),
+      async (_i: AgentState, state) => {
+        const view = new VaultView({
+          api: new SyncApi({ baseUrl: "https://vault.test", token: "t", http: vault.http }),
+          crypto,
+        });
+        const ctx: ToolContext = {
+          view,
+          writable: false,
+          enqueue: async () => ({ head: "", summary: "" }),
+          index: new SearchIndex(state.storage.sql),
+        };
+        const rows = () =>
+          state.storage.sql.exec<{ path: string }>("SELECT path FROM notes ORDER BY path").toArray().map((r) => r.path);
+
+        await callTool("search", { query: "tea" }, ctx);
+        vault.requests.length = 0;
+        const reused = await callTool("search", { query: "informant" }, ctx);
+        const reusedReads = vault.requests.filter((r) => r.startsWith("GET /api/blobs/")).length;
+        const rowsBefore = rows();
+
+        vault.settings = await policyDoc(crypto, 2, { excludes: "Secret.md" });
+        // Any tool, not only a search: this one reads a different note.
+        await callTool("read", { path: "Welcome.md" }, ctx);
+        const rowsAfter = rows();
+        const narrowed = await callTool("search", { query: "informant" }, ctx);
+        return { reused, reusedReads, rowsBefore, rowsAfter, narrowed };
+      }
+    );
+    expect(vault.head).toBe(head);
+    // Same policy: the index answered, with no blob fetched.
+    expect(seen.reused).toMatch(/\(all \d+ searched/);
+    expect(seen.reused).toContain("Secret.md");
+    expect(seen.reusedReads).toBe(0);
+    expect(seen.rowsBefore).toEqual(["Secret.md", "Welcome.md"]);
+    // Narrowed: the excluded note's plaintext is gone from storage, and from every answer.
+    expect(seen.rowsAfter).not.toContain("Secret.md");
+    expect(seen.narrowed).not.toContain("Secret.md");
+    expect(seen.narrowed).not.toContain("informant");
+  });
+
   // A failed fetch has still been spent. Budgeting on successes lets a run of unreadable
   // blobs walk past the limit, and hands the catch-up a remainder that was already used.
   it("counts a failed blob read against the budget, not only a successful one", async () => {

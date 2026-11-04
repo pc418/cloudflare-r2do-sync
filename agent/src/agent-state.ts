@@ -14,7 +14,7 @@ import { VaultCrypto } from "../../plugin/src/crypto";
 import { SearchIndex, type IndexStatus } from "./index-store";
 import { callTool, type ToolContext } from "./tools";
 import { resolveZone } from "./tz";
-import { fetchHttp, VaultView } from "./vault";
+import { fetchHttp, StoredVaultMarks, VaultView } from "./vault";
 import { VaultWriter, type WriteOp, type WriteOutcome } from "./write";
 import type { AgentEnv } from "./env";
 
@@ -64,6 +64,9 @@ export class AgentState extends DurableObject<AgentEnv> {
         crypto,
         configDir,
         deny: this.env.AGENT_DENY,
+        // In this object's storage, so "an authenticated policy was read" outlives the isolate
+        // and the deploy. Scoped by server and key id: re-pointing the deployment starts clean.
+        marks: new StoredVaultMarks(this.ctx.storage.sql, `${this.env.SYNC_URL} ${crypto.keyId}`),
       });
       this.#writer = new VaultWriter({
         view: this.#view,

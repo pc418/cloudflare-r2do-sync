@@ -4,6 +4,7 @@
 //   node scripts/restore.mjs --out ./restored [--head <manifest-id>] [--url <worker-url>]
 //   node scripts/restore.mjs --out ./restored --passphrase --salt <base64-vault-salt>
 //   node scripts/restore.mjs --out ./restored --plaintext      (an unencrypted vault only)
+//   node scripts/restore.mjs --out ./restored --legacy-v2      (accept an unauthenticated v2 head)
 //
 // Credentials come from the environment (ACCESS_TOKEN and either MASTER_KEY or
 // VAULT_PASSPHRASE) or a hidden prompt, so they stay out of shell history. `--passphrase` is
@@ -279,14 +280,25 @@ function arg(name) {
  * So the operator states the mode: any key input means the vault is encrypted and only an
  * encrypted snapshot is accepted; a plaintext snapshot needs `--plaintext`, which in turn
  * refuses key inputs and encrypted snapshots. Anything that is not v1/v2/v3 is refused.
+ *
+ * v2 is encrypted but its clear header is not authenticated, so a key-less token holder can
+ * lift a retained v2 path map under any header. It needs `--legacy-v2`, which relaxes only
+ * that refusal: the keyId check and v3 authentication in `openEncryptedManifest` still apply.
  */
-export function restoreMode({ version, keyInput, plaintext }) {
+export function restoreMode({ version, keyInput, plaintext, legacyV2 = false }) {
   if (keyInput && plaintext) {
     throw new Error("--plaintext cannot be combined with a master key or passphrase");
   }
   if (version === 2 || version === 3) {
     if (plaintext) {
       throw new Error(`snapshot is encrypted (v${version}), but --plaintext was given`);
+    }
+    if (version === 2 && !legacyV2) {
+      throw new Error(
+        "snapshot is v2, whose header is not authenticated, so nothing proves it is a snapshot " +
+          "your devices wrote. Pass --head with a known-good v3 snapshot id, or --legacy-v2 to " +
+          "restore it anyway"
+      );
     }
     return "encrypted";
   }
@@ -306,10 +318,59 @@ export function restoreMode({ version, keyInput, plaintext }) {
   throw new Error(`snapshot has unsupported format version ${JSON.stringify(version)}`);
 }
 
-export function plaintextModeRequested(argv = process.argv) {
-  const matches = argv.filter((value) => value === "--plaintext");
-  if (matches.length > 1) throw new Error("--plaintext may only be supplied once");
+function modeFlagRequested(flag, argv) {
+  const matches = argv.filter((value) => value === flag);
+  if (matches.length > 1) throw new Error(`${flag} may only be supplied once`);
   return matches.length === 1;
+}
+
+export function plaintextModeRequested(argv = process.argv) {
+  return modeFlagRequested("--plaintext", argv);
+}
+
+export function legacyV2Requested(argv = process.argv) {
+  return modeFlagRequested("--legacy-v2", argv);
+}
+
+const HASH_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Checks an encrypted snapshot's envelope and opens its path map, before anything is written.
+ *
+ * The key must be the one the snapshot names (a wrong key is refused here, whatever flags were
+ * given), the envelope must be the snapshot that was asked for, and a v3 path map is decrypted
+ * with `manifestAad` over the envelope as it arrived — so a changed id, parent, device, time,
+ * keyId or blob set fails authentication. Only `restoreMode` decides whether v2 is acceptable.
+ */
+export async function openEncryptedManifest(master, manifest, expectedId) {
+  const fail = (why) => {
+    throw new Error(`invalid snapshot from server: ${why}`);
+  };
+  if (typeof manifest !== "object" || manifest === null) fail("not an object");
+  if (manifest.v !== 2 && manifest.v !== 3) fail(`not an encrypted snapshot (v${manifest.v})`);
+  if (typeof manifest.id !== "string" || manifest.id !== expectedId) {
+    fail(`asked for snapshot ${expectedId}, got ${JSON.stringify(manifest.id)}`);
+  }
+  if (manifest.parent !== null && typeof manifest.parent !== "string") fail("parent is malformed");
+  if (typeof manifest.device !== "string") fail("device is missing");
+  if (typeof manifest.createdAt !== "string") fail("createdAt is missing");
+  if (typeof manifest.keyId !== "string") fail("keyId is missing");
+  if (!Array.isArray(manifest.blobs) || manifest.blobs.some((h) => typeof h !== "string" || !HASH_RE.test(h))) {
+    fail("blobs must be an array of sha256 hex digests");
+  }
+  const enc = manifest.enc;
+  if (typeof enc !== "object" || enc === null || typeof enc.iv !== "string" || typeof enc.data !== "string") {
+    fail("enc is malformed");
+  }
+  const expected = await keyIdOf(master);
+  if (expected !== manifest.keyId) {
+    throw new Error(`wrong master key: snapshot wants keyId ${manifest.keyId}, this key is ${expected}`);
+  }
+  const files = await decryptManifestMap(master, enc, manifest.v === 3 ? manifestAad(manifest) : undefined);
+  if (typeof files !== "object" || files === null || Array.isArray(files)) {
+    fail("decrypted snapshot is not a path map");
+  }
+  return files;
 }
 
 export function passphraseModeRequested(argv = process.argv) {
@@ -348,7 +409,7 @@ async function main() {
   const outDir = arg("out");
   if (!outDir) {
     console.error(
-      "usage: node scripts/restore.mjs --out <dir> [--head <id>] [--url <worker-url>] [--passphrase --salt <base64> | --plaintext]"
+      "usage: node scripts/restore.mjs --out <dir> [--head <id>] [--url <worker-url>] [--passphrase --salt <base64> | --plaintext] [--legacy-v2]"
     );
     process.exit(2);
   }
@@ -389,6 +450,7 @@ async function main() {
       process.env.MASTER_KEY !== undefined ||
       process.env.VAULT_PASSPHRASE !== undefined,
     plaintext: plaintextModeRequested(),
+    legacyV2: legacyV2Requested(),
   });
   if (mode === "encrypted") {
     const vaultSalt = arg("salt") ?? process.env.VAULT_SALT?.trim();
@@ -411,16 +473,7 @@ async function main() {
         vaultSalt,
       });
     }
-    const expected = await keyIdOf(master);
-    if (expected !== manifest.keyId) {
-      console.error(`wrong master key: snapshot wants keyId ${manifest.keyId}, this key is ${expected}`);
-      process.exit(1);
-    }
-    files = await decryptManifestMap(
-      master,
-      manifest.enc,
-      manifest.v === 3 ? manifestAad(manifest) : undefined
-    );
+    files = await openEncryptedManifest(master, manifest, head);
   } else {
     files = manifest.files;
   }

@@ -100,10 +100,10 @@ function b64urlDecode(text: string): Uint8Array {
  * hygiene rather than a fix — but the two uses have different lifetimes and should not come to
  * share a secret by accident.
  */
-async function codeKey(bearer: string): Promise<CryptoKey> {
+async function signingKey(domain: string, bearer: string): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     "raw",
-    encoder.encode(`obsidian-agent/oauth-code ${bearer}`),
+    encoder.encode(`${domain} ${bearer}`),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"]
@@ -111,7 +111,59 @@ async function codeKey(bearer: string): Promise<CryptoKey> {
 }
 
 async function signCode(bearer: string, payload: string): Promise<string> {
-  return b64url(await crypto.subtle.sign("HMAC", await codeKey(bearer), encoder.encode(payload)));
+  const key = await signingKey("obsidian-agent/oauth-code", bearer);
+  return b64url(await crypto.subtle.sign("HMAC", key, encoder.encode(payload)));
+}
+
+/** Its own domain, so a client id can never be presented as a code or the reverse. */
+async function signClient(bearer: string, payload: string): Promise<string> {
+  const key = await signingKey("obsidian-agent/oauth-client", bearer);
+  return b64url(await crypto.subtle.sign("HMAC", key, encoder.encode(payload)));
+}
+
+/** Longest registered client name carried and shown; a name is a label, not a paragraph. */
+const MAX_CLIENT_NAME_CHARS = 80;
+
+/**
+ * A registered `client_name`, made displayable: control and format characters (including
+ * bidirectional overrides, which could make a name read as something else) are dropped, and the
+ * length is capped by code point. HTML escaping happens where it is rendered, never here.
+ */
+function displayableClientName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const cleaned = Array.from(value.replace(/[\p{Cc}\p{Cf}]/gu, "").trim())
+    .slice(0, MAX_CLIENT_NAME_CHARS)
+    .join("")
+    .trim();
+  return cleaned === "" ? null : cleaned;
+}
+
+/**
+ * Registration is stateless, so the name a client registered travels inside its `client_id`,
+ * signed under a key derived from the bearer. Only a name this server signed is shown on the
+ * consent page; a hand-made `client_id` (or one from before a `--rotate-bearer`) shows none.
+ * The name is still the client's own choice, which is why the page says so.
+ */
+async function issueClientId(bearer: string, clientName: string | null): Promise<string> {
+  const nonce = b64url(crypto.getRandomValues(new Uint8Array(12)));
+  const body = b64url(encoder.encode(JSON.stringify(clientName === null ? { r: nonce } : { r: nonce, n: clientName })));
+  return `mcp-${body}.${await signClient(bearer, body)}`;
+}
+
+async function registeredClientName(bearer: string, clientId: string | null): Promise<string | null> {
+  if (clientId === null || !clientId.startsWith("mcp-")) return null;
+  const rest = clientId.slice("mcp-".length);
+  const dot = rest.indexOf(".");
+  if (dot <= 0) return null;
+  const body = rest.slice(0, dot);
+  if (!tokensMatch(rest.slice(dot + 1), await signClient(bearer, body))) return null;
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(b64urlDecode(body)));
+    if (parsed === null || typeof parsed !== "object") return null;
+    return displayableClientName((parsed as { n?: unknown }).n);
+  } catch {
+    return null;
+  }
 }
 
 async function s256(verifier: string): Promise<string> {
@@ -240,6 +292,9 @@ function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c] ?? c);
 }
 
+/** Fields the consent form itself supplies; never echoed back as hidden inputs. */
+const CONSENT_FIELDS = new Set(["token", "decision"]);
+
 /**
  * The consent screen.
  *
@@ -247,11 +302,26 @@ function escapeHtml(text: string): string {
  * way not to confirm to a stranger that the hostname fronts a vault master key — `/health`
  * answers `{ok:true}` and nothing else, and the script name carries a random suffix — and a
  * page announcing the vault would undo that for the one route a browser can reach.
+ *
+ * It does say where the code will go: the host (and any non-default port) of the redirect URI
+ * this request validated, and the name the client registered, if this server signed one. Both
+ * are chosen by whoever started the flow, so both are escaped — but a flow someone else started
+ * from their own connector shows *their* callback here, which is the one thing a person pasting
+ * the token can check.
  */
-function consentPage(params: URLSearchParams, error?: string): Response {
+function consentPage(
+  params: URLSearchParams,
+  destination: { host: string; clientName: string | null },
+  error?: string
+): Response {
   const hidden = [...params.entries()]
+    .filter(([k]) => !CONSENT_FIELDS.has(k))
     .map(([k, v]) => `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(v)}">`)
     .join("\n  ");
+  const client =
+    destination.clientName === null
+      ? ""
+      : `<p>The client registered itself as <strong class="client">${escapeHtml(destination.clientName)}</strong> (a name it chose).</p>`;
 
   return new Response(
     `<!doctype html>
@@ -266,11 +336,14 @@ function consentPage(params: URLSearchParams, error?: string): Response {
 </style>
 <h1>Authorize this connector</h1>
 <p>Paste the connector token to allow this client access.</p>
+<p>Access will be sent to <strong class="destination">${escapeHtml(destination.host)}</strong>. Continue only if you started this connection there yourself.</p>
+${client}
 ${error === undefined ? "" : `<p class="err">${escapeHtml(error)}</p>`}
 <form method="POST">
   ${hidden}
   <input type="password" name="token" autocomplete="off" autofocus placeholder="64 hex characters">
-  <button type="submit">Authorize</button>
+  <button type="submit" name="decision" value="allow">Authorize</button>
+  <button type="submit" name="decision" value="deny">Deny</button>
 </form>`,
     {
       status: 200,
@@ -338,6 +411,9 @@ export async function handleOAuth(request: Request, env: AgentEnv): Promise<Resp
       grant_types_supported: ["authorization_code", "refresh_token"],
       code_challenge_methods_supported: ["S256"],
       token_endpoint_auth_methods_supported: ["none"],
+      // RFC 9207: every authorization response names this issuer, so a client that also talks
+      // to another authorization server can tell whose code it was handed.
+      authorization_response_iss_parameter_supported: true,
       // `offline_access` is advertised so a client asks for a refresh token. Without one it
       // treats the connection as expiring and drops it, though this token never expires.
       scopes_supported: ["mcp", "offline_access"],
@@ -352,6 +428,7 @@ export async function handleOAuth(request: Request, env: AgentEnv): Promise<Resp
     const body = await readBounded(request, MAX_OAUTH_BODY_BYTES);
     if (body === null) return oauthError("invalid_request", "registration body is too large", 413);
     const uris = redirectUrisOf(body);
+    const clientName = clientNameOf(body);
     if (uris === null) {
       return oauthError(
         "invalid_client_metadata",
@@ -362,8 +439,9 @@ export async function handleOAuth(request: Request, env: AgentEnv): Promise<Resp
     if (rejected.length > 0) return oauthError("invalid_redirect_uri", rejected.join(", "));
     return json(
       {
-        client_id: `mcp-${b64url(crypto.getRandomValues(new Uint8Array(12)))}`,
+        client_id: await issueClientId(bearer, clientName),
         client_id_issued_at: Math.floor(Date.now() / 1000),
+        ...(clientName === null ? {} : { client_name: clientName }),
         redirect_uris: uris,
         grant_types: ["authorization_code", "refresh_token"],
         response_types: ["code"],
@@ -398,12 +476,33 @@ export async function handleOAuth(request: Request, env: AgentEnv): Promise<Resp
       return oauthError("invalid_request", "PKCE with code_challenge_method=S256 is required");
     }
 
-    if (request.method === "GET") return consentPage(params);
+    // Past this point the redirect URI is validated, so the answer goes back to it. RFC 9207's
+    // `iss` is on every such answer, success or error, and is exactly the metadata `issuer`.
+    const answer = (fields: Record<string, string>): Response => {
+      const back = new URL(redirectUri);
+      for (const [name, value] of Object.entries(fields)) back.searchParams.set(name, value);
+      if (state !== "") back.searchParams.set("state", state);
+      back.searchParams.set("iss", base);
+      return new Response(null, {
+        status: 302,
+        headers: { location: back.toString(), "cache-control": "no-store" },
+      });
+    };
+
+    const destination = {
+      host: new URL(redirectUri).host,
+      clientName: await registeredClientName(bearer, params.get("client_id")),
+    };
+    if (request.method === "GET") return consentPage(params, destination);
+
+    // Declining needs no token: it hands the client nothing but the refusal.
+    if (params.get("decision") === "deny") {
+      return answer({ error: "access_denied", error_description: "the request was declined" });
+    }
 
     const presented = (params.get("token") ?? "").trim();
     if (!tokensMatch(presented, bearer)) {
-      params.delete("token");
-      return consentPage(params, "That token was not accepted.");
+      return consentPage(params, destination, "That token was not accepted.");
     }
 
     const code = await issueCode(bearer, {
@@ -411,13 +510,7 @@ export async function handleOAuth(request: Request, env: AgentEnv): Promise<Resp
       ru: redirectUri,
       exp: Math.floor(Date.now() / 1000) + CODE_TTL_SECONDS,
     });
-    const back = new URL(redirectUri);
-    back.searchParams.set("code", code);
-    if (state !== "") back.searchParams.set("state", state);
-    return new Response(null, {
-      status: 302,
-      headers: { location: back.toString(), "cache-control": "no-store" },
-    });
+    return answer({ code });
   }
 
   if (path === "/oauth/token") {
@@ -487,6 +580,17 @@ function tokenResponse(bearer: string): Response {
     200,
     { "cache-control": "no-store", pragma: "no-cache" }
   );
+}
+
+/** The registration's `client_name`, made displayable, or `null` when absent or unusable. */
+function clientNameOf(body: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (parsed === null || typeof parsed !== "object") return null;
+    return displayableClientName((parsed as { client_name?: unknown }).client_name);
+  } catch {
+    return null;
+  }
 }
 
 /**

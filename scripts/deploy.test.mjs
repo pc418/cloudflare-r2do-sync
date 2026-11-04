@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -555,4 +555,104 @@ test("--live is a separate door, and it is gated on a deny list", async () => {
   assert.match(source, /--live requires --deny/);
   // And --live/--vault are mutually exclusive, or the target would be ambiguous.
   assert.match(source, /--live and --vault name different deployments/);
+});
+
+test("agent deployment and script names are validated at the option boundary", async () => {
+  const { agentTarget, LIVE, parseArgs } = await import("./deploy-agent.mjs");
+  const base = { scriptName: "obsidian-r2do-sync", bucket: "obsidian-r2do-sync" };
+
+  for (const bad of ["../x", "a/b", "a\\b", "..", "x/../../escape", ".env", "Notes", "", " ", "a"]) {
+    assert.throws(() => agentTarget({ vault: bad }, base), /deployment name/, `vault ${JSON.stringify(bad)}`);
+    assert.throws(
+      () => agentTarget({ vault: "obsidian-agent-dummy", name: bad }, base),
+      /deployment name/,
+      `name ${JSON.stringify(bad)}`
+    );
+  }
+  // The refusals a vault deploy already makes hold here too.
+  for (const forbidden of ["obsidian-r2do-sync", "obsidian", "my-sandbox-1"]) {
+    assert.throws(() => agentTarget({ vault: forbidden }, base));
+    assert.throws(() => agentTarget({ vault: "obsidian-agent-dummy", name: forbidden }, base));
+  }
+
+  assert.deepEqual(agentTarget({ vault: "obsidian-agent-dummy" }, base), { vault: "obsidian-agent-dummy", name: null });
+  assert.deepEqual(agentTarget({ vault: "obsidian-agent-dummy", name: "dummy-agent-2" }, base), {
+    vault: "obsidian-agent-dummy",
+    name: "dummy-agent-2",
+  });
+  // `live` is production, and only `--live` may say so.
+  assert.deepEqual(agentTarget(parseArgs(["--live", "--deny", "Private/**"]), base), { vault: LIVE, name: null });
+  assert.throws(() => agentTarget({ vault: LIVE }, base), /pass --live/);
+  assert.throws(() => agentTarget(parseArgs(["--vault", LIVE]), base), /pass --live/);
+});
+
+test("a rejected agent name touches nothing: no file, no lock, no request", async () => {
+  const { deployAgent } = await import("./deploy-agent.mjs");
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const before = new Set(readdirSync(root));
+  const realFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url) => {
+    requests.push(String(url));
+    throw new Error("no network in this test");
+  };
+  try {
+    for (const opts of [
+      { vault: "../escape", writable: false },
+      { vault: "a/b", writable: false },
+      { vault: "obsidian-agent-dummy", name: "../evil", writable: false },
+      { vault: "obsidian-agent-dummy", name: "x/y", writable: false },
+    ]) {
+      await assert.rejects(deployAgent(opts), /invalid deployment name/, JSON.stringify(opts));
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.deepEqual(requests, []);
+  assert.deepEqual([...readdirSync(root)].filter((f) => !before.has(f)), []);
+});
+
+test("REST path components in the agent deploy are encoded one by one", () => {
+  const source = readFileSync(fileURLToPath(new URL("./deploy-agent.mjs", import.meta.url)), "utf8");
+  assert.match(source, /accounts\/\$\{encodeURIComponent\(ACCOUNT_ID\)\}/);
+  assert.match(source, /const SCRIPT = encodeURIComponent\(scriptName\);/);
+  assert.match(source, /\/api\/tokens\/\$\{encodeURIComponent\(id\)\}/);
+  // No raw interpolation of the script name into a REST path survives.
+  assert.doesNotMatch(source, /\/workers\/scripts\/\$\{scriptName\}/);
+});
+
+test("a failed Cloudflare step prints status and errors[], never the rest of the response", async () => {
+  const { cloudflareFailure } = await import("./setup-lib.mjs");
+  const SENTINEL = "SENTINEL-master-key-AAAA";
+  const message = cloudflareFailure("put-secret", {
+    status: 400,
+    body: {
+      success: false,
+      errors: [
+        { code: 10021, message: "script content is invalid", documentation_url: SENTINEL },
+        { code: "10052", message: "binding name collision", error_chain: [{ message: SENTINEL }] },
+      ],
+      messages: [SENTINEL],
+      result: { name: "VAULT_MASTER_KEY", text: SENTINEL },
+    },
+  }).message;
+  assert.match(message, /FAIL \[put-secret\]: HTTP 400/);
+  assert.match(message, /10021: script content is invalid/);
+  assert.match(message, /10052: binding name collision/);
+  assert.doesNotMatch(message, new RegExp(SENTINEL));
+
+  // A body that is not the Cloudflare envelope gives the status alone.
+  for (const body of [null, "<html>bad gateway</html>", { result: SENTINEL }, { errors: SENTINEL }]) {
+    const only = cloudflareFailure("upload", { status: 502, body }).message;
+    assert.equal(only, "FAIL [upload]: HTTP 502");
+  }
+  // The script's own message passes through.
+  assert.equal(cloudflareFailure("smoke", "health did not answer").message, "FAIL [smoke]: health did not answer");
+
+  // Both deploy paths fail through it, and neither stringifies a response any more.
+  for (const file of ["./deploy.mjs", "./deploy-agent.mjs"]) {
+    const source = readFileSync(fileURLToPath(new URL(file, import.meta.url)), "utf8");
+    assert.match(source, /throw cloudflareFailure\(step, detail\);/, file);
+    assert.doesNotMatch(source, /JSON\.stringify\(detail/, file);
+  }
 });
