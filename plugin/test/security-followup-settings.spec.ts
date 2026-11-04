@@ -391,6 +391,56 @@ describe("B1: an interrupted encryption change resumes only on proof", () => {
     expect((await flushToDisk(plugin)).pendingEncryptionTransition).toBeNull();
   });
 
+  /**
+   * The plaintext migration committed CHILD and saved its own state, then the process died before
+   * the pending change was cleared. That record names CHILD, but what the server answers for
+   * CHILD is still only the server's word.
+   */
+  async function committedPlaintext(
+    served: (recorded: Record<string, FileEntry>) => Promise<Record<string, FileEntry>>
+  ) {
+    const r = await interrupted("plaintext");
+    const { h, size, mtime } = r.sourceFiles[NOTE];
+    const recorded = { [NOTE]: { h, size, mtime } };
+    r.data.state = { lastSyncedHead: CHILD, files: recorded, keyId: null, lines: {} };
+    publish(r.server, await snapshot(null, CHILD, SOURCE, await served(recorded)));
+    return r;
+  }
+
+  it.each([
+    [
+      "a different",
+      async () => {
+        const other = new TextEncoder().encode("planted\n");
+        return { "planted.md": { h: await sha256Hex(other), size: other.byteLength, mtime: 1 } };
+      },
+    ],
+    ["an empty", async () => ({})],
+  ] as const)("does not complete when the recorded plaintext head is served with %s map", async (_label, map) => {
+    const r = await committedPlaintext(map);
+
+    const { plugin } = await boot(r.data);
+
+    expect(plugin.settings.encryptionMode).toBe("encrypted");
+    const saved = await flushToDisk(plugin);
+    expect(saved.settings.masterKey).toBe(r.oldKey);
+    expect(saved.pendingEncryptionTransition).toEqual(r.data.pendingEncryptionTransition);
+    expect(commitsAttempted(r.server)).toBe(0);
+  });
+
+  it("completes when the recorded plaintext head is served with the map this device committed", async () => {
+    const r = await committedPlaintext(async (recorded) => recorded);
+
+    const { plugin } = await boot(r.data);
+
+    expect(plugin.settings.encryptionMode).toBe("plaintext");
+    expect(plugin.settings.masterKey).toBe("");
+    const saved = await flushToDisk(plugin);
+    expect(saved.pendingEncryptionTransition).toBeNull();
+    // The record is the target's own, so it is kept as the merge base rather than dropped.
+    expect(saved.state).toEqual(r.data.state);
+  });
+
   it("re-runs a migration interrupted before its commit, after a reload", async () => {
     const r = await interrupted("rekey");
 

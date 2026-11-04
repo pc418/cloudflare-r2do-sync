@@ -161,7 +161,8 @@ export type TransitionBase = Pick<SyncState, "lastSyncedHead" | "files" | "keyId
  *
  * 1. The head is still the snapshot the migration started from: nothing was committed.
  * 2. This device's own post-commit record (`current`, saved by the migration itself) names the
- *    head under the target key — and, for an encrypted target, the head authenticates under it.
+ *    head under the target key — and the head authenticates under it (encrypted target) or
+ *    carries exactly the path map that record saved (plaintext target).
  * 3. The head is a direct child of the source head (`base`), and either authenticates under the
  *    target key (encrypted target; `parent` is inside the AAD) or carries exactly the source's
  *    content (plaintext target, which has no key: persisted intent plus content equivalence).
@@ -192,16 +193,19 @@ export async function classifyTransition(evidence: {
       : null;
   if (source !== null && head === source.lastSyncedHead) return "not-started";
 
-  const authenticTarget = async (): Promise<boolean> =>
-    targetCrypto === null ? manifest.v === 1 : authenticatesUnderKey(manifest, targetCrypto);
-
   if (
     current !== null &&
     current.lastSyncedHead === head &&
-    (current.keyId ?? null) === targetKeyId &&
-    (await authenticTarget())
+    (current.keyId ?? null) === targetKeyId
   ) {
-    return "complete";
+    // The record names the head, but the head's content is still the server's word. A plaintext
+    // target has no key, so the served map must be the one this device recorded committing —
+    // otherwise the recorded id could be answered with any map, an empty one included.
+    const proven =
+      targetCrypto === null
+        ? manifest.v === 1 && samePlainContent(manifest.files, current.files)
+        : await authenticatesUnderKey(manifest, targetCrypto);
+    if (proven) return "complete";
   }
   if (source !== null && manifest.parent === source.lastSyncedHead) {
     const proven =
