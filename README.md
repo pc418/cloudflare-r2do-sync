@@ -169,9 +169,10 @@ and re-add the connector.
 Read-only gives `search`, `read`, `list` and `recent`. Writable adds `append`, `edit`, `delete`
 and `move` on a second, separately revocable credential.
 
-The write tools behave like a file system, minus one-call overwrite: `append` adds to a note and
-creates it if missing, `edit` changes one exact string, and replacing a whole note is `delete`
-then `append`. `delete` asks for no confirmation, and folders come and go with the notes in
+The write tools behave like a file system with no blind overwrite: `append` adds to a note and
+creates it if missing, and `edit` replaces one exact string it quotes, so it fails if that text
+changed. Replacing a whole note is `delete` then `append` (or an `edit` quoting the note's entire
+current text). `delete` asks for no confirmation, and folders come and go with the notes in
 them. **Your undo is snapshot history**, so the retention window is what a mistake costs, and
 recovery is done from the plugin — the assistant cannot do it for you. `move` is the exception
 to the plain-`rm` reading: it refuses to land on a path that already exists.
