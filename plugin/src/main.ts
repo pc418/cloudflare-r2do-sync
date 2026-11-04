@@ -33,10 +33,14 @@ import {
 } from "./crypto";
 import {
   activateEncryptionState,
+  classifyTransition,
   encryptionReadiness,
   normalizeEncryptionState,
+  remoteAdoptableAsTarget,
   remoteManifestMatchesTarget,
   type EncryptionMode,
+  type TransitionBase,
+  type TransitionOutcome,
 } from "./encryption-state";
 import {
   conflictDiff,
@@ -134,10 +138,13 @@ import {
   domMobileChrome,
 } from "./mobile-status-bar";
 import {
+  alwaysSkip,
   ancestorDirs,
   countInScope,
+  isConfigPath,
   makeFolderScopeFilter,
   parseGlobs,
+  pathError,
   DEFAULT_CONFIG_DIR,
 } from "./paths";
 import { DEFAULT_LANES, MAX_LANES, clampLanes, mapPool } from "./pool";
@@ -158,6 +165,7 @@ import {
   isSettingsDoc,
   reconcileVaultSalt,
   sharedFingerprint,
+  type SaltReconciliation,
   type SettingsDoc,
   type SettingsRev,
 } from "./settings-doc";
@@ -265,6 +273,19 @@ export interface Settings {
    */
   firstSyncAcknowledged: boolean;
   /**
+   * The endpoint (`endpointIdentity`) whose shared settings this device has accepted in the
+   * authenticated v3 format — by decrypting one under the vault key, or by publishing one.
+   * Empty: never. While it names the current endpoint and the vault is encrypted, a v2 or v1
+   * document is refused: v2 authenticates nothing around its ciphertext, so anyone with the
+   * sync token could replay a captured old policy under a revision of their choosing.
+   *
+   * Device-local and never shared (`SharedSettings` is a whitelist). Kept inside `settings`
+   * rather than beside it because 1.1.7 carries unknown `settings` keys through a load and
+   * save but drops unknown top-level ones, so a rollback and return keeps the latch. A key
+   * rotation keeps it too; only a different endpoint — a different vault — leaves it inert.
+   */
+  authenticatedSettingsEndpoint: string;
+  /**
    * Rename Markdown over 1.5 MiB to `.txt` automatically (`large-markdown.ts`). Device-local,
    * because it relieves this device's indexer. The explicit rename button ignores it.
    */
@@ -318,6 +339,7 @@ export const DEFAULT_SETTINGS: Settings = {
   mobileStatusBar: false,
   syncSettings: true,
   firstSyncAcknowledged: false,
+  authenticatedSettingsEndpoint: "",
   largeMarkdownAsText: true,
 };
 
@@ -365,15 +387,35 @@ export function dataResponsibility(mode: EncryptionMode): string {
  * the disclaimer is actually in the dialog the user has to answer, rather than only in the
  * panel they may never look at.
  */
-export function firstSyncConsentBody(mode: EncryptionMode): readonly string[] {
+export function firstSyncConsentBody(mode: EncryptionMode, server = ""): readonly string[] {
   return [
     "This device has not synced with the vault yet, so the first pass reconciles two " +
       "collections of real files: everything the remote holds is merged into this vault, and " +
       "everything here is published. Notes that cannot be merged are kept on both sides, but " +
       "a copy of this vault is the only thing that makes a bad first pass fully undoable. " +
       "Make one now if you have not.",
+    ...destinationParagraph(server),
     dataResponsibility(mode),
   ];
+}
+
+/**
+ * Where the first pass goes, named in the dialog that consents to it. A setup link sets the
+ * server along with everything else, so without this the user agrees to publish the vault
+ * without being told to whom. Origin only: the path, query and fragment are not the
+ * destination's identity, and nothing here may carry the access token.
+ */
+export function serverOrigin(url: string): string {
+  try {
+    const origin = new URL(url).origin;
+    return origin === "null" ? "" : origin;
+  } catch {
+    return "";
+  }
+}
+
+function destinationParagraph(server: string): string[] {
+  return server === "" ? [] : [`This first sync is with the server at ${server}.`];
 }
 
 /**
@@ -386,11 +428,12 @@ export function firstSyncConsentBody(mode: EncryptionMode): readonly string[] {
  * general question anyway would be describing a risk this case does not carry, which is how a
  * dialog teaches people to click through dialogs.
  */
-export function emptyVaultConsentBody(mode: EncryptionMode): readonly string[] {
+export function emptyVaultConsentBody(mode: EncryptionMode, server = ""): readonly string[] {
   return [
     "This vault has no notes of its own yet, so this first sync only downloads: the vault's " +
       "files are written here, and nothing on this device is published. Once it finishes, " +
       "this device syncs in both directions like any other.",
+    ...destinationParagraph(server),
     dataResponsibility(mode),
   ];
 }
@@ -489,6 +532,23 @@ const MIN_START_NOTICE_MS = 1500;
 const ENCRYPTION_REWRITE_BLOCK =
   "Encryption is being changed, which rewrites every file on the remote. Wait for it to " +
   "finish, then resolve this conflict.";
+/** A migration that reported a failure, but whose commit the remote proves landed. */
+const ENCRYPTION_CHANGE_LANDED =
+  "R2DO Sync: the encryption change reported an error, but the remote shows it finished, so " +
+  "this device now uses the new setting.";
+/** Appended when a failed migration cannot be shown either to have landed or not to have. */
+const ENCRYPTION_CHANGE_KEPT =
+  "The remote could not confirm whether the change landed, so this device keeps its current " +
+  "key and the pending change, and checks again the next time R2DO Sync starts.";
+/**
+ * A resumed change whose remote head proves neither completion nor the old mode: typically a
+ * header claiming the new key that does not authenticate under it.
+ */
+const ENCRYPTION_RESUME_UNVERIFIED =
+  "R2DO Sync could not confirm that the interrupted encryption change finished: the remote " +
+  "snapshot does not prove it was written by this change. This device keeps its current key " +
+  "and the pending change, and checks again the next time R2DO Sync starts. If the vault was " +
+  "changed from another device, apply a setup link from that device instead.";
 const FORCE_PULL_BLOCK =
   "The remote is being pulled over this vault. Wait for it to finish, then resolve this " +
   "conflict — the pull may already have settled it.";
@@ -707,6 +767,8 @@ export default class LogSyncPlugin extends Plugin {
    * rather than restored from disk where it could go stale.
    */
   #keyMismatch: string | null = null;
+  /** One warning per load for refused pre-v3 settings documents; the refusal itself repeats. */
+  #warnedSettingsDowngrade = false;
   /** Set while a sync the user asked for is running, so guards may raise a modal. */
   #interactive = 0;
   #phase:
@@ -739,6 +801,9 @@ export default class LogSyncPlugin extends Plugin {
     }
     if (typeof this.settings.largeMarkdownAsText !== "boolean") {
       this.settings.largeMarkdownAsText = DEFAULT_SETTINGS.largeMarkdownAsText;
+    }
+    if (typeof this.settings.authenticatedSettingsEndpoint !== "string") {
+      this.settings.authenticatedSettingsEndpoint = DEFAULT_SETTINGS.authenticatedSettingsEndpoint;
     }
     // The five per-category notice booleans became one level in 0.7.2. Resolved from the SAVED
     // object rather than from `this.settings`, because the spread above has already merged the
@@ -1258,63 +1323,58 @@ export default class LogSyncPlugin extends Plugin {
   async #pullSharedSettings(): Promise<void> {
     const api = this.#settingsApi();
     if (api === null) return;
+    // The endpoint this document came from, captured before any await can see the URL change.
+    const endpoint = endpointIdentity(this.settings.serverUrl);
     const raw = await api.getSettingsDoc();
     if (raw === null) return; // nothing shared yet; a local change will publish first
     if (!isSettingsDoc(raw)) throw new Error("shared settings document is malformed");
-    const salt = reconcileVaultSalt(this.settings.vaultSalt, raw.vaultSalt);
-    const saltChanged = salt.changed;
-    if (salt.changed) {
-      this.settings.vaultSalt = salt.salt;
-      if (salt.replaced !== null) {
-        // Only worth a word: a passphrase-derived key was derived with the old salt, so the
-        // owner's written-down recovery pair no longer matches the vault.
-        new Notice(
-          "R2DO Sync adopted this vault's published salt in place of the one this device " +
-            "generated. If you set this device's master key from a passphrase, re-derive it " +
-            "using the vault salt now shown in settings.",
-          15_000
-        );
-      }
-    }
     const rev: SettingsRev = { updatedAt: raw.updatedAt, device: raw.device, rev: raw.rev };
-    if (this.#sharedSettings !== null && !isNewerRev(rev, this.#sharedSettings.rev)) {
-      if (saltChanged) await this.#persist();
+    const newer = this.#sharedSettings === null || isNewerRev(rev, this.#sharedSettings.rev);
+    // A same-revision document still matters when it carries a salt this device lacks.
+    if (!newer && !reconcileVaultSalt(this.settings.vaultSalt, raw.vaultSalt).changed) return;
+
+    // The format version, not the revision: a replay names whatever revision it likes.
+    if (raw.v !== 3 && this.#authenticatedSettingsRequired()) {
+      if (!this.#warnedSettingsDowngrade) {
+        this.#warnedSettingsDowngrade = true;
+        const text =
+          `ignored shared settings from "${raw.device}": this vault's settings are ` +
+          `authenticated, and this document is the older v${raw.v} format, which anyone with ` +
+          "the sync token can replay. Change a setting on an up-to-date device to republish them.";
+        console.warn(`R2DO Sync: ${text}`);
+        this.#say("problems", text, 15_000);
+      }
       return;
     }
 
-    let plain: Record<string, unknown>;
-    if (raw.v === 2 || raw.v === 3) {
-      if (!this.encryptionEnabled) {
-        throw new Error("shared settings are encrypted, but this device has no master key");
+    const plain = await this.#openSettingsDoc(raw);
+
+    // Only now, once the document has opened: a v3 envelope's salt is inside its AAD, so a
+    // substituted salt fails the decryption above. v2 binds nothing outside its ciphertext,
+    // so its salt stays an unauthenticated claim — adopted after the key check and the
+    // decryption because the server holds the salt write-once and refuses any other on
+    // publish, and refused outright once the vault is known to publish v3.
+    const salt = reconcileVaultSalt(this.settings.vaultSalt, raw.vaultSalt);
+    if (!newer) {
+      if (salt.changed) {
+        this.#adoptVaultSalt(salt);
+        await this.#persist();
       }
-      const crypto = await VaultCrypto.fromText(this.settings.masterKey);
-      if (crypto.keyId !== raw.keyId) {
-        throw new WrongVaultKeyError(
-          "shared settings were written with a different master key — this device was " +
-            'configured by hand instead of from the vault. On a working device use "Set up ' +
-            'another device", then scan its QR or copy its setup link and apply that here; ' +
-            "a typed server URL and access token do not carry the key."
-        );
-      }
-      // Positive proof this device holds the vault's key, so any earlier verdict is stale.
-      this.#keyMismatch = null;
-      // v3 authenticates the revision and identity around the ciphertext; v2 does not, and
-      // stays readable so an upgrade does not strand a vault's existing policy document.
-      plain = await crypto.decryptSettingsJson<Record<string, unknown>>(
-        raw.enc,
-        raw.v === 3
-          ? settingsAad({ v: 3, rev: raw.rev ?? 0, device: raw.device, keyId: raw.keyId, vaultSalt: raw.vaultSalt })
-          : undefined
-      );
-    } else {
-      // Mixed mode also halts the vault sync itself; refusing here keeps the two aligned.
-      if (this.encryptionEnabled) {
-        throw new Error("shared settings are plaintext, but this vault is encrypted");
-      }
-      plain = raw.plain;
+      return;
     }
 
-    const changed = applySharedSettings(this.settings, plain) || saltChanged;
+    // Every field is checked on a copy before any of them takes effect, so a document that
+    // fails validation half-way can neither half-apply nor set the latch.
+    applySharedSettings({ ...this.settings }, plain);
+    if (raw.v === 3) {
+      if (this.settings.authenticatedSettingsEndpoint !== endpoint) {
+        this.settings.authenticatedSettingsEndpoint = endpoint;
+        // On disk before the document's settings are, so no reload can accept a v2 after them.
+        await this.#persist();
+      }
+    }
+    if (salt.changed) this.#adoptVaultSalt(salt);
+    const changed = applySharedSettings(this.settings, plain) || salt.changed;
     this.#sharedSettings = { rev, fingerprint: sharedFingerprint(this.settings) };
     if (changed) {
       // Fingerprint already matches the doc, so the push scheduled by saveSettings no-ops.
@@ -1327,9 +1387,71 @@ export default class LogSyncPlugin extends Plugin {
     }
   }
 
+  /** Whether this encrypted device has accepted v3 settings for the endpoint it uses now. */
+  #authenticatedSettingsRequired(): boolean {
+    const latched = this.settings.authenticatedSettingsEndpoint;
+    return (
+      this.encryptionEnabled &&
+      latched !== "" &&
+      latched === endpointIdentity(this.settings.serverUrl)
+    );
+  }
+
+  /**
+   * The document's shared fields, once its format matches this device's mode and, when
+   * encrypted, its key id matches and its ciphertext opens. v3 also authenticates its envelope.
+   */
+  async #openSettingsDoc(raw: SettingsDoc): Promise<Record<string, unknown>> {
+    if (raw.v === 1) {
+      // Mixed mode also halts the vault sync itself; refusing here keeps the two aligned.
+      if (this.encryptionEnabled) {
+        throw new Error("shared settings are plaintext, but this vault is encrypted");
+      }
+      return raw.plain;
+    }
+    if (!this.encryptionEnabled) {
+      throw new Error("shared settings are encrypted, but this device has no master key");
+    }
+    const crypto = await VaultCrypto.fromText(this.settings.masterKey);
+    if (crypto.keyId !== raw.keyId) {
+      throw new WrongVaultKeyError(
+        "shared settings were written with a different master key — this device was " +
+          'configured by hand instead of from the vault. On a working device use "Set up ' +
+          'another device", then scan its QR or copy its setup link and apply that here; ' +
+          "a typed server URL and access token do not carry the key."
+      );
+    }
+    // Positive proof this device holds the vault's key, so any earlier verdict is stale.
+    this.#keyMismatch = null;
+    // v3 authenticates the revision and identity around the ciphertext; v2 does not, and
+    // stays readable so an upgrade does not strand a vault's existing policy document.
+    return await crypto.decryptSettingsJson<Record<string, unknown>>(
+      raw.enc,
+      raw.v === 3
+        ? settingsAad({ v: 3, rev: raw.rev ?? 0, device: raw.device, keyId: raw.keyId, vaultSalt: raw.vaultSalt })
+        : undefined
+    );
+  }
+
+  #adoptVaultSalt(salt: SaltReconciliation): void {
+    this.settings.vaultSalt = salt.salt;
+    if (salt.replaced !== null) {
+      // Only worth a word: a passphrase-derived key was derived with the old salt, so the
+      // owner's written-down recovery pair no longer matches the vault.
+      new Notice(
+        "R2DO Sync adopted this vault's published salt in place of the one this device " +
+          "generated. If you set this device's master key from a passphrase, re-derive it " +
+          "using the vault salt now shown in settings.",
+        15_000
+      );
+    }
+  }
+
   async #pushSharedSettings(): Promise<void> {
     const api = this.#settingsApi();
     if (api === null) return;
+    // The endpoint this PUT goes to, captured before any await can see the URL change.
+    const endpoint = endpointIdentity(this.settings.serverUrl);
     const fingerprint = sharedFingerprint(this.settings);
     if (this.#sharedSettings?.fingerprint === fingerprint) return;
 
@@ -1374,6 +1496,9 @@ export default class LogSyncPlugin extends Plugin {
       try {
         await api.putSettingsDoc(doc);
         this.#sharedSettings = { rev, fingerprint };
+        // Publishing an authenticated document is as good a proof as reading one: this vault
+        // has v3 settings, so a device that only ever publishes must refuse a replayed v2 too.
+        if (doc.v === 3) this.settings.authenticatedSettingsEndpoint = endpoint;
         await this.#persist();
         return;
       } catch (e) {
@@ -1693,8 +1818,8 @@ export default class LogSyncPlugin extends Plugin {
       new ConfirmModal(this.app, {
         title: pullOnly ? "Download the vault to this device?" : "Back up this vault before the first sync",
         body: pullOnly
-          ? emptyVaultConsentBody(this.settings.encryptionMode)
-          : firstSyncConsentBody(this.settings.encryptionMode),
+          ? emptyVaultConsentBody(this.settings.encryptionMode, serverOrigin(this.settings.serverUrl))
+          : firstSyncConsentBody(this.settings.encryptionMode, serverOrigin(this.settings.serverUrl)),
         confirmText: pullOnly ? "Download the vault" : "I have a backup — sync",
         cancelText: "Not yet",
         onConfirm: () => resolve(true),
@@ -2460,7 +2585,7 @@ export default class LogSyncPlugin extends Plugin {
     const body = `${formatLogNote(this.#log, Date.now())}${NL}${this.#recoveryReport()}`;
     const name = `r2do-sync-report-${stamp(Date.now())}.md`;
     try {
-      const folder = await this.#ensureLogFolder();
+      const folder = await this.#ensureLogFolder(name);
       const path = folder === "" ? name : `${folder}/${name}`;
       await this.app.vault.create(path, body);
       new Notice(`R2DO Sync: wrote ${path}`);
@@ -2495,10 +2620,30 @@ export default class LogSyncPlugin extends Plugin {
    * vault root. A path that exists but is a *file* is an error, not something to write
    * around — silently dumping the report elsewhere is how a user ends up believing they
    * have no logs.
+   *
+   * The folder is a *shared* setting, so another device — or anyone able to write the settings
+   * document of a plaintext vault — chooses it. It is therefore checked here, at the moment it
+   * becomes a path, and refused rather than repaired: a traversal, a configuration directory
+   * (`.Obsidian/plugins` resolves to `.obsidian/plugins` on a case-insensitive disk) or any
+   * other path this plugin would never sync gets no note at all.
    */
-  async #ensureLogFolder(): Promise<string> {
+  async #ensureLogFolder(name: string): Promise<string> {
     const folder = this.settings.logNoteFolder.trim().replace(/^\/+|\/+$/g, "");
     if (folder === "") return "";
+    const target = `${folder}/${name}`;
+    const configDir = configDirOf(this.app);
+    const reserved =
+      alwaysSkip(target, configDir) ||
+      isConfigPath(target, configDir) ||
+      isConfigPath(target, DEFAULT_CONFIG_DIR);
+    const invalid =
+      pathError(target) ??
+      (reserved ? "inside the configuration folder or a folder that is never synced" : null);
+    if (invalid !== null) {
+      throw new Error(
+        `the report folder "${folder}" is not allowed (${invalid}) — change the report folder setting`
+      );
+    }
     const existing = this.app.vault.getAbstractFileByPath(folder);
     if (existing instanceof TFolder) return folder;
     if (existing !== null) {
@@ -2721,11 +2866,7 @@ export default class LogSyncPlugin extends Plugin {
       if (!this.settings.serverUrl || !this.settings.accessToken) {
         throw new Error("set the server URL and access token before changing encryption");
       }
-      const api = new SyncApi({
-        baseUrl: this.settings.serverUrl,
-        token: this.settings.accessToken,
-        http: obsidianHttp,
-      });
+      const api = this.#transitionApi();
       const head = await api.getHead();
       if (head !== null) {
         const manifest = await api.getManifest(head);
@@ -2736,13 +2877,23 @@ export default class LogSyncPlugin extends Plugin {
             "mode/key and sync once to adopt it before running REKEY"
           );
         }
+        // The clear keyId is only a claim. Adopting on it alone would discard this device's
+        // current key for a header anyone with the sync token can write.
+        if (!(await remoteAdoptableAsTarget(manifest, targetCrypto))) {
+          throw new Error(
+            `remote head ${shortSnapshot(head)} names the requested key but does not decrypt ` +
+              "under it; refusing to adopt it"
+          );
+        }
       }
       this.#activateEncryptionTarget(target);
+      this.#pendingEncryptionTransition = null;
       await this.saveSettings();
       return;
     }
     if (currentKeyId === targetKeyId) {
       this.#activateEncryptionTarget(target);
+      this.#pendingEncryptionTransition = null;
       await this.saveSettings();
       return;
     }
@@ -2753,6 +2904,7 @@ export default class LogSyncPlugin extends Plugin {
     }
 
     this.#pendingEncryptionTransition = target;
+    const base = this.#transitionBase();
     // Held across the rebuild, not just the migration: the block is released by the `finally`
     // only once a usable scheduler is installed again.
     await this.#withVaultRewrite(ENCRYPTION_REWRITE_BLOCK, async () => {
@@ -2764,25 +2916,95 @@ export default class LogSyncPlugin extends Plugin {
       // duration, and `#vaultRewrite` above is what keeps a conflict choice from meeting it
       // and being told "sync scheduler stopped".
       await scheduler.stopAndWait();
+      let migrated: number;
       try {
-        const migrated = await engine.migrateEncryption(targetCrypto);
-        this.#activateEncryptionTarget(target);
-        this.#pendingEncryptionTransition = null;
-        // Force the settings document to be rewritten under the target mode/key.
-        this.#sharedSettings = null;
-        await this.saveSettings();
-        new Notice(
-          `R2DO Sync migrated ${migrated.files} file(s) to ${target.mode === "encrypted" ? "encrypted" : "plaintext"} storage.`,
-          10_000
-        );
+        migrated = (await engine.migrateEncryption(targetCrypto)).files;
       } catch (error) {
-        this.#pendingEncryptionTransition = null;
+        // A failure says nothing about whether the commit landed: the response can be lost
+        // after the server took it, or the state save can fail after the commit. Only proof
+        // that the remote is still in the source mode cancels the change; without proof
+        // either way the change and the current key are both kept for the next start.
+        const outcome = await this.#transitionOutcome(base, targetCrypto);
+        if (outcome === "complete") {
+          await this.#completeEncryptionTarget(target, targetCrypto);
+          new Notice(ENCRYPTION_CHANGE_LANDED, 10_000);
+          return;
+        }
+        if (outcome === "not-started") this.#pendingEncryptionTransition = null;
         await this.#persist();
         await this.rebuild();
-        new Notice(`Encryption migration failed: ${message(error)}`, 0);
+        new Notice(
+          `Encryption migration failed: ${message(error)}` +
+            (outcome === "unverified" ? ` ${ENCRYPTION_CHANGE_KEPT}` : ""),
+          0
+        );
         throw error;
       }
+      await this.#completeEncryptionTarget(target, targetCrypto);
+      new Notice(
+        `R2DO Sync migrated ${migrated} file(s) to ${target.mode === "encrypted" ? "encrypted" : "plaintext"} storage.`,
+        10_000
+      );
     });
+  }
+
+  #transitionApi(): SyncApi {
+    return new SyncApi({
+      baseUrl: this.settings.serverUrl,
+      token: this.settings.accessToken,
+      http: obsidianHttp,
+    });
+  }
+
+  /** This device's own record of where it stands, captured before an attempt changes it. */
+  #transitionBase(): TransitionBase | null {
+    const state = this.#state;
+    if (state === null) return null;
+    return { lastSyncedHead: state.lastSyncedHead, files: state.files, keyId: state.keyId ?? null };
+  }
+
+  /**
+   * Where a transition stands on the remote, judged by `classifyTransition`. A remote that
+   * cannot be asked is `unverified` — never a reason to drop the change or the key.
+   */
+  async #transitionOutcome(
+    base: TransitionBase | null,
+    targetCrypto: VaultCrypto | null
+  ): Promise<TransitionOutcome> {
+    try {
+      const api = this.#transitionApi();
+      const head = await api.getHead();
+      const manifest = head === null ? null : await api.getManifest(head);
+      const sourceCrypto = this.encryptionEnabled
+        ? await VaultCrypto.fromText(this.settings.masterKey)
+        : null;
+      return await classifyTransition({
+        head,
+        manifest,
+        base,
+        current: this.#transitionBase(),
+        sourceCrypto,
+        targetCrypto,
+      });
+    } catch (error) {
+      console.warn("R2DO Sync: could not check the encryption change against the remote", error);
+      return "unverified";
+    }
+  }
+
+  /** The target is in effect on the remote; make it this device's mode and key. */
+  async #completeEncryptionTarget(
+    target: PendingEncryptionTransition,
+    targetCrypto: VaultCrypto | null
+  ): Promise<void> {
+    this.#activateEncryptionTarget(target);
+    this.#pendingEncryptionTransition = null;
+    // If the process died after CAS but before the engine persisted target state,
+    // force a target-mode pull rather than trusting a source-mode cache.
+    if ((this.#state?.keyId ?? null) !== (targetCrypto?.keyId ?? null)) this.#state = null;
+    // Force the settings document to be rewritten under the target mode/key.
+    this.#sharedSettings = null;
+    await this.saveSettings();
   }
 
   #activateEncryptionTarget(target: PendingEncryptionTransition): void {
@@ -2806,25 +3028,19 @@ export default class LogSyncPlugin extends Plugin {
     try {
       if (pending.mode === "encrypted") parseVaultSalt(pending.vaultSalt);
       const targetCrypto = pending.mode === "encrypted" ? await VaultCrypto.fromText(pending.key) : null;
-      const api = new SyncApi({
-        baseUrl: this.settings.serverUrl,
-        token: this.settings.accessToken,
-        http: obsidianHttp,
-      });
-      const head = await api.getHead();
-      if (head !== null) {
-        const manifest = await api.getManifest(head);
-        const remoteMatches = remoteManifestMatchesTarget(manifest, targetCrypto?.keyId ?? null);
-        if (remoteMatches) {
-          this.#activateEncryptionTarget(pending);
-          this.#pendingEncryptionTransition = null;
-          // If the process died after CAS but before the engine persisted target state,
-          // force a target-mode pull rather than trusting a source-mode cache.
-          if ((this.#state?.keyId ?? null) !== (targetCrypto?.keyId ?? null)) this.#state = null;
-          this.#sharedSettings = null;
-          await this.saveSettings();
-          return;
-        }
+      // No snapshot of its own: nothing was migrated, and adoption checks the remote itself.
+      if (this.#state?.lastSyncedHead == null) {
+        await this.#applyEncryptionTarget(pending);
+        return;
+      }
+      const outcome = await this.#transitionOutcome(this.#transitionBase(), targetCrypto);
+      if (outcome === "complete") {
+        await this.#completeEncryptionTarget(pending, targetCrypto);
+        return;
+      }
+      if (outcome === "unverified") {
+        new Notice(ENCRYPTION_RESUME_UNVERIFIED, 0);
+        return;
       }
       await this.#applyEncryptionTarget(pending);
     } catch (error) {
