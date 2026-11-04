@@ -1632,6 +1632,54 @@ export class SyncEngine {
     return null;
   }
 
+  /**
+   * Why this device must not take content from a snapshot it was pointed at, or null.
+   *
+   * History, browsing, per-file restore and restore-all all read a snapshot the user *chose*,
+   * not the head, and none of them used to ask `#modeError` — so on an encrypted device a v1
+   * path map, which nothing authenticates, was listed, previewed and restored. It can name any
+   * path and point it at any blob, including a genuine encrypted blob of this vault that this
+   * device's key then opens without complaint, so the bytes pass every later check while
+   * landing wherever the map says.
+   *
+   * `#modeError`'s rules, with two deliberate differences. There is no empty-snapshot
+   * exemption: that exists so a sync can *adopt* an empty plaintext head, while a restore of
+   * an empty snapshot is a deletion of everything this device syncs. And the wording speaks
+   * about this snapshot, not about committing. v2 under this device's key stays readable, as it
+   * does for `forcePull`: its path map is still encrypted under the key, only its envelope is
+   * unauthenticated, and existing history is v2.
+   *
+   * A snapshot is refused on its own; a listing that crosses a key or mode change still lists
+   * every row and marks these unreadable.
+   */
+  #snapshotSourceError(manifest: Manifest): string | null {
+    if (this.#crypto === null) {
+      return isEncryptedManifest(manifest)
+        ? `snapshot ${manifest.id} is encrypted, but no vault master key is set on this device`
+        : null;
+    }
+    if (manifest.v === 1) {
+      return (
+        `snapshot ${manifest.id} is unencrypted, but this device has encryption enabled, so ` +
+        "nothing authenticates what it lists"
+      );
+    }
+    if (manifest.keyId !== this.#crypto.keyId) {
+      return (
+        `snapshot ${manifest.id} was encrypted with a different master key ` +
+        `(snapshot ${manifest.keyId}, ours ${this.#crypto.keyId})`
+      );
+    }
+    return null;
+  }
+
+  /** A chosen snapshot's path map, refused unless `#snapshotSourceError` allows it. */
+  async #snapshotSourceFiles(manifest: Manifest): Promise<Record<string, FileEntry>> {
+    const refused = this.#snapshotSourceError(manifest);
+    if (refused !== null) throw new Error(refused);
+    return await this.#remoteFiles(manifest);
+  }
+
   async #remoteFiles(remote: Manifest): Promise<Record<string, FileEntry>> {
     if (remote.v === 1) return copyPathMap(remote.files);
     if (this.#crypto === null) throw new HaltError("remote is encrypted and no master key is set");
@@ -2519,7 +2567,7 @@ export class SyncEngine {
         return { missing: e };
       }
       try {
-        return { files: await this.#remoteFiles(manifest), manifest };
+        return { files: await this.#snapshotSourceFiles(manifest), manifest };
       } catch {
         return { files: null, manifest };
       }
@@ -2678,7 +2726,7 @@ export class SyncEngine {
       }
       let files: Record<string, FileEntry> | null;
       try {
-        files = await this.#remoteFiles(manifest);
+        files = await this.#snapshotSourceFiles(manifest);
       } catch {
         files = null;
       }
@@ -2707,7 +2755,7 @@ export class SyncEngine {
 
   /** The path → entry map a snapshot recorded, decrypting the path map when needed. */
   async snapshotFiles(id: string): Promise<Record<string, FileEntry>> {
-    return await this.#remoteFiles(await this.#api.getManifest(id));
+    return await this.#snapshotSourceFiles(await this.#api.getManifest(id));
   }
 
   /**
@@ -2720,7 +2768,7 @@ export class SyncEngine {
   async inspectRestore(id: string, path: string): Promise<RestoreInspection> {
     this.#assertRestorableSource(path);
     const manifest = await this.#api.getManifest(id);
-    const entry = (await this.#remoteFiles(manifest))[path];
+    const entry = (await this.#snapshotSourceFiles(manifest))[path];
     if (entry === undefined) throw new Error(`"${path}" is not in snapshot ${id}`);
 
     const local = await this.#localHash(path);
@@ -2927,9 +2975,14 @@ export class SyncEngine {
    * snapshot being replaced stays in the chain.
    */
   async restoreAll(id: string): Promise<{ written: number; removed: number }> {
-    return await this.#exclusive(async () =>
-      this.#materialise(await this.#api.getManifest(id), await this.#vault.list())
-    );
+    return await this.#exclusive(async () => {
+      const manifest = await this.#api.getManifest(id);
+      // Before anything else, because an empty snapshot needs no decrypt and no download:
+      // `#materialise` would go straight to removing every file this device syncs.
+      const refused = this.#snapshotSourceError(manifest);
+      if (refused !== null) throw new Error(`refusing to restore: ${refused}`);
+      return await this.#materialise(manifest, await this.#vault.list());
+    });
   }
 
   /**

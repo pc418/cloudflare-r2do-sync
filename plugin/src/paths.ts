@@ -53,22 +53,62 @@ export function segmentKey(segment: string): string {
   return (colon === -1 ? segment : segment.slice(0, colon)).normalize("NFC").toLowerCase();
 }
 
+/** A character an 8.3 short name can hold, lower-cased as `segmentKey` leaves it. */
+const SHORT_NAME_CHAR = /^[a-z0-9!#$%&'()\-@^_`{}~]$/;
+const SHORT_NAME_PART = "[a-z0-9!#$%&'()\\-@^_`{}~]";
+/** A name that is already a valid 8.3 name, for which Windows generates no alias. */
+const VALID_SHORT_NAME = new RegExp(`^${SHORT_NAME_PART}{1,8}(\\.${SHORT_NAME_PART}{1,3})?$`);
+
+/**
+ * Whether a vault-root segment may be the Windows 8.3 short name of the vault-root folder
+ * `dir` — `OBSIDI~1` for `.obsidian` — which NTFS resolves to the folder itself, exactly as it
+ * does the stream suffix `segmentKey` cuts off.
+ *
+ * A conservative heuristic, **not** 8.3 canonicalisation: it accepts `<prefix>~<digits>`, at
+ * most eight characters, whose 1–6 character prefix begins the folder's name once leading dots
+ * and characters a short name cannot hold are removed. Windows can also produce names this
+ * misses — a hashed `OB1A2B~1` after four collisions, a `.EXT` part for a name with an inner
+ * dot, `_` for some replaced characters — and which alias a folder actually got is known only
+ * to the volume. Being wrong in the other direction skips a vault-root folder that happens to
+ * be called `OBSIDI~1`, which is not a name anyone types.
+ */
+function isShortNameOf(segment: string, dir: string): boolean {
+  const match = /^(.{1,6})~([0-9]+)$/.exec(segmentKey(segment));
+  if (match === null) return false;
+  const [, prefix, digits] = match;
+  if (prefix.length + 1 + digits.length > 8) return false;
+  const name = segmentKey(dir);
+  if (VALID_SHORT_NAME.test(name)) return false;
+  const stem = [...name.replace(/^\.+/, "")].filter((ch) => SHORT_NAME_CHAR.test(ch)).join("");
+  return stem.startsWith(prefix);
+}
+
+/** Whether a first path segment names the vault-root folder `dir`, short name included. */
+function isSameRoot(segment: string, dir: string): boolean {
+  return segmentKey(segment) === segmentKey(dir) || isShortNameOf(segment, dir);
+}
+
 /**
  * Whether `path` is `dir` or inside it, comparing each segment as `segmentKey` resolves it.
  * Every check against a protected directory goes through here, so no caller can reintroduce
  * the byte-exact comparison by hand.
+ *
+ * Every protected directory is rooted at a configuration folder, so the first segment also
+ * matches that folder's 8.3 short name (`isShortNameOf`). Only the first: the configuration
+ * folder lives at the vault root, and `notes/OBSIDI~1` is an ordinary folder.
  */
 export function isUnderDir(path: string, dir: string): boolean {
   const p = path.split("/");
   const d = dir.split("/");
   if (p.length < d.length) return false;
-  return d.every((segment, i) => segmentKey(p[i]) === segmentKey(segment));
+  return d.every((segment, i) =>
+    i === 0 ? isSameRoot(p[0], segment) : segmentKey(p[i]) === segmentKey(segment)
+  );
 }
 
 /** Whether a first path segment names `configDir` or the default config directory. */
 function isConfigRoot(segment: string, configDir: string): boolean {
-  const key = segmentKey(segment);
-  return key === segmentKey(configDir) || key === DEFAULT_CONFIG_DIR;
+  return isSameRoot(segment, configDir) || isSameRoot(segment, DEFAULT_CONFIG_DIR);
 }
 
 /**

@@ -75,7 +75,11 @@ function isFileEntry(value: unknown): value is FileEntry {
   if (typeof value !== "object" || value === null) return false;
   const e = value as Record<string, unknown>;
   return (
+    // On a plaintext vault `h` is the blob key and goes into a request path. Every writer has
+    // only ever produced it with `sha256Hex` (or copied it from an entry that was), and the
+    // Worker has refused anything else in a v1 manifest since the first commit.
     typeof e.h === "string" &&
+    HASH_RE.test(e.h) &&
     typeof e.size === "number" &&
     Number.isFinite(e.size) &&
     typeof e.mtime === "number" &&
