@@ -189,9 +189,9 @@ export function mcpHandoffSection({ url, bearer, writable, vaultUrl }) {
     "",
     "     Sent verbatim: the word Bearer and the space are part of the value.",
     "",
-    `  tools     ${writable ? "search, recent, read, list, append, edit, write, move, delete" : "search, recent, read, list (read-only)"}`,
+    `  tools     ${writable ? "search, recent, read, list, append, edit, move, delete" : "search, recent, read, list (read-only)"}`,
     writable
-      ? "            write, delete and move act like a file system: no confirmation, and your\n            undo is snapshot history within the retention window."
+      ? "            append adds (creating a missing note); nothing overwrites blind. delete and move\n            ask no confirmation; your undo is snapshot history within the retention window."
       : "",
     "",
     "  Sized for ONE NOTE AT A TIME: append to a log, save a conversation, revise or replace a",
@@ -226,7 +226,7 @@ export function mcpHandoffSection({ url, bearer, writable, vaultUrl }) {
 export function mcpSetupInstructions({ url, agentEnvName, writable, handoffFile, bearerPrint }) {
   return `
 agent live at ${url}
-tools: ${writable ? "search, recent, read, list, append, edit, write, move, delete" : "search, recent, read, list (read-only)"}
+tools: ${writable ? "search, recent, read, list, append, edit, move, delete" : "search, recent, read, list (read-only)"}
 bearer fingerprint ${bearerPrint} (a hash — the value itself is in the file below)
 token ids and script name recorded in ${agentEnvName} (gitignored)
 
@@ -341,6 +341,19 @@ export function retirementPlan(agentEnv, minted, opts = {}) {
   const active = new Set((opts.activeIds ?? []).filter((id) => id));
   const ids = [...supersededTokenIds(agentEnv, minted, opts), ...pending];
   return [...new Set(ids)].filter((id) => !active.has(id));
+}
+
+/**
+ * Reads a Cloudflare answer about a Worker that may not exist yet. Only a 200 is an answer and
+ * only a 404 is absence; anything else (a token without access answers 403, a bad moment 5xx)
+ * throws, because both callers act on "absent": one mints permanent full-vault credentials, the
+ * other uploads over a name. Treating a refusal as absence did exactly that with a scoped token
+ * that could not read the Worker.
+ */
+export function workerLookup(step, res) {
+  if (res.status === 200) return { exists: true, result: res.body?.result };
+  if (res.status === 404) return { exists: false, result: undefined };
+  throw cloudflareFailure(step, res);
 }
 
 /**
@@ -507,8 +520,8 @@ async function deployAgentLocked(opts) {
   // The upload is a PUT: against a name somebody else owns it would replace that Worker's
   // code and bindings. A recorded URL from a previous deploy is proof this name is ours.
   if (!agentEnv.AGENT_URL) {
-    const existing = await cf(`/workers/scripts/${SCRIPT}/settings`);
-    if (existing.status === 200) {
+    const existing = workerLookup("read the Worker's settings", await cf(`/workers/scripts/${SCRIPT}/settings`));
+    if (existing.exists) {
       throw new Error(
         `a Worker named "${scriptName}" already exists on this account, and ${agentEnvName} has no\n` +
           "record of this deployment. Uploading would replace that Worker's code and bindings.\n" +
@@ -573,10 +586,8 @@ async function deployAgentLocked(opts) {
     // over an agent that cannot write. Asking the platform also covers the day the
     // never-deletes-a-secret behaviour stops being true: the binding is simply absent, and this
     // mints rather than deploying a tokenless agent.
-    const live = await cf(`/workers/scripts/${SCRIPT}/secrets`);
-    const present = new Set(
-      live.status === 200 ? (live.body?.result ?? []).map((secret) => secret.name) : []
-    );
+    const live = workerLookup("list the Worker's secrets", await cf(`/workers/scripts/${SCRIPT}/secrets`));
+    const present = new Set((live.result ?? []).map((secret) => secret.name));
     const needsWrite = opts.writable && !present.has("SYNC_WRITE_TOKEN");
     const mintTokens = opts.rotateTokens === true || !present.has("SYNC_TOKEN") || needsWrite;
     if (mintTokens) {

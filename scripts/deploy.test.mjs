@@ -138,8 +138,9 @@ test("the handover section names the writable deployment's extra ability", async
   const args = { url: "https://a.example", bearer: "x", vaultUrl: "https://v.example" };
   const ro = mcpHandoffSection({ ...args, writable: false });
   const rw = mcpHandoffSection({ ...args, writable: true });
-  assert.match(rw, /append, edit, write/);
-  assert.doesNotMatch(ro, /append, edit, write/);
+  assert.match(rw, /append, edit, move, delete/);
+  assert.doesNotMatch(rw, /\bwrite,/);
+  assert.doesNotMatch(ro, /append, edit/);
   // The consequence, not just the capability: no confirmation, history is the undo.
   assert.match(rw, /no confirmation/);
   assert.doesNotMatch(ro, /no confirmation/);
@@ -680,4 +681,28 @@ test("a failed Cloudflare step prints status and errors[], never the rest of the
     assert.match(source, /throw cloudflareFailure\(step, detail\);/, file);
     assert.doesNotMatch(source, /JSON\.stringify\(detail/, file);
   }
+});
+
+test("a Worker lookup reads only 200 as present and 404 as absent; any other answer stops the deploy", async () => {
+  const { workerLookup } = await import("./deploy-agent.mjs");
+  assert.deepEqual(workerLookup("s", { status: 200, body: { result: [{ name: "SYNC_TOKEN" }] } }), {
+    exists: true,
+    result: [{ name: "SYNC_TOKEN" }],
+  });
+  assert.deepEqual(workerLookup("s", { status: 404, body: {} }), { exists: false, result: undefined });
+  // A token without access to the Worker answers 403. Reading that as "no secrets" minted a
+  // permanent vault token pair; reading it as "no such Worker" would upload over the name.
+  for (const status of [401, 403, 429, 500, 503]) {
+    assert.throws(
+      () => workerLookup("list the Worker's secrets", { status, body: { errors: [{ code: 10000, message: "Authentication error" }], result: [{ name: "x" }] } }),
+      (error) => error.message.includes(`HTTP ${status}`) && error.message.includes("list the Worker's secrets") && !error.message.includes('"x"'),
+    );
+  }
+});
+
+test("both lookups that act on absence go through workerLookup", () => {
+  const source = readFileSync(new URL("./deploy-agent.mjs", import.meta.url), "utf8");
+  assert.match(source, /workerLookup\("read the Worker's settings", await cf\(`\/workers\/scripts\/\$\{SCRIPT\}\/settings`\)\)/);
+  assert.match(source, /workerLookup\("list the Worker's secrets", await cf\(`\/workers\/scripts\/\$\{SCRIPT\}\/secrets`\)\)/);
+  assert.doesNotMatch(source, /live\.status === 200 \?/);
 });
